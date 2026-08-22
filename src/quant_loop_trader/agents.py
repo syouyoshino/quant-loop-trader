@@ -90,7 +90,10 @@ def adversarial_review(exp_dir: Path, ticker: str, horizon: int,
                        start: str, end: str, seed: int, n_shuffles: int = 200) -> dict:
     """Hostile tests: label randomisation + regime concentration."""
     # Rebuild the exact train/test the creator used (documented path only)
-    df = pl.read_parquet(str(PROC_DIR / f"{ticker}.parquet"))
+    pq = PROC_DIR / f"{ticker}.parquet"
+    if not pq.exists():
+        fetch_ohlcv(ticker, start, end)
+    df = ReplayEngine(pq).get_snapshot(ticker, end)  # same PIT cut as creator
     df = make_labels(df, horizon)
     df_feat = add_improved_features(df).drop_nulls(subset=improved_feature_columns() + ["label"])
     train, test = time_split(df_feat, 0.7)
@@ -149,7 +152,14 @@ def independent_replication(experiment_id: str, tolerance: float = 1e-9) -> dict
     cfg = json.loads((exp_dir / "config.json").read_text())
     report = json.loads((exp_dir / "report.json").read_text())
 
+    # documented pipeline: fetch → PIT snapshot cut at prediction_timestamp
     df = fetch_ohlcv(cfg["ticker"], cfg["start"], cfg["end"])
+    from quant_loop_trader.data import save_parquet as _sp
+    from quant_loop_trader.replay import ReplayEngine as _RE
+    pq = PROC_DIR / f"{cfg['ticker']}.parquet"
+    if not pq.exists():
+        _sp(df, pq)
+    df = _RE(pq).get_snapshot(cfg["ticker"], cfg["end"])
     df = make_labels(df, cfg["horizon"])
     df_feat = add_improved_features(df).drop_nulls(subset=improved_feature_columns() + ["label"])
     train, test = time_split(df_feat, 0.7)

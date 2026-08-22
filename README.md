@@ -72,4 +72,20 @@ Single-command end-to-end loop — fetch → PIT snapshot → train baseline →
 - **L3 — Multi-Agent Research Team:** `agents.py` — role/permission model (researcher cannot approve own work), validation gate with three independent reviewers: statistical (binomial significance vs coin-flip), adversarial (label-randomisation null test, regime concentration), and an independent replicator that rebuilds dataset→features→model from documented artifacts only. Champion promotion requires APPROVED from all three.
 - **L4 — Autonomous Research Mode:** `autonomy.py` — budgeted observation-mode sessions: review memory → select unseen configs (duplicate prevention) → run experiments → validate → store knowledge. Scheduling = invoke from cron/launchd; sessions are crash-safe (each experiment commits independently). Champion promotion remains a human decision (REVIEW MODE).
 
+## Continuous operation (7-day unattended run)
+
+Installed via launchd (see `deploy/*.plist`, loaded into `~/Library/LaunchAgents`):
+
+| Job | Schedule | Action |
+|---|---|---|
+| `com.quantloop.research-session` | daily 06:00 | `autonomy --max-experiments 4` — budgeted research session |
+| `com.quantloop.weekly-report` | Sunday 18:00 | `report` + git-commit `data/reports/` |
+
+Logs: `data/logs/session.log`. Reports: `data/reports/weekly_YYYY-Www.md`. Manage with:
+```bash
+launchctl kickstart gui/$(id -u)/com.quantloop.research-session  # run now
+launchctl unload ~/Library/LaunchAgents/com.quantloop.research-session.plist  # stop
+```
+When the research grid is exhausted the loop idles by design (anti-mining governor, see report's "Research frontier").
+
 Note: install non-editable (`pip install .`) — macOS security tooling on some machines flags editable-install `.pth` files as hidden, breaking imports. Reinstall after code changes, or run tests (which use `pythonpath = src`).
