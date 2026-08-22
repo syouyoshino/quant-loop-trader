@@ -230,3 +230,13 @@ data/processed/
 
 # Local virtual environment
 .venv/
+
+# macOS
+.DS_Store
+
+# Generated/local market data
+data/raw/
+data/processed/
+data/cache/
+*.duckdb
+*.parquet
