@@ -241,3 +241,9 @@ data/cache/
 data/experiments/
 *.duckdb
 *.parquet
+
+# Runtime session artifacts
+data/.session.lock
+data/logs/
+data/backups/
+data/cache/
