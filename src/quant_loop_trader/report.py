@@ -9,7 +9,8 @@ from pathlib import Path
 
 import duckdb
 
-from quant_loop_trader.data import DB_PATH, migrate_db, PROC_DIR, dataset_metadata
+from quant_loop_trader.data import DB_PATH, migrate_db, dataset_metadata
+from quant_loop_trader.experiment import EXP_ROOT
 from quant_loop_trader.research_memory import search_memory
 from quant_loop_trader.autonomy import GRID, _already_run
 
@@ -60,7 +61,7 @@ def generate_report(out_dir: Path | None = None) -> Path:
         f"- Last 7 days: {len(week_exps)} completed hypotheses" + ("" if week_exps else " (idle — grid exhausted or budget)"),
     ]
     for eid, dec in week_exps[:10]:
-        vfile = Path("data/experiments") / eid.replace("_improved", "") / "validation.json"
+        vfile = EXP_ROOT / eid.replace("_improved", "") / "validation.json"
         vstatus = "n/a"
         if vfile.exists():
             vstatus = json.loads(vfile.read_text()).get("approval_status", "n/a")

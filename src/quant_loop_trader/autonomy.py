@@ -53,6 +53,10 @@ def _already_run(ticker: str, horizon: int, start: str, end: str, seed: int) -> 
     return n > 0
 
 
+def _frontier_remaining(ticker: str = "SPY", horizon: int = 5) -> int:
+    return sum(1 for c in GRID if not _already_run(ticker, horizon, c["start"], c["end"], c["seed"]))
+
+
 def review_memory() -> dict:
     """Research director step 1: what do we already believe?"""
     fails = search_memory("volatility regime")
@@ -70,15 +74,23 @@ def select_candidates(ticker: str, horizon: int, budget: int) -> list[dict]:
             break
         if _already_run(ticker, horizon, cand["start"], cand["end"], cand["seed"]):
             continue
-        dup = duplicate_risk("volatility regime classification")
-        cand = {**cand, "duplicate_warning": dup["should_warn"]}
         out.append(cand)
     return out
 
 
 def run_session(ticker: str = "SPY", horizon: int = 5,
                 max_experiments: int = 3, validate: bool = True) -> dict:
-    """One bounded autonomous research session."""
+    """One bounded autonomous research session. Lockfile-guarded; writes heartbeat."""
+    import fcntl
+    ROOT = DB_PATH.parent
+    lock_path = ROOT / ".session.lock"
+    lock_file = open(lock_path, "w")
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        logger.warning(json.dumps({"event": "session_locked", "detail": "another session holds the lock"}))
+        return {"mode": "OBSERVATION", "executed": 0, "results": [], "skipped": "session_locked"}
+
     started = datetime.now(timezone.utc).isoformat()
     memory_review = review_memory()
     candidates = select_candidates(ticker, horizon, max_experiments)
@@ -102,18 +114,34 @@ def run_session(ticker: str = "SPY", horizon: int = 5,
             entry["issues"] = verdict["issues_found"]
         results.append(entry)
 
+    # heartbeat: distinguishes healthy-idle from broken-silent for unattended ops
+    heartbeat = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "executed": len(results),
+        "decisions": [r["decision"] for r in results],
+        "grid_remaining": _frontier_remaining(ticker, horizon),
+        "ok": True,
+    }
+    (ROOT / "logs").mkdir(exist_ok=True)
+    (ROOT / "logs" / "heartbeat.json").write_text(json.dumps(heartbeat, indent=2))
+    # nightly insurance: single-file DB backup, keep last 8
+    bdir = ROOT / "backups"
+    bdir.mkdir(exist_ok=True)
+    import shutil
+    shutil.copy2(DB_PATH, bdir / f"research_{datetime.now(timezone.utc).strftime('%Y%m%d')}.duckdb")
+    for old in sorted(bdir.glob("research_*.duckdb"))[:-8]:
+        old.unlink()
+
     summary = {
         "session_started": started,
         "session_finished": datetime.now(timezone.utc).isoformat(),
         "mode": "OBSERVATION",
-        "memory_review": memory_review,
+        "memory_review": memory_review,  # research-director traceability: what we believed entering the session
         "budget": max_experiments,
         "executed": len(results),
-        "skipped_as_duplicate": sum(1 for c in GRID if _already_run(ticker, horizon, c["start"], c["end"], c["seed"])) and None,
+        "grid_remaining": heartbeat["grid_remaining"],
         "results": results,
     }
-    # clean up the placeholder key (kept simple above; drop it)
-    summary.pop("skipped_as_duplicate", None)
     logger.info(json.dumps({"event": "session_complete", "executed": len(results)}))
     return summary
 

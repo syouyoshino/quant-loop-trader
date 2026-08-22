@@ -48,17 +48,27 @@ def make_labels(df: pl.DataFrame, horizon: int = 5) -> pl.DataFrame:
     return df
 
 
-def train_evaluate(df: pl.DataFrame, feature_fn, feat_cols: list[str], horizon: int, seed: int) -> dict:
-    _seed_all(seed)
+def build_train_test(ticker: str, start: str, end: str, horizon: int, feature_fn, feat_cols: list[str]):
+    """Single pipeline used by creator AND every reviewer. Divergence here was the
+    root cause of false replication rejections — do not copy this logic elsewhere."""
+    pq = PROC_DIR / f"{ticker}.parquet"
+    if not pq.exists():
+        df_raw, _ = fetch_ohlcv(ticker, start, end)
+        save_parquet(df_raw, pq)
+    df = ReplayEngine(pq).get_snapshot(ticker, end)  # PIT cut at prediction_timestamp
+    df = df.filter(pl.col("event_time") >= pl.lit(start).str.strptime(pl.Date, "%Y-%m-%d"))
     df = make_labels(df, horizon)
-    # drop rows where label or features are null
-    df_feat = feature_fn(df)
-    # need at least one feature + label
-    df_clean = df_feat.drop_nulls(subset=feat_cols + ["label"])
+    df_clean = feature_fn(df).drop_nulls(subset=feat_cols + ["label"])
     if df_clean.height < 100:
         raise ValueError(f"not enough rows after feature cleaning: {df_clean.height}")
-    train, test = time_split(df_clean, 0.7)
-    # hidden future: test labels not seen during training — evaluation owns them
+    # purge h boundary rows whose labels read hidden-window prices
+    train, test = time_split(df_clean, 0.7, purge=horizon)
+    return train, test
+
+
+def train_evaluate_from(train: pl.DataFrame, test: pl.DataFrame, feat_cols: list[str], horizon: int, seed: int) -> dict:
+    """Train on prebuilt train frames, evaluate on hidden test. Creator path only."""
+    _seed_all(seed)
     X_train = train.select(feat_cols).to_numpy()
     y_train = train["label"].to_numpy()
     X_test = test.select(feat_cols).to_numpy()
@@ -73,7 +83,7 @@ def train_evaluate(df: pl.DataFrame, feature_fn, feat_cols: list[str], horizon: 
     except Exception:
         y_prob = y_pred.astype(float)
 
-    metrics = evaluate(y_test, y_pred, y_prob, prices_test)
+    metrics = evaluate(y_test, y_pred, y_prob, prices_test, horizon)
     err = autopsy(test, y_test, y_pred)
 
     # predictions frame for storage (only test)
@@ -88,38 +98,34 @@ def train_evaluate(df: pl.DataFrame, feature_fn, feat_cols: list[str], horizon: 
     return {"metrics": metrics, "error_analysis": err, "pred_df": pred_df, "train_n": train.height, "test_n": test.height, "model": pipe}
 
 
+def _code_version() -> str:
+    """Git SHA of the code that produced this result (best-effort)."""
+    import subprocess
+    try:
+        return subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True, timeout=5).stdout.strip()
+    except Exception:
+        return "unknown"
+
+
 def run_experiment(ticker: str = "SPY", horizon: int = 5, start: str = "2018-01-01", end: str = "2024-12-31", seed: int = 42) -> dict:
     exp_id = f"{datetime.now(timezone.utc).strftime('%Y%m%d')}_{ticker}_{horizon}d_{hashlib.sha256(f'{ticker}{horizon}{seed}{start}{end}'.encode()).hexdigest()[:8]}"
     exp_dir = EXP_ROOT / exp_id
     exp_dir.mkdir(parents=True, exist_ok=True)
 
     # 1. data
-    df_raw = fetch_ohlcv(ticker, start, end)
-    meta = dataset_metadata(df_raw, ticker, "tiingo" if "TIINGO_API_KEY" in str(fetch_ohlcv.__code__) else "fixture")
-    # determine source more accurately
-    import os
-    source = "tiingo" if os.getenv("TIINGO_API_KEY", "").strip() else "fixture"
-    meta["source"] = source
-    meta["provenance_json"] = json.dumps({"source": source, "ticker": ticker, "start": start, "end": end})
-    # save parquet already done in fetch, ensure replay engine uses it
-    parquet_path = PROC_DIR / f"{ticker}.parquet"
-    if not parquet_path.exists():
-        save_parquet(df_raw, parquet_path)
+    df_raw, source = fetch_ohlcv(ticker, start, end)
+    meta = dataset_metadata(df_raw, ticker, source, extra_provenance={"start": start, "end": end})
+    parquet_path = PROC_DIR / f"{ticker}.parquet"  # fetch_ohlcv guarantees persistence
     upsert_dataset(meta)
 
-    # 2. replay verification
-    engine = ReplayEngine(parquet_path)
-    # sanity: snapshot at end should equal full history
-    snap_full = engine.get_snapshot(ticker, str(df_raw["event_time"].max()))
-    assert snap_full.height == df_raw.height, "replay full snapshot mismatch"
-
-    df_snapshot = engine.get_snapshot(ticker, end)  # full available at end
-    # For PIT correctness we use df_raw directly (already PIT-filtered by fetch). In L1 available==event.
+    # 2. shared PIT pipeline (same path reviewers use — no divergence possible)
 
     # 3. baseline
-    baseline = train_evaluate(df_snapshot, add_features, feature_columns(), horizon, seed)
-    # 4. improved
-    improved = train_evaluate(df_snapshot, add_improved_features, improved_feature_columns(), horizon, seed)
+    train_b, test_b = build_train_test(ticker, start, end, horizon, add_features, feature_columns())
+    baseline = train_evaluate_from(train_b, test_b, feature_columns(), horizon, seed)
+    # 4. improved (reuse same split base: rebuild with improved features)
+    train_i, test_i = build_train_test(ticker, start, end, horizon, add_improved_features, improved_feature_columns())
+    improved = train_evaluate_from(train_i, test_i, improved_feature_columns(), horizon, seed)
 
     # 5. compare
     b_acc = baseline["metrics"]["accuracy"]
@@ -203,7 +209,7 @@ def run_experiment(ticker: str = "SPY", horizon: int = 5, start: str = "2018-01-
         "final_result": decision,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "config": config,
-        "reproducibility": {"seed": seed, "checksum": meta["checksum"]},
+        "reproducibility": {"seed": seed, "checksum": meta["checksum"], "code_version": _code_version()},
     }
 
     # 6. store predictions
@@ -214,8 +220,7 @@ def run_experiment(ticker: str = "SPY", horizon: int = 5, start: str = "2018-01-
     (exp_dir / "report.json").write_text(json.dumps(report, indent=2))
     # ledger jsonl
     EXP_ROOT.mkdir(parents=True, exist_ok=True)
-    with open(EXP_ROOT / "experiments.jsonl", "a") as f:
-        f.write(json.dumps({"experiment_id": exp_id, "decision": decision, "delta_acc": float(improvement), "created_at": report["created_at"]}) + "\n")
+    # DuckDB experiments table is the single idempotent ledger — no second source of truth
 
     # 7. DuckDB insert
     migrate_db()
@@ -273,7 +278,8 @@ def run_experiment(ticker: str = "SPY", horizon: int = 5, start: str = "2018-01-
         "performance_history_json": json.dumps(improved["metrics"]),
         "failure_modes": "same as baseline; interaction terms add no lift in tested regime",
         "research_lineage": f"momentum→vol_regime_filter:{exp_id}",
-        "status": {"KEEP": "champion", "IMPROVE": "candidate"}.get(decision, "rejected"),
+        # promotion to champion happens ONLY via validate_experiment APPROVED — never here
+        "status": "rejected" if decision == "REJECT" else "candidate",
     })
 
     # L2: research memory — record outcome + update beliefs

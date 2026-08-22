@@ -6,7 +6,6 @@ import json
 import logging
 import os
 import time
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import polars as pl
@@ -18,8 +17,6 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 ROOT = Path(os.environ.get("QLT_ROOT", Path.cwd()))
-RAW_DIR = ROOT / "data" / "raw"
-CACHE_DIR = ROOT / "data" / "cache"
 PROC_DIR = ROOT / "data" / "processed"
 MIGR_DIR = ROOT / "data" / "migrations"
 DB_PATH = ROOT / "data" / "research.duckdb"
@@ -34,15 +31,22 @@ def _checksum_df(df: pl.DataFrame) -> str:
     return hashlib.sha256(b).hexdigest()[:16]
 
 
+_MIGRATED: set[str] = set()
+
+
 def migrate_db(db_path: Path | None = None) -> None:
+    """Apply migrations once per (process, resolved db path). Idempotent SQL either way."""
     import duckdb
 
-    db_path = Path(db_path or DB_PATH)
+    db_path = Path(db_path or DB_PATH).resolve()
+    if str(db_path) in _MIGRATED:
+        return
     db_path.parent.mkdir(parents=True, exist_ok=True)
     con = duckdb.connect(str(db_path))
     for sql_file in sorted(MIGR_DIR.glob("*.sql")):
         con.execute(sql_file.read_text())
     con.close()
+    _MIGRATED.add(str(db_path))
 
 
 def _tiingo_fetch(ticker: str, start: str, end: str, api_key: str) -> list[dict]:
@@ -67,9 +71,7 @@ def _tiingo_fetch(ticker: str, start: str, end: str, api_key: str) -> list[dict]
             last_exc = e
             if attempt < 2:
                 time.sleep(2**attempt)
-            else:
-                raise
-    raise last_exc  # type: ignore[misc]
+    raise RuntimeError(f"Tiingo failed after retries: {last_exc}")
 
 
 def _parse_tiingo(rows: list[dict]) -> pl.DataFrame:
@@ -105,14 +107,11 @@ def _load_fixture() -> pl.DataFrame | None:
     return None
 
 
-def fetch_ohlcv(ticker: str = "SPY", start: str = "2018-01-01", end: str = "2024-12-31", use_cache: bool = True) -> pl.DataFrame:
-    """Fetch OHLCV with PIT columns. Uses cache parquet if fresh, else Tiingo, else fixture."""
+def fetch_ohlcv(ticker: str = "SPY", start: str = "2018-01-01", end: str = "2024-12-31", use_cache: bool = True) -> tuple[pl.DataFrame, str]:
+    """Fetch OHLCV with PIT columns. Returns (df, actual_source)."""
     PROC_DIR.mkdir(parents=True, exist_ok=True)
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    RAW_DIR.mkdir(parents=True, exist_ok=True)
 
     parquet_path = PROC_DIR / f"{ticker}.parquet"
-    cache_meta = CACHE_DIR / f"{ticker}_{start}_{end}.json"
 
     # 1. parquet cache hit
     if use_cache and parquet_path.exists():
@@ -123,8 +122,12 @@ def fetch_ohlcv(ticker: str = "SPY", start: str = "2018-01-01", end: str = "2024
                 min_d = str(df["event_time"].min())
                 max_d = str(df["event_time"].max())
                 if min_d <= start and max_d >= end:
+                    df = df.filter(
+                        (pl.col("event_time") >= pl.lit(start).str.strptime(pl.Date, "%Y-%m-%d"))
+                        & (pl.col("event_time") <= pl.lit(end).str.strptime(pl.Date, "%Y-%m-%d"))
+                    )
                     logger.info(json.dumps({"event": "cache_hit_parquet", "ticker": ticker, "rows": df.height}))
-                    return df
+                    return df, "cache"
         except Exception:
             pass
 
@@ -139,23 +142,20 @@ def fetch_ohlcv(ticker: str = "SPY", start: str = "2018-01-01", end: str = "2024
             # missing data detection: gaps >3 trading days
             gap_check(df)
             save_parquet(df, parquet_path)
-            # also raw json cache
-            try:
-                cache_meta.write_text(json.dumps(rows[:2]))  # minimal
-            except Exception:
-                pass
             logger.info(json.dumps({"event": "tiingo_fetch_ok", "ticker": ticker, "rows": df.height}))
-            return df
+            return df, "tiingo"
         except Exception as e:
             logger.warning(json.dumps({"event": "tiingo_failed_fallback_fixture", "error": str(e)[:200]}))
 
-    # 3. fixture fallback
+    # 3. fixture fallback — forbidden while a key is configured (never poison research silently)
+    if api_key:
+        raise RuntimeError("Tiingo failed and fixture fallback is forbidden while TIINGO_API_KEY is set")
     fixture = _load_fixture()
     if fixture is not None:
         logger.info(json.dumps({"event": "fixture_used", "ticker": ticker, "rows": fixture.height}))
-        # filter to requested range
         fixture = fixture.filter((pl.col("event_time") >= pl.lit(start).str.strptime(pl.Date, "%Y-%m-%d")) & (pl.col("event_time") <= pl.lit(end).str.strptime(pl.Date, "%Y-%m-%d")))
-        return fixture
+        save_parquet(fixture, parquet_path)  # single persistence site — downstream always finds the parquet
+        return fixture, "fixture"
 
     raise FileNotFoundError("No Tiingo key and no fixture at tests/fixtures/SPY.csv — cannot fetch data")
 
@@ -178,10 +178,11 @@ def save_parquet(df: pl.DataFrame, path: Path) -> str:
     return cs
 
 
-def dataset_metadata(df: pl.DataFrame, ticker: str, source: str) -> dict:
+def dataset_metadata(df: pl.DataFrame, ticker: str, source: str, extra_provenance: dict | None = None) -> dict:
     cs = _checksum_df(df)
     start = str(df["event_time"].min())
     end = str(df["event_time"].max())
+    prov = {"source": source, "ticker": ticker, "rows": df.height, **(extra_provenance or {})}
     return {
         "dataset_id": f"{ticker}_{start}_{end}_{cs[:8]}",
         "ticker": ticker,
@@ -193,7 +194,7 @@ def dataset_metadata(df: pl.DataFrame, ticker: str, source: str) -> dict:
         "row_count": df.height,
         "validation_status": "valid",
         "snapshot_definition": "available_time <= prediction_timestamp, event_time daily close",
-        "provenance_json": json.dumps({"source": source, "ticker": ticker, "rows": df.height}),
+        "provenance_json": json.dumps(prov),
     }
 
 

@@ -29,3 +29,14 @@ def test_features_shifted_one_bar():
     vals = feat["ret_1"].to_list()
     assert vals[0] is None and vals[1] is None
     assert abs(vals[2] - 0.01) < 1e-6
+
+
+def test_features_truncation_invariant():
+    """No feature at time t may read rows > t: recomputing on any truncated
+    history must reproduce the same final row, or lookahead exists."""
+    from quant_loop_trader.features import add_improved_features
+    df = pl.read_parquet(str(PROC_DIR / "SPY.parquet")).sort("event_time")
+    full = add_improved_features(df)
+    for t in [20, 100, len(df) // 2, len(df) - 1]:
+        partial = add_improved_features(df.slice(0, t))
+        assert partial.row(-1) == full.row(t - 1), f"lookahead detected at index {t}"

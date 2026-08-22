@@ -14,14 +14,12 @@ from pathlib import Path
 import numpy as np
 import polars as pl
 
-from quant_loop_trader.data import PROC_DIR, fetch_ohlcv
-from quant_loop_trader.replay import ReplayEngine
+from quant_loop_trader.data import PROC_DIR
 from quant_loop_trader.features import (
-    add_features, add_improved_features,
-    feature_columns, improved_feature_columns,
+    add_improved_features,
+    improved_feature_columns,
 )
-from quant_loop_trader.evaluation import time_split
-from quant_loop_trader.experiment import EXP_ROOT, make_labels
+from quant_loop_trader.experiment import EXP_ROOT
 
 logger = logging.getLogger(__name__)
 
@@ -68,20 +66,33 @@ def _load_predictions(exp_dir: Path) -> pl.DataFrame:
 
 # --- Statistical Reviewer ---------------------------------------------------
 def statistical_review(exp_dir: Path, alpha: float = 0.05) -> dict:
-    """Significance + sample size against coin-flip null."""
+    """Significance vs the majority-class BASE RATE (not coin-flip), sample size,
+    and a hard gate on degenerate constant predictions.
+    ponytail: per-experiment binomial only; no Bonferroni correction across the
+    overlapping-window grid family — add family-wise correction when grid >100 configs."""
     pred = _load_predictions(exp_dir)
     n = pred.height
     correct = int((pred["y_true"] == pred["y_pred"]).sum())
-    from scipy.stats import binomtest
-    pvalue = float(binomtest(correct, n, 0.5).pvalue)
     issues = []
+    # degenerate classifier: predicts a single class regardless of features
+    if len(set(pred["y_pred"].to_list())) < 2:
+        issues.append(f"degenerate_constant_predictions:{sorted(set(pred['y_pred'].to_list()))}")
+    # null = majority-class accuracy on the same test labels
+    p_base = float(max(pred["y_true"].mean(), 1 - pred["y_true"].mean()))
+    from scipy.stats import binomtest
+    pvalue = float(binomtest(correct, n, p_base).pvalue)
     if n < 100:
         issues.append(f"sample_size_too_small:{n}")
     if pvalue >= alpha:
-        issues.append(f"not_significant_vs_coinflip:p={pvalue:.4f}")
-    logger.info(json.dumps({"event": "statistical_review", "n": n, "correct": correct, "p": pvalue}))
+        issues.append(f"not_significant_vs_base_rate{p_base:.3f}:p={pvalue:.4f}")
+    if n < 100:
+        issues.append(f"sample_size_too_small:{n}")
+    if pvalue >= alpha:
+        issues.append(f"not_significant_vs_base_rate{p_base:.3f}:p={pvalue:.4f}")
+    logger.info(json.dumps({"event": "statistical_review", "n": n, "correct": correct,
+                            "base_rate": p_base, "p": pvalue}))
     return _msg("statistical_reviewer",
-                ["binomial_significance_vs_coinflip", "sample_size_check"],
+                ["majority_class_null_test", "degenerate_prediction_gate", "sample_size_check"],
                 issues)
 
 
@@ -89,14 +100,8 @@ def statistical_review(exp_dir: Path, alpha: float = 0.05) -> dict:
 def adversarial_review(exp_dir: Path, ticker: str, horizon: int,
                        start: str, end: str, seed: int, n_shuffles: int = 200) -> dict:
     """Hostile tests: label randomisation + regime concentration."""
-    # Rebuild the exact train/test the creator used (documented path only)
-    pq = PROC_DIR / f"{ticker}.parquet"
-    if not pq.exists():
-        fetch_ohlcv(ticker, start, end)
-    df = ReplayEngine(pq).get_snapshot(ticker, end)  # same PIT cut as creator
-    df = make_labels(df, horizon)
-    df_feat = add_improved_features(df).drop_nulls(subset=improved_feature_columns() + ["label"])
-    train, test = time_split(df_feat, 0.7)
+    from quant_loop_trader.experiment import build_train_test
+    train, test = build_train_test(ticker, start, end, horizon, add_improved_features, improved_feature_columns())
 
     from sklearn.linear_model import LogisticRegression
     from sklearn.preprocessing import StandardScaler
@@ -106,8 +111,11 @@ def adversarial_review(exp_dir: Path, ticker: str, horizon: int,
     Xte = test.select(improved_feature_columns()).to_numpy()
     yte = test["label"].to_numpy()
 
-    pipe = Pipeline([("scaler", StandardScaler()),
-                     ("clf", LogisticRegression(max_iter=1000, random_state=seed))])
+    def _pipe():
+        return Pipeline([("scaler", StandardScaler()),
+                         ("clf", LogisticRegression(max_iter=1000, random_state=seed))])
+
+    pipe = _pipe()
     pipe.fit(Xtr, ytr)
     real_acc = float((pipe.predict(Xte) == yte).mean())
 
@@ -116,8 +124,7 @@ def adversarial_review(exp_dir: Path, ticker: str, horizon: int,
     null_accs = np.empty(n_shuffles)
     for i in range(n_shuffles):
         ytr_rand = rng.permutation(ytr)
-        pipe_r = Pipeline([("scaler", StandardScaler()),
-                           ("clf", LogisticRegression(max_iter=1000, random_state=seed))])
+        pipe_r = _pipe()
         pipe_r.fit(Xtr, ytr_rand)
         null_accs[i] = (pipe_r.predict(Xte) == yte).mean()
     null_p95 = float(np.quantile(null_accs, 0.95))
@@ -131,7 +138,9 @@ def adversarial_review(exp_dir: Path, ticker: str, horizon: int,
     reg_accs = [float((pred_df["y_true"].to_numpy()[regimes == r] ==
                        pred_df["y_pred"].to_numpy()[regimes == r]).mean())
                 for r in np.unique(regimes)]
-    concentrated = len(reg_accs) > 1 and max(reg_accs) > 2 * acc_overall
+    # dead rule removed (max(reg)>2*acc unreachable); real check: any populated
+    # regime below chance while overall above → edge concentrated elsewhere
+    concentrated = len(reg_accs) > 1 and min(reg_accs) < 0.5 < acc_overall
 
     issues = []
     if real_acc <= null_p95:
@@ -152,17 +161,9 @@ def independent_replication(experiment_id: str, tolerance: float = 1e-9) -> dict
     cfg = json.loads((exp_dir / "config.json").read_text())
     report = json.loads((exp_dir / "report.json").read_text())
 
-    # documented pipeline: fetch → PIT snapshot cut at prediction_timestamp
-    df = fetch_ohlcv(cfg["ticker"], cfg["start"], cfg["end"])
-    from quant_loop_trader.data import save_parquet as _sp
-    from quant_loop_trader.replay import ReplayEngine as _RE
-    pq = PROC_DIR / f"{cfg['ticker']}.parquet"
-    if not pq.exists():
-        _sp(df, pq)
-    df = _RE(pq).get_snapshot(cfg["ticker"], cfg["end"])
-    df = make_labels(df, cfg["horizon"])
-    df_feat = add_improved_features(df).drop_nulls(subset=improved_feature_columns() + ["label"])
-    train, test = time_split(df_feat, 0.7)
+    from quant_loop_trader.experiment import build_train_test
+    train, test = build_train_test(cfg["ticker"], cfg["start"], cfg["end"], cfg["horizon"],
+                                   add_improved_features, improved_feature_columns())
 
     from sklearn.linear_model import LogisticRegression
     from sklearn.preprocessing import StandardScaler
@@ -184,17 +185,13 @@ def independent_replication(experiment_id: str, tolerance: float = 1e-9) -> dict
 
 
 # --- Orchestrator -----------------------------------------------------------
-def validate_experiment(experiment_id: str, ticker: str | None = None,
-                        horizon: int | None = None, start: str | None = None,
-                        end: str | None = None, seed: int | None = None) -> dict:
-    """Full validation gate. Returns combined VALIDATION MESSAGE; stores validation.json."""
+def validate_experiment(experiment_id: str) -> dict:
+    """Full validation gate. Returns combined VALIDATION MESSAGE; stores validation.json.
+    Reviewers always rebuild from the experiment's documented config — no overrides."""
     exp_dir = EXP_ROOT / experiment_id
     cfg = json.loads((exp_dir / "config.json").read_text())
-    ticker = ticker or cfg["ticker"]
-    horizon = horizon or cfg["horizon"]
-    start = start or cfg["start"]
-    end = end or cfg["end"]
-    seed = seed if seed is not None else cfg["seed"]
+    ticker, horizon = cfg["ticker"], cfg["horizon"]
+    start, end, seed = cfg["start"], cfg["end"], cfg["seed"]
 
     reviews = [
         statistical_review(exp_dir),
@@ -209,7 +206,13 @@ def validate_experiment(experiment_id: str, ticker: str | None = None,
         "issues_found": all_issues,
     }
     (exp_dir / "validation.json").write_text(json.dumps(verdict, indent=2))
-    # promotion policy: champion only survives every reviewer
+    # promotion policy: champion only survives every reviewer; enforced in DB, not prose
+    import duckdb
+    from quant_loop_trader.data import DB_PATH
+    status = "champion" if verdict["approval_status"] == "APPROVED" else "rejected"
+    con = duckdb.connect(str(DB_PATH))
+    con.execute("UPDATE model_registry SET status=? WHERE model_id=?", [status, f"{experiment_id}_improved"])
+    con.close()
     logger.info(json.dumps({"event": "validation_complete", "experiment_id": experiment_id,
-                            "status": verdict["approval_status"]}))
+                            "status": verdict["approval_status"], "registry_status": status}))
     return verdict

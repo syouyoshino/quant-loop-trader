@@ -12,11 +12,13 @@ from sklearn.metrics import accuracy_score, precision_score, recall_score, brier
 logger = logging.getLogger(__name__)
 
 
-def time_split(df: pl.DataFrame, train_ratio: float = 0.7) -> tuple[pl.DataFrame, pl.DataFrame]:
-    """Time-ordered split, no shuffle. Returns (train, test_hidden)."""
+def time_split(df: pl.DataFrame, train_ratio: float = 0.7, purge: int = 0) -> tuple[pl.DataFrame, pl.DataFrame]:
+    """Time-ordered split, no shuffle. Purge drops last `purge` train rows whose
+    labels read prices inside the hidden test window."""
     df = df.sort("event_time")
     n = df.height
     cut = int(n * train_ratio)
+    cut = max(0, cut - max(0, purge))
     train = df.slice(0, cut)
     test = df.slice(cut, n - cut)
     # invariant: train strictly before test
@@ -25,10 +27,10 @@ def time_split(df: pl.DataFrame, train_ratio: float = 0.7) -> tuple[pl.DataFrame
     return train, test
 
 
-def _sharpe(returns: np.ndarray) -> float:
+def _sharpe(returns: np.ndarray, periods_per_year: float = 252) -> float:
     if len(returns) < 2 or returns.std() == 0:
         return 0.0
-    return float(np.sqrt(252) * returns.mean() / returns.std())
+    return float(np.sqrt(periods_per_year) * returns.mean() / returns.std())
 
 
 def _max_drawdown(cum_returns: np.ndarray) -> float:
@@ -39,7 +41,7 @@ def _max_drawdown(cum_returns: np.ndarray) -> float:
     return float(dd.min())
 
 
-def evaluate(y_true: np.ndarray, y_pred: np.ndarray, y_prob: np.ndarray, prices: np.ndarray) -> dict:
+def evaluate(y_true: np.ndarray, y_pred: np.ndarray, y_prob: np.ndarray, prices: np.ndarray, horizon: int = 1) -> dict:
     """Return dict with prediction + financial metrics."""
     acc = float(accuracy_score(y_true, y_pred)) if len(y_true) else 0.0
     prec = float(precision_score(y_true, y_pred, zero_division=0)) if len(y_true) else 0.0
@@ -49,25 +51,28 @@ def evaluate(y_true: np.ndarray, y_pred: np.ndarray, y_prob: np.ndarray, prices:
     except Exception:
         brier = 0.0
 
-    # financial: equal-weight long if pred=1 else flat. Returns based on 5d forward?
-    # For metrics we use next-day return as proxy; cumulative product
-    # prices are close series aligned with y_true length (test)
-    if len(prices) < 2:
-        strat_rets = np.array([])
-        bench_rets = np.array([])
-    else:
-        daily_ret = np.diff(prices) / prices[:-1]
-        # align: y_pred[i] predicts move from prices[i] to prices[i+1]? For simplicity daily
-        # pad to same length
-        n = min(len(daily_ret), len(y_pred))
-        strat_rets = daily_ret[:n] * y_pred[:n]  # long only
-        bench_rets = daily_ret[:n]  # buy-hold
+    # financial: position held for `horizon` days (matches label horizon), long if pred=1 else flat.
+    # Non-overlapping horizon buckets: signal from bucket start, return over the bucket.
+    h = max(1, int(horizon))
+    n_buckets = min(len(y_pred), max(0, (len(prices) - 1) // h))
+    strat_rets = np.array([])
+    bench_rets = np.array([])
+    pos = np.array([])
+    if len(prices) >= 2 and n_buckets > 0:
+        bucket_ret = prices[h::h][:n_buckets] / prices[:-h:h][:n_buckets] - 1
+        pos = y_pred[: n_buckets * h].reshape(n_buckets, h)[:, 0]
+        bench_rets = bucket_ret
+        strat_rets = bucket_ret * pos
 
-    # transaction cost 5bps per turnover
-    turnover = float(np.abs(np.diff(y_pred)).mean()) if len(y_pred) > 1 else 0.0
-    cost = turnover * 0.0005
-    strat_rets_net = strat_rets - cost / max(len(strat_rets), 1) if len(strat_rets) else strat_rets
+    # transaction cost: 5bps per position change, charged to the switching bucket
+    changes = np.abs(np.diff(pos)) if n_buckets > 1 else np.array([])
+    turnover = float(changes.mean()) if len(changes) else 0.0
+    strat_rets_net = strat_rets.copy()
+    if len(strat_rets_net):
+        # change between bucket i-1 and i costs entry at bucket i
+        strat_rets_net[1:] -= changes * 0.0005
 
+    ppy = 252 / h  # h-day buckets → annualization factor
     cum_strat = np.cumprod(1 + strat_rets_net) if len(strat_rets_net) else np.array([1.0])
     cum_bench = np.cumprod(1 + bench_rets) if len(bench_rets) else np.array([1.0])
 
@@ -76,8 +81,8 @@ def evaluate(y_true: np.ndarray, y_pred: np.ndarray, y_prob: np.ndarray, prices:
         "precision": prec,
         "recall": rec,
         "brier_score": brier,
-        "sharpe_strategy": _sharpe(strat_rets_net),
-        "sharpe_benchmark": _sharpe(bench_rets),
+        "sharpe_strategy": _sharpe(strat_rets_net, periods_per_year=ppy),
+        "sharpe_benchmark": _sharpe(bench_rets, periods_per_year=ppy),
         "volatility_strategy": float(strat_rets_net.std()) if len(strat_rets_net) else 0.0,
         "volatility_benchmark": float(bench_rets.std()) if len(bench_rets) else 0.0,
         "max_drawdown_strategy": _max_drawdown(cum_strat),
@@ -85,7 +90,7 @@ def evaluate(y_true: np.ndarray, y_pred: np.ndarray, y_prob: np.ndarray, prices:
         "cumulative_return_strategy": float(cum_strat[-1] - 1) if len(cum_strat) else 0.0,
         "cumulative_return_benchmark": float(cum_bench[-1] - 1) if len(cum_bench) else 0.0,
         "turnover": turnover,
-        "transaction_cost_adj_return": float(cum_strat[-1] - 1) if len(cum_strat) else 0.0,
+        "transaction_cost_adj_return": float(strat_rets.sum()) if len(strat_rets) else 0.0,
         "n_test": int(len(y_true)),
     }
     return metrics

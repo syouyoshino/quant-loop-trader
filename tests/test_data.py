@@ -5,13 +5,13 @@ from quant_loop_trader.data import fetch_ohlcv, save_parquet, dataset_metadata, 
 import duckdb
 
 def test_fetch_fallback_or_tiingo():
-    df = fetch_ohlcv("SPY", "2018-01-01", "2024-12-31")
+    df, _ = fetch_ohlcv("SPY", "2018-01-01", "2024-12-31")
     assert df.height > 1000
     assert {"event_time", "available_time", "close"}.issubset(set(df.columns))
     assert (df["available_time"] <= df["event_time"].max()).all() or True  # L1 equal
 
 def test_dataset_reconstruction():
-    df1 = fetch_ohlcv("SPY", "2018-01-01", "2024-12-31", use_cache=False)
+    df1, _ = fetch_ohlcv("SPY", "2018-01-01", "2024-12-31", use_cache=False)
     p = PROC_DIR / "SPY.parquet"
     cs1 = save_parquet(df1, p)
     df2 = pl.read_parquet(str(p))
@@ -20,7 +20,7 @@ def test_dataset_reconstruction():
     assert df1.height == df2.height
 
 def test_checksum_stable():
-    df = fetch_ohlcv("SPY", "2019-01-01", "2019-12-31")
+    df, _ = fetch_ohlcv("SPY", "2019-01-01", "2019-12-31")
     m1 = dataset_metadata(df, "SPY", "test")
     m2 = dataset_metadata(df, "SPY", "test")
     assert m1["checksum"] == m2["checksum"]

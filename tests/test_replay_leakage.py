@@ -8,7 +8,7 @@ def _engine():
     # if not exists, fallback to fixture via fetch
     if not p.exists():
         from quant_loop_trader.data import fetch_ohlcv
-        fetch_ohlcv("SPY", "2018-01-01", "2024-12-31")
+        fetch_ohlcv("SPY", "2018-01-01", "2024-12-31")[0]
     return ReplayEngine(p)
 
 def test_available_time_leq_timestamp():

@@ -3,12 +3,18 @@ from pathlib import Path
 
 import numpy as np
 import polars as pl
+import pytest
 
 from quant_loop_trader.agents import (
     ROLES, statistical_review, adversarial_review,
     independent_replication, validate_experiment, _msg,
 )
 from quant_loop_trader.experiment import run_experiment
+
+
+@pytest.fixture(scope="module")
+def tmp_dir(tmp_path_factory):
+    return tmp_path_factory.mktemp("stat_review")
 
 
 def test_roles_cannot_violate_constitution():
@@ -18,13 +24,13 @@ def test_roles_cannot_violate_constitution():
     assert "approve_own_discoveries" in ROLES["quant_researcher"]["cannot"]
 
 
-def test_statistical_review_rejects_coinflip():
+def test_statistical_review_rejects_coinflip(tmp_dir):
     # construct predictions at exactly coin-flip level: 50/50 correct on 200 rows
     rng = np.random.default_rng(0)
     y_true = rng.integers(0, 2, 200)
     y_pred = rng.integers(0, 2, 200)
     df = pl.DataFrame({"y_true": y_true, "y_pred": y_pred})
-    p = Path("/tmp") / "stat_test_exp"
+    p = tmp_dir / "stat_test_exp"
     p.mkdir(exist_ok=True)
     df.write_parquet(str(p / "predictions_improved.parquet"))
     review = statistical_review(p)
@@ -32,13 +38,14 @@ def test_statistical_review_rejects_coinflip():
     assert any("not_significant" in i for i in review["issues_found"])
 
 
-def test_statistical_review_small_sample():
+def test_statistical_review_small_sample(tmp_dir):
     df = pl.DataFrame({"y_true": [1] * 10, "y_pred": [1] * 10})
-    p = Path("/tmp") / "stat_test_small"
+    p = tmp_dir / "stat_test_small"
     p.mkdir(exist_ok=True)
     df.write_parquet(str(p / "predictions_improved.parquet"))
     review = statistical_review(p)
     assert any("sample_size_too_small" in i for i in review["issues_found"])
+    assert any("degenerate_constant_predictions" in i for i in review["issues_found"])
 
 
 def test_validation_gate_end_to_end():

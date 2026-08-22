@@ -17,11 +17,7 @@ def _to_date(ts) -> date:
     if isinstance(ts, datetime):
         return ts.date()
     if isinstance(ts, str):
-        # try ISO date or datetime
-        try:
-            return datetime.fromisoformat(ts.replace("Z", "")).date()
-        except Exception:
-            return datetime.strptime(ts, "%Y-%m-%d").date()
+        return date.fromisoformat(str(ts)[:10])
     raise ValueError(f"unsupported timestamp {ts!r}")
 
 
@@ -55,16 +51,11 @@ class ReplayEngine:
             raise ValueError(f"engine holds {self.ticker}, requested {ticker}")
         ts = _to_date(timestamp)
         snap = self.df.filter(pl.col("available_time") <= ts)
-        # defensive: ensure sorted and no future leakage
-        snap = snap.sort("event_time")
-        # verify invariant
+        # verify invariant (filter is the enforcement; assert is the tripwire)
         if snap.height > 0:
             max_av = snap["available_time"].max()
             assert max_av <= ts, f"leakage: max available {max_av} > {ts}"
         return snap
-
-    def get_snapshot_range(self, ticker: str, end_timestamp) -> pl.DataFrame:
-        return self.get_snapshot(ticker, end_timestamp)
 
     def full_history(self) -> pl.DataFrame:
         return self.df
