@@ -216,3 +216,17 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+# Secrets / API keys
+.env
+.env.*
+!.env.example
+
+# Local market data
+data/raw/
+data/cache/
+data/processed/
+*.duckdb
+*.db
+
+# Local virtual environment
+.venv/
