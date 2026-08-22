@@ -303,7 +303,13 @@ def main():
     p.add_argument("--end", default="2024-12-31")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--reproduce", type=str, default=None, help="experiment_id to reproduce")
+    p.add_argument("--validate", type=str, default=None, help="experiment_id to run validation gate on")
     args = p.parse_args()
+    if args.validate:
+        from quant_loop_trader.agents import validate_experiment
+        verdict = validate_experiment(args.validate)
+        print(json.dumps(verdict, indent=2))
+        return
     if args.reproduce:
         report = reproduce(args.reproduce)
     else:
