@@ -21,6 +21,7 @@ from quant_loop_trader.data import fetch_ohlcv, save_parquet, dataset_metadata, 
 from quant_loop_trader.replay import ReplayEngine
 from quant_loop_trader.features import add_features, add_improved_features, feature_columns, improved_feature_columns
 from quant_loop_trader.evaluation import time_split, evaluate, autopsy
+from quant_loop_trader.research_memory import record_outcome, duplicate_risk, register_features, register_model
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger(__name__)
@@ -136,6 +137,11 @@ def run_experiment(ticker: str = "SPY", horizon: int = 5, start: str = "2018-01-
     hypothesis = "Adding volatility regime classification should improve momentum prediction because trend persistence differs across volatility environments."
     economic_reasoning = "High-vol regimes reflect noise/mean-reversion and crowded positioning; low-vol regimes allow trend persistence due to gradual information diffusion and institutional herding."
     research_question = f"Does volatility regime filtering improve {horizon}-day directional prediction for {ticker}?"
+    # L2: duplicate-prevention — search research memory before committing to this hypothesis
+    dup = duplicate_risk(hypothesis)
+    if dup["should_warn"]:
+        logger.warning(json.dumps({"event": "duplicate_risk", "similar_failures": dup["similar_failures"], "hypothesis": hypothesis[:60]}))
+
     # dataset version etc
     config = {
         "ticker": ticker,
@@ -238,6 +244,39 @@ def run_experiment(ticker: str = "SPY", horizon: int = 5, start: str = "2018-01-
             ],
         )
     con.close()
+
+    # L2: feature registry — register all features used (idempotent)
+    register_features([
+        {"feature_id": "ret_1", "formula": "shift(close/close.shift(1)-1, 1)"},
+        {"feature_id": "ret_5", "formula": "shift(close/close.shift(5)-1, 1)"},
+        {"feature_id": "ma10_gap", "formula": "shift((close-sma10)/close, 1)"},
+        {"feature_id": "vol10", "formula": "shift(std(ret_1,10), 1)"},
+        {"feature_id": "rsi14", "formula": "shift(rsi(14, Wilder), 1)"},
+        {"feature_id": "ret5_x_vol10", "formula": "shift(ret_5 * vol10, 1)", "failure_conditions": "degenerate when vol10 near zero"},
+        {"feature_id": "ret5_div_vol10", "formula": "shift(ret_5 / (vol10+1e-9), 1)", "failure_conditions": "unstable at low vol"},
+    ])
+
+    # L2: model registry — baseline + improved with lineage and status
+    register_model({
+        "model_id": f"{exp_id}_baseline", "training_data_version": meta["dataset_id"],
+        "feature_version": config["feature_version_baseline"],
+        "parameters_json": json.dumps(report["parameters"]),
+        "performance_history_json": json.dumps(baseline["metrics"]),
+        "failure_modes": "majority-class collapse when signal weak (all-positive predictions)",
+        "research_lineage": f"root:{exp_id}", "status": "candidate",
+    })
+    register_model({
+        "model_id": f"{exp_id}_improved", "parent_model_id": f"{exp_id}_baseline",
+        "training_data_version": meta["dataset_id"], "feature_version": config["feature_version_improved"],
+        "parameters_json": json.dumps(report["parameters"]),
+        "performance_history_json": json.dumps(improved["metrics"]),
+        "failure_modes": "same as baseline; interaction terms add no lift in tested regime",
+        "research_lineage": f"momentum→vol_regime_filter:{exp_id}",
+        "status": {"KEEP": "champion", "IMPROVE": "candidate"}.get(decision, "rejected"),
+    })
+
+    # L2: research memory — record outcome + update beliefs
+    record_outcome(report)
 
     logger.info(json.dumps({"event": "experiment_done", "experiment_id": exp_id, "decision": decision, "delta_acc": float(improvement), "path": str(exp_dir)}))
     return report
