@@ -53,8 +53,23 @@ Single-command end-to-end loop — fetch → PIT snapshot → train baseline →
 # reproduce a prior experiment
 .venv/bin/python -m quant_loop_trader.experiment --reproduce 20260822_SPY_5d_cca02216
 
+# run the independent validation gate (statistical + adversarial + replication)
+.venv/bin/python -m quant_loop_trader.experiment --validate <experiment_id>
+
+# autonomous research session (observation mode, budgeted)
+.venv/bin/python -m quant_loop_trader.autonomy --max-experiments 2
+
 # run tests (no API required, uses fixture)
 .venv/bin/python -m pytest -v
 ```
 
 **Design:** SPY single market, 5-day horizon (param-driven for future 1/3/10/20), LogisticRegression + StandardScaler, 5 lagged features (ret_1, ret_5, ma10_gap, vol10, rsi14) + 2 vol-regime interactions for the improvement. `ReplayEngine.get_snapshot(ticker, timestamp)` enforces `available_time <= prediction_timestamp` — only `evaluation.py` sees future outcomes. Baseline vs improved compared on identical hidden test (time-split 70/30) with accuracy/precision/recall/Brier + Sharpe/vol/DD/turnover/cost; decision KEEP/IMPROVE/REJECT stored with lineage.
+
+## Levels
+
+- **L1 — MVP Research Scientist:** single-command loop (`experiment.py`), PIT replay, baseline vs improvement, DuckDB provenance, reproducible via `--reproduce`.
+- **L2 — Research Infrastructure:** `research_memory.py` (institutional memory + belief updates + duplicate-risk detection), feature/model registries, migration `002_registries.sql`.
+- **L3 — Multi-Agent Research Team:** `agents.py` — role/permission model (researcher cannot approve own work), validation gate with three independent reviewers: statistical (binomial significance vs coin-flip), adversarial (label-randomisation null test, regime concentration), and an independent replicator that rebuilds dataset→features→model from documented artifacts only. Champion promotion requires APPROVED from all three.
+- **L4 — Autonomous Research Mode:** `autonomy.py` — budgeted observation-mode sessions: review memory → select unseen configs (duplicate prevention) → run experiments → validate → store knowledge. Scheduling = invoke from cron/launchd; sessions are crash-safe (each experiment commits independently). Champion promotion remains a human decision (REVIEW MODE).
+
+Note: install non-editable (`pip install .`) — macOS security tooling on some machines flags editable-install `.pth` files as hidden, breaking imports. Reinstall after code changes, or run tests (which use `pythonpath = src`).

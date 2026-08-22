@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+from pathlib import Path
 
 import duckdb
 
@@ -11,9 +12,11 @@ from quant_loop_trader.data import DB_PATH, migrate_db
 logger = logging.getLogger(__name__)
 
 
-def _con(db_path=DB_PATH):
-    migrate_db()
-    return duckdb.connect(str(db_path))
+def _con(db_path=None):
+    migrate_db(db_path)
+    import duckdb as _duckdb
+    from quant_loop_trader.data import DB_PATH as _DB
+    return _duckdb.connect(str(Path(db_path or _DB)))
 
 
 def search_memory(query: str, memory_type: str | None = None) -> list[dict]:

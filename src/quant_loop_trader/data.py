@@ -17,7 +17,7 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(os.environ.get("QLT_ROOT", Path.cwd()))
 RAW_DIR = ROOT / "data" / "raw"
 CACHE_DIR = ROOT / "data" / "cache"
 PROC_DIR = ROOT / "data" / "processed"
@@ -34,9 +34,10 @@ def _checksum_df(df: pl.DataFrame) -> str:
     return hashlib.sha256(b).hexdigest()[:16]
 
 
-def migrate_db(db_path: Path = DB_PATH) -> None:
+def migrate_db(db_path: Path | None = None) -> None:
     import duckdb
 
+    db_path = Path(db_path or DB_PATH)
     db_path.parent.mkdir(parents=True, exist_ok=True)
     con = duckdb.connect(str(db_path))
     for sql_file in sorted(MIGR_DIR.glob("*.sql")):
@@ -196,9 +197,10 @@ def dataset_metadata(df: pl.DataFrame, ticker: str, source: str) -> dict:
     }
 
 
-def upsert_dataset(meta: dict, db_path: Path = DB_PATH) -> None:
+def upsert_dataset(meta: dict, db_path: Path | None = None) -> None:
     import duckdb
 
+    db_path = Path(db_path or DB_PATH)
     migrate_db(db_path)
     con = duckdb.connect(str(db_path))
     con.execute(

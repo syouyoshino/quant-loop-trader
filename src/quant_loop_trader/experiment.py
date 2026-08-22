@@ -5,6 +5,7 @@ import argparse
 import hashlib
 import json
 import logging
+import os
 import random
 import sys
 from datetime import datetime, timezone
@@ -26,7 +27,7 @@ from quant_loop_trader.research_memory import record_outcome, duplicate_risk, re
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger(__name__)
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(os.environ.get("QLT_ROOT", Path.cwd()))
 EXP_ROOT = ROOT / "data" / "experiments"
 
 
