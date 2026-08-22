@@ -19,12 +19,12 @@ tests/                  Automated checks
 
 ## Local setup
 
-Create a virtual environment and install the project:
+Create a virtual environment with Python 3.12 and install:
 
 ```bash
-python3 -m venv .venv
+python3.12 -m venv .venv
 source .venv/bin/activate
-pip install -e .
+pip install -e ".[dev]"
 ```
 
 Copy the safe template if needed, then paste your own values into `.env`:
@@ -34,3 +34,27 @@ cp .env.example .env
 ```
 
 Keep `ALPACA_PAPER=true` until the strategy has been tested through historical replay and paper trading.
+
+## Minimum Viable Research Scientist (Level 1)
+
+Single-command end-to-end loop — fetch → PIT snapshot → train baseline → predict → evaluate vs hidden future → autopsy → improved hypothesis → compare → store → reproduce:
+
+```bash
+# uses TIINGO_API_KEY if present, else fixture at tests/fixtures/SPY.csv (offline)
+.venv/bin/python -m quant_loop_trader.experiment --ticker SPY --horizon 5 --start 2018-01-01 --end 2024-12-31
+
+# outputs:
+#   data/processed/SPY.parquet        — cached OHLCV with event_time/available_time
+#   data/research.duckdb              — datasets + experiments tables (migrated)
+#   data/experiments/{id}/report.json — full Experiment Framework record (20 fields)
+#   data/experiments/{id}/predictions_*.parquet
+#   data/experiments/experiments.jsonl — ledger
+
+# reproduce a prior experiment
+.venv/bin/python -m quant_loop_trader.experiment --reproduce 20260822_SPY_5d_cca02216
+
+# run tests (no API required, uses fixture)
+.venv/bin/python -m pytest -v
+```
+
+**Design:** SPY single market, 5-day horizon (param-driven for future 1/3/10/20), LogisticRegression + StandardScaler, 5 lagged features (ret_1, ret_5, ma10_gap, vol10, rsi14) + 2 vol-regime interactions for the improvement. `ReplayEngine.get_snapshot(ticker, timestamp)` enforces `available_time <= prediction_timestamp` — only `evaluation.py` sees future outcomes. Baseline vs improved compared on identical hidden test (time-split 70/30) with accuracy/precision/recall/Brier + Sharpe/vol/DD/turnover/cost; decision KEEP/IMPROVE/REJECT stored with lineage.

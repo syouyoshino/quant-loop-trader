@@ -238,5 +238,6 @@ data/processed/
 data/raw/
 data/processed/
 data/cache/
+data/experiments/
 *.duckdb
 *.parquet
