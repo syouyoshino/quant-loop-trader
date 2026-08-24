@@ -14,9 +14,10 @@ def isolated_research(tmp_path, monkeypatch):
     import quant_loop_trader.autonomy as auto_mod
     import quant_loop_trader.agents as agents_mod
     import quant_loop_trader.report as report_mod
+    import quant_loop_trader.automation.queue as queue_mod
 
     db = tmp_path / "research.duckdb"
-    for m in (data_mod, exp_mod, rm_mod, auto_mod):
+    for m in (data_mod, exp_mod, rm_mod, auto_mod, queue_mod):
         monkeypatch.setattr(m, "DB_PATH", db)
     exp_root = tmp_path / "experiments"
     exp_root.mkdir()
