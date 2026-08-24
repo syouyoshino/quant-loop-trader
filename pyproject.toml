@@ -19,6 +19,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
+advanced = ["xgboost>=2.0"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

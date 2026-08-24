@@ -72,6 +72,20 @@ Single-command end-to-end loop — fetch → PIT snapshot → train baseline →
 - **L3 — Multi-Agent Research Team:** `agents.py` — role/permission model (researcher cannot approve own work), validation gate with three independent reviewers: statistical (binomial significance vs coin-flip), adversarial (label-randomisation null test, regime concentration), and an independent replicator that rebuilds dataset→features→model from documented artifacts only. Champion promotion requires APPROVED from all three.
 - **L4 — Autonomous Research Mode:** `autonomy.py` — budgeted observation-mode sessions: review memory → select unseen configs (duplicate prevention) → run experiments → validate → store knowledge. Scheduling = invoke from cron/launchd; sessions are crash-safe (each experiment commits independently). Champion promotion remains a human decision (REVIEW MODE).
 
+## Platform phases (all built; autonomous mode OFF)
+
+| Phase | Module(s) | Notes |
+|---|---|---|
+| 3 — Features | `features/` (technical, macro, fundamental, pit) | as-of availability joins; truncation-invariance leakage tests |
+| 4 — Prediction | `models/prediction.py`, `experiment.run_horizons` | frozen Prediction objects (1/3/5/10/20d) |
+| 5 — Models | `models/registry.py` | random/majority baselines, logistic, XGBoost (`pip install '.[advanced]'`) |
+| 6 — Experiments | `experiment.py` registry API | list/get/compare, train+test period provenance |
+| 7 — Validation | `validation/` | hidden holdout, ablation, bias dashboard, bootstrap CI |
+| 8 — Portfolio | `portfolio/construction.py` | equal/vol/risk sizing, water-filled caps, drawdown stop |
+| 9 — Strategies | `strategies/framework.py` | Strategy ABC + PIT-only contract; reference impl only |
+| 10 — Automation | `automation/controller.py`, `queue.py` | task queue + controller, **inert** until `enabled=True` AND `QLT_AUTONOMOUS_ENABLED=true` |
+| 11 — Paper prep | `paper_trading.py` | Order/simulator/tracker offline; broker **disabled** until `allow=True` AND `QLT_PAPER_ENABLED=true` |
+
 ## Data connectors (`connectors/`)
 
 Every connector returns `(pl.DataFrame, source)` where the frame satisfies the PIT contract: `event_time` + `available_time` Date columns, `available_time >= event_time`. Any such frame filters through `replay.pit_filter(df, ts)` — the same availability rule as `ReplayEngine.get_snapshot`.
