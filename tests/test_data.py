@@ -4,13 +4,15 @@ from pathlib import Path
 from quant_loop_trader.data import fetch_ohlcv, save_parquet, dataset_metadata, gap_check, PROC_DIR, DB_PATH, migrate_db
 import duckdb
 
-def test_fetch_fallback_or_tiingo():
+def test_fetch_fallback_or_tiingo(monkeypatch):
+    monkeypatch.delenv("TIINGO_API_KEY", raising=False)  # hermetic: exercise fixture path
     df, _ = fetch_ohlcv("SPY", "2018-01-01", "2024-12-31")
     assert df.height > 1000
     assert {"event_time", "available_time", "close"}.issubset(set(df.columns))
     assert (df["available_time"] <= df["event_time"].max()).all() or True  # L1 equal
 
-def test_dataset_reconstruction():
+def test_dataset_reconstruction(monkeypatch):
+    monkeypatch.delenv("TIINGO_API_KEY", raising=False)  # hermetic
     df1, _ = fetch_ohlcv("SPY", "2018-01-01", "2024-12-31", use_cache=False)
     p = PROC_DIR / "SPY.parquet"
     cs1 = save_parquet(df1, p)
@@ -19,7 +21,8 @@ def test_dataset_reconstruction():
     assert cs1 == cs2
     assert df1.height == df2.height
 
-def test_checksum_stable():
+def test_checksum_stable(monkeypatch):
+    monkeypatch.delenv("TIINGO_API_KEY", raising=False)
     df, _ = fetch_ohlcv("SPY", "2019-01-01", "2019-12-31")
     m1 = dataset_metadata(df, "SPY", "test")
     m2 = dataset_metadata(df, "SPY", "test")

@@ -117,14 +117,17 @@ def fetch_ohlcv(ticker: str = "SPY", start: str = "2018-01-01", end: str = "2024
     if use_cache and parquet_path.exists():
         try:
             df = pl.read_parquet(str(parquet_path))
-            # validate date range covers request
             if df.height > 0:
-                min_d = str(df["event_time"].min())
-                max_d = str(df["event_time"].max())
-                if min_d <= start and max_d >= end:
+                # parsed-date coverage check with a small grace window: a request
+                # starting on a holiday/weekend is covered by the next trading day
+                import datetime as _dt
+                s = _dt.date.fromisoformat(start)
+                e = _dt.date.fromisoformat(end)
+                min_d, max_d = df["event_time"].min(), df["event_time"].max()
+                if min_d <= s + _dt.timedelta(days=7) and max_d >= e:
                     df = df.filter(
-                        (pl.col("event_time") >= pl.lit(start).str.strptime(pl.Date, "%Y-%m-%d"))
-                        & (pl.col("event_time") <= pl.lit(end).str.strptime(pl.Date, "%Y-%m-%d"))
+                        (pl.col("event_time") >= pl.lit(s))
+                        & (pl.col("event_time") <= pl.lit(e))
                     )
                     logger.info(json.dumps({"event": "cache_hit_parquet", "ticker": ticker, "rows": df.height}))
                     return df, "cache"
