@@ -23,3 +23,11 @@ def test_evaluate_metrics():
     for k in ["accuracy","precision","recall","sharpe_strategy","cumulative_return_strategy","turnover","transaction_cost_adj_return"]:
         assert k in m
     assert 0 <= m["accuracy"] <= 1
+
+
+def test_bootstrap_ci_contains_point_estimate():
+    from quant_loop_trader.evaluation import bootstrap_ci
+    rng = np.random.default_rng(1)
+    rets = rng.normal(0.001, 0.01, 300)
+    lo, hi = bootstrap_ci(rets)
+    assert lo < rets.mean() < hi and lo < hi

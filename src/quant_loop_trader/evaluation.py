@@ -165,3 +165,14 @@ def autopsy(df_test: pl.DataFrame, y_true: np.ndarray, y_pred: np.ndarray) -> di
     out["false_negative_rate"] = float(((y_pred == 0) & (y_true == 1)).sum() / max((y_true == 1).sum(), 1))
     logger.info(json.dumps({"event": "autopsy", **out}))
     return out
+
+
+def bootstrap_ci(returns: np.ndarray, n_boot: int = 1000, seed: int = 42, alpha: float = 0.05) -> tuple[float, float]:
+    """Percentile bootstrap CI on mean return — how much of a result is sampling luck."""
+    if len(returns) < 2:
+        return (0.0, 0.0)
+    rng = np.random.default_rng(seed)
+    means = [float(rng.choice(returns, len(returns), replace=True).mean()) for _ in range(n_boot)]
+    lo = float(np.quantile(means, alpha / 2))
+    hi = float(np.quantile(means, 1 - alpha / 2))
+    return (lo, hi)
