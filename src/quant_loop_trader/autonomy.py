@@ -114,16 +114,19 @@ def run_session(ticker: str = "SPY", horizon: int = 5,
             entry["issues"] = verdict["issues_found"]
         results.append(entry)
 
-    # heartbeat: distinguishes healthy-idle from broken-silent for unattended ops
-    heartbeat = {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "executed": len(results),
-        "decisions": [r["decision"] for r in results],
-        "grid_remaining": _frontier_remaining(ticker, horizon),
-        "ok": True,
-    }
-    (ROOT / "logs").mkdir(exist_ok=True)
-    (ROOT / "logs" / "heartbeat.json").write_text(json.dumps(heartbeat, indent=2))
+    # heartbeat + alerting via monitoring layer (distinguishes healthy-idle from broken-silent)
+    from quant_loop_trader.monitoring.heartbeat import write_heartbeat
+    from quant_loop_trader.monitoring.alerts import send_alert
+    remaining = _frontier_remaining(ticker, horizon)
+    write_heartbeat(ROOT / "logs", status="healthy",
+                    last_task=results[-1]["experiment_id"] if results else None,
+                    details={"executed": len(results),
+                             "decisions": [r["decision"] for r in results],
+                             "grid_remaining": remaining})
+    if len(results) == 0:
+        send_alert("research_grid_exhausted", "warning",
+                   {"ticker": ticker, "horizon": horizon,
+                    "note": "no new candidates — hypothesis refresh required"})
     # nightly insurance: single-file DB backup, keep last 8
     bdir = ROOT / "backups"
     bdir.mkdir(exist_ok=True)
@@ -139,7 +142,7 @@ def run_session(ticker: str = "SPY", horizon: int = 5,
         "memory_review": memory_review,  # research-director traceability: what we believed entering the session
         "budget": max_experiments,
         "executed": len(results),
-        "grid_remaining": heartbeat["grid_remaining"],
+        "grid_remaining": remaining,
         "results": results,
     }
     logger.info(json.dumps({"event": "session_complete", "executed": len(results)}))
