@@ -212,14 +212,21 @@ def run_experiment(ticker: str = "SPY", horizon: int = 5, start: str = "2018-01-
         "reproducibility": {"seed": seed, "checksum": meta["checksum"], "code_version": _code_version()},
     }
 
-    # 6. store predictions
+    # 6. store predictions, then LOCK them (STEP 4: immutable after creation)
+    def _sha(path: Path) -> str:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+
     baseline["pred_df"].write_parquet(str(exp_dir / "predictions_baseline.parquet"))
     improved["pred_df"].write_parquet(str(exp_dir / "predictions_improved.parquet"))
     (exp_dir / "config.json").write_text(json.dumps(config, indent=2))
     (exp_dir / "metrics.json").write_text(json.dumps({"baseline": baseline["metrics"], "improved": improved["metrics"]}, indent=2))
     (exp_dir / "report.json").write_text(json.dumps(report, indent=2))
-    # ledger jsonl
-    EXP_ROOT.mkdir(parents=True, exist_ok=True)
+    (exp_dir / "predictions.lock").write_text(json.dumps({
+        "predictions_baseline.parquet": _sha(exp_dir / "predictions_baseline.parquet"),
+        "predictions_improved.parquet": _sha(exp_dir / "predictions_improved.parquet"),
+        "config.json": _sha(exp_dir / "config.json"),
+        "locked_at": report["created_at"],
+    }, indent=2))
     # DuckDB experiments table is the single idempotent ledger — no second source of truth
 
     # 7. DuckDB insert

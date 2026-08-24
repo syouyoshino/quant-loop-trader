@@ -7,6 +7,7 @@ separate pipeline owned by reviewer roles below.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 from pathlib import Path
@@ -64,6 +65,27 @@ def _load_predictions(exp_dir: Path) -> pl.DataFrame:
     return pl.read_parquet(str(exp_dir / "predictions_improved.parquet"))
 
 
+def _verify_locks(exp_dir: Path) -> list[str]:
+    """STEP 4 enforcement: predictions are immutable after creation. Any tampering
+    with locked artifacts fails validation before any reviewer runs."""
+    lock_path = exp_dir / "predictions.lock"
+    if not lock_path.exists():
+        return ["missing_predictions_lock"]
+    locks = json.loads(lock_path.read_text())
+    issues = []
+    for name, expected in locks.items():
+        if name == "locked_at":
+            continue
+        f = exp_dir / name
+        if not f.exists():
+            issues.append(f"locked_artifact_missing:{name}")
+            continue
+        actual = hashlib.sha256(f.read_bytes()).hexdigest()
+        if actual != expected:
+            issues.append(f"artifact_tampered:{name}")
+    return issues
+
+
 # --- Statistical Reviewer ---------------------------------------------------
 def statistical_review(exp_dir: Path, alpha: float = 0.05) -> dict:
     """Significance vs the majority-class BASE RATE (not coin-flip), sample size,
@@ -115,12 +137,18 @@ def adversarial_review(exp_dir: Path, ticker: str, horizon: int,
         return Pipeline([("scaler", StandardScaler()),
                          ("clf", LogisticRegression(max_iter=1000, random_state=seed))])
 
+    rng = np.random.default_rng(seed)
     pipe = _pipe()
     pipe.fit(Xtr, ytr)
     real_acc = float((pipe.predict(Xte) == yte).mean())
 
+    # Test 0: feature shuffling — if destroying all feature information leaves
+    # performance unchanged, the model is exploiting noise/majority class.
+    Xte_shuf = rng.permuted(Xte, axis=0)  # independent permutation per column
+    shuffled_acc = float((pipe.predict(Xte_shuf) == yte).mean())
+    feature_dependent = real_acc - shuffled_acc > 0.01
+
     # Test 1: label randomisation — would shuffled targets give similar accuracy?
-    rng = np.random.default_rng(seed)
     null_accs = np.empty(n_shuffles)
     for i in range(n_shuffles):
         ytr_rand = rng.permutation(ytr)
@@ -143,14 +171,16 @@ def adversarial_review(exp_dir: Path, ticker: str, horizon: int,
     concentrated = len(reg_accs) > 1 and min(reg_accs) < 0.5 < acc_overall
 
     issues = []
+    if not feature_dependent:
+        issues.append(f"feature_shuffle:acc_unchanged_when_features_destroyed:{shuffled_acc:.3f}vs{real_acc:.3f}")
     if real_acc <= null_p95:
         issues.append(f"label_randomisation:acc{real_acc:.3f}<=null95{null_p95:.3f}")
     if concentrated:
         issues.append("regime_concentration:edge_driven_by_single_regime")
     logger.info(json.dumps({"event": "adversarial_review", "real_acc": real_acc,
-                            "null_p95": null_p95, "regime_accs": reg_accs}))
+                            "shuffled_acc": shuffled_acc, "null_p95": null_p95, "regime_accs": reg_accs}))
     return _msg("adversarial_reviewer",
-                ["label_randomisation_null_test", "regime_concentration_test"], issues)
+                ["feature_shuffle_null_test", "label_randomisation_null_test", "regime_concentration_test"], issues)
 
 
 # --- Independent Replicator -------------------------------------------------
@@ -193,12 +223,15 @@ def validate_experiment(experiment_id: str) -> dict:
     ticker, horizon = cfg["ticker"], cfg["horizon"]
     start, end, seed = cfg["start"], cfg["end"], cfg["seed"]
 
+    # STEP 4: tamper check first — locked predictions must be untouched
+    lock_issues = _verify_locks(exp_dir)
+
     reviews = [
         statistical_review(exp_dir),
         adversarial_review(exp_dir, ticker, horizon, start, end, seed),
         independent_replication(experiment_id),
     ]
-    all_issues = [i for r in reviews for i in r["issues_found"]]
+    all_issues = [i for r in reviews for i in r["issues_found"]] + lock_issues
     verdict = {
         "experiment_id": experiment_id,
         "reviews": reviews,

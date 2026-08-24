@@ -6,10 +6,11 @@ import polars as pl
 import pytest
 
 from quant_loop_trader.agents import (
+    _verify_locks,
     ROLES, statistical_review, adversarial_review,
     independent_replication, validate_experiment, _msg,
 )
-from quant_loop_trader.experiment import run_experiment
+from quant_loop_trader.experiment import EXP_ROOT, run_experiment
 
 
 @pytest.fixture(scope="module")
@@ -48,11 +49,11 @@ def test_statistical_review_small_sample(tmp_dir):
     assert any("degenerate_constant_predictions" in i for i in review["issues_found"])
 
 
-def test_validation_gate_end_to_end():
+def test_validation_gate_end_to_end(isolated_research):
     report = run_experiment(ticker="SPY", horizon=5, start="2019-01-01", end="2024-12-31", seed=555)
     exp_id = report["experiment_id"]
     verdict = validate_experiment(exp_id)
-    vpath = Path("data/experiments") / exp_id / "validation.json"
+    vpath = isolated_research / exp_id / "validation.json"
     assert vpath.exists()
     loaded = json.loads(vpath.read_text())
     assert loaded["approval_status"] in ("APPROVED", "REJECTED")
@@ -62,3 +63,20 @@ def test_validation_gate_end_to_end():
     # replication must match (deterministic pipeline) — no mismatch issues allowed
     repl = loaded["reviews"][2]
     assert not any("replication_mismatch" in i for i in repl["issues_found"])
+    # predictions lock verified — no tampering issues on fresh experiment
+    assert not any("artifact_tampered" in i or "missing_predictions_lock" in i for i in loaded["issues_found"])
+
+
+def test_prediction_lock_detects_tampering(isolated_research):
+    report = run_experiment(ticker="SPY", horizon=5, start="2020-01-01", end="2023-12-31", seed=321)
+    exp_dir = isolated_research / report["experiment_id"]
+    # tamper: flip a stored prediction after the fact
+    import polars as pl
+    p = exp_dir / "predictions_improved.parquet"
+    df = pl.read_parquet(str(p))
+    df = df.with_columns(pl.when(pl.arange(0, df.height) == 0).then(1 - pl.col("y_pred")).otherwise(pl.col("y_pred")).alias("y_pred"))
+    df.write_parquet(str(p))
+    issues = _verify_locks(exp_dir)
+    assert any("artifact_tampered:predictions_improved.parquet" in i for i in issues)
+    verdict = validate_experiment(report["experiment_id"])
+    assert "artifact_tampered:predictions_improved.parquet" in verdict["issues_found"]

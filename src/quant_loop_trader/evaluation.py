@@ -41,6 +41,30 @@ def _max_drawdown(cum_returns: np.ndarray) -> float:
     return float(dd.min())
 
 
+def _downside_dev(returns: np.ndarray, mar: float = 0.0) -> float:
+    downside = np.minimum(returns - mar, 0)
+    return float(np.sqrt((downside**2).mean())) if len(returns) else 0.0
+
+
+def _trade_quality(strat_rets: np.ndarray) -> dict:
+    """Per-decision quality: distinguishes better decisions from merely more trades."""
+    if len(strat_rets) == 0:
+        return {"win_rate": 0.0, "avg_win": 0.0, "avg_loss": 0.0, "profit_factor": 0.0, "expectancy": 0.0, "n_trades": 0}
+    active = strat_rets[strat_rets != 0]  # decisions where we held a position
+    wins = active[active > 0]
+    losses = active[active <= 0]
+    gross_win = float(wins.sum())
+    gross_loss = float(-losses.sum())
+    return {
+        "win_rate": float(len(wins) / len(active)) if len(active) else 0.0,
+        "avg_win": float(wins.mean()) if len(wins) else 0.0,
+        "avg_loss": float(losses.mean()) if len(losses) else 0.0,
+        "profit_factor": gross_win / gross_loss if gross_loss > 0 else float("inf") if gross_win > 0 else 0.0,
+        "expectancy": float(active.mean()) if len(active) else 0.0,
+        "n_trades": int(len(active)),
+    }
+
+
 def evaluate(y_true: np.ndarray, y_pred: np.ndarray, y_prob: np.ndarray, prices: np.ndarray, horizon: int = 1) -> dict:
     """Return dict with prediction + financial metrics."""
     acc = float(accuracy_score(y_true, y_pred)) if len(y_true) else 0.0
@@ -76,6 +100,16 @@ def evaluate(y_true: np.ndarray, y_pred: np.ndarray, y_prob: np.ndarray, prices:
     cum_strat = np.cumprod(1 + strat_rets_net) if len(strat_rets_net) else np.array([1.0])
     cum_bench = np.cumprod(1 + bench_rets) if len(bench_rets) else np.array([1.0])
 
+    # extended risk: downside deviation, Sortino, VaR/ES, Calmar
+    dd_dev = _downside_dev(strat_rets_net)
+    mean_p = float(strat_rets_net.mean()) * ppy if len(strat_rets_net) else 0.0
+    sortino = mean_p / (dd_dev * ppy) if dd_dev > 0 else 0.0
+    var_95 = float(np.quantile(strat_rets_net, 0.05)) if len(strat_rets_net) else 0.0
+    tail = strat_rets_net[strat_rets_net <= var_95] if len(strat_rets_net) else np.array([])
+    es_95 = float(tail.mean()) if len(tail) else 0.0
+    mdd = _max_drawdown(cum_strat)
+    calmar = mean_p / abs(mdd) if mdd < 0 else 0.0
+
     metrics = {
         "accuracy": acc,
         "precision": prec,
@@ -85,12 +119,20 @@ def evaluate(y_true: np.ndarray, y_pred: np.ndarray, y_prob: np.ndarray, prices:
         "sharpe_benchmark": _sharpe(bench_rets, periods_per_year=ppy),
         "volatility_strategy": float(strat_rets_net.std()) if len(strat_rets_net) else 0.0,
         "volatility_benchmark": float(bench_rets.std()) if len(bench_rets) else 0.0,
-        "max_drawdown_strategy": _max_drawdown(cum_strat),
+        "max_drawdown_strategy": mdd,
         "max_drawdown_benchmark": _max_drawdown(cum_bench),
         "cumulative_return_strategy": float(cum_strat[-1] - 1) if len(cum_strat) else 0.0,
         "cumulative_return_benchmark": float(cum_bench[-1] - 1) if len(cum_bench) else 0.0,
         "turnover": turnover,
         "transaction_cost_adj_return": float(strat_rets.sum()) if len(strat_rets) else 0.0,
+        # risk-adjusted extras
+        "sortino_ratio": sortino,
+        "downside_deviation": dd_dev,
+        "var_95": var_95,
+        "expected_shortfall_95": es_95,
+        "calmar_ratio": calmar,
+        # trade quality
+        **_trade_quality(strat_rets),
         "n_test": int(len(y_true)),
     }
     return metrics

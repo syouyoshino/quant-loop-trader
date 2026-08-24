@@ -59,3 +59,10 @@ class ReplayEngine:
 
     def full_history(self) -> pl.DataFrame:
         return self.df
+
+    def evaluate_future(self, ticker: str, timestamp) -> pl.DataFrame:
+        """Outcomes strictly AFTER timestamp. For EVALUATION systems only —
+        models/features must never receive this frame (enforced by convention +
+        the leakage tests)."""
+        ts = _to_date(timestamp)
+        return self.df.filter(pl.col("event_time") > ts).sort("event_time")
