@@ -1,0 +1,9 @@
+{"entityName": "Apple Inc.", "facts": {"us-gaap": {
+  "NetIncomeLoss": {"units": {"USD": [
+    {"end": "2024-06-30", "val": 21448000000, "fy": 2024, "fp": "Q3", "form": "10-Q", "filed": "2024-08-02"},
+    {"end": "2023-12-31", "val": 33916000000, "fy": 2023, "fp": "FY", "form": "10-K", "filed": "2024-02-02"}
+  ]}},
+  "Assets": {"units": {"USD": [
+    {"end": "2024-06-30", "val": 331657000000, "fy": 2024, "fp": "Q3", "form": "10-Q", "filed": "2024-08-02"}
+  ]}}
+}}}

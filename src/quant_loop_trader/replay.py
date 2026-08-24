@@ -21,6 +21,13 @@ def _to_date(ts) -> date:
     raise ValueError(f"unsupported timestamp {ts!r}")
 
 
+def pit_filter(df: pl.DataFrame, timestamp) -> pl.DataFrame:
+    """PIT filter for ANY connector frame carrying available_time — macro, fundamentals,
+    news. Same contract as ReplayEngine.get_snapshot for arbitrary frames."""
+    ts = _to_date(timestamp)
+    return df.filter(pl.col("available_time") <= ts).sort("event_time")
+
+
 class ReplayEngine:
     """Reconstruct information state at prediction time."""
 

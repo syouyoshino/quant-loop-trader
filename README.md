@@ -72,6 +72,18 @@ Single-command end-to-end loop — fetch → PIT snapshot → train baseline →
 - **L3 — Multi-Agent Research Team:** `agents.py` — role/permission model (researcher cannot approve own work), validation gate with three independent reviewers: statistical (binomial significance vs coin-flip), adversarial (label-randomisation null test, regime concentration), and an independent replicator that rebuilds dataset→features→model from documented artifacts only. Champion promotion requires APPROVED from all three.
 - **L4 — Autonomous Research Mode:** `autonomy.py` — budgeted observation-mode sessions: review memory → select unseen configs (duplicate prevention) → run experiments → validate → store knowledge. Scheduling = invoke from cron/launchd; sessions are crash-safe (each experiment commits independently). Champion promotion remains a human decision (REVIEW MODE).
 
+## Data connectors (`connectors/`)
+
+Every connector returns `(pl.DataFrame, source)` where the frame satisfies the PIT contract: `event_time` + `available_time` Date columns, `available_time >= event_time`. Any such frame filters through `replay.pit_filter(df, ts)` — the same availability rule as `ReplayEngine.get_snapshot`.
+
+| Connector | Source | event_time | available_time |
+|---|---|---|---|
+| `alpaca.fetch_bars` | Alpaca Market Data (IEX feed, historical only — no trading) | bar date (daily close) | same day |
+| `fred.fetch_series` | FRED observations | observation period | period end **+ publication lag** (monthly ~15d, quarterly ~45d; `ponytail:` heuristic — ALFRED vintage_dates is the exact upgrade path) |
+| `sec.fetch_company_facts` | SEC EDGAR XBRL companyfacts | fiscal period end | **exact filing date** — a Q2 report filed Aug 2 is unavailable until Aug 2 |
+
+Unit tests mock all HTTP; integration tests hit live APIs and skip when credentials are absent. SEC raw payloads cached under `data/raw/sec/`.
+
 ## Continuous operation (7-day unattended run)
 
 Installed via launchd (see `deploy/*.plist`, loaded into `~/Library/LaunchAgents`):
