@@ -39,3 +39,19 @@ def test_no_future_leakage_in_experiment(isolated_research):
     # predictions event_time should be after train period (approx 70% split)
     assert pred.height > 0
     assert "y_true" in pred.columns and "y_pred" in pred.columns
+
+
+def test_multi_horizon_framework(isolated_research):
+    from quant_loop_trader.experiment import run_horizons
+    from quant_loop_trader.models.prediction import Prediction, SUPPORTED_HORIZONS
+    assert sorted(SUPPORTED_HORIZONS) == [1, 3, 5, 10, 20]
+    reports = run_horizons(ticker="SPY", horizons=[1, 5], start="2019-01-01", end="2024-12-31", seed=7)
+    assert [r["config"]["horizon"] for r in reports] == [1, 5]
+    # Prediction object: frozen, hashable, content-addressed
+    p = Prediction(timestamp="2024-01-05", ticker="SPY", horizon=5, prediction=1,
+                   confidence=0.55, features_used=["ret_5"], model_version="t")
+    assert p.sha256() != Prediction(timestamp="2024-01-05", ticker="SPY", horizon=5, prediction=0,
+                                    confidence=0.55).sha256()
+    import pytest as _pytest
+    with _pytest.raises(__import__("dataclasses").FrozenInstanceError):
+        p.prediction = 0

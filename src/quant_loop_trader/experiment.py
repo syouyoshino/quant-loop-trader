@@ -333,3 +333,15 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+def run_horizons(ticker: str = "SPY", horizons: list[int] | None = None,
+                 start: str = "2018-01-01", end: str = "2024-12-31", seed: int = 42) -> list[dict]:
+    """Multi-horizon runner (Phase 4): the SAME pipeline at 1/3/5/10/20 day horizons.
+    Framework only — callers decide when to execute; nothing here schedules itself."""
+    from quant_loop_trader.models.prediction import SUPPORTED_HORIZONS
+    horizons = horizons or SUPPORTED_HORIZONS
+    unsupported = [h for h in horizons if h not in SUPPORTED_HORIZONS]
+    if unsupported:
+        raise ValueError(f"unsupported horizons {unsupported}; supported: {SUPPORTED_HORIZONS}")
+    return [run_experiment(ticker=ticker, horizon=h, start=start, end=end, seed=seed) for h in horizons]
