@@ -24,10 +24,26 @@ def volatility_weight(returns: np.ndarray, lookback: int = 20) -> np.ndarray:
 
 
 def apply_max_position(weights: np.ndarray, max_weight: float = 0.25) -> np.ndarray:
-    """Cap and renormalise so exposure stays fully invested but never concentrated."""
-    w = np.clip(weights, 0.0, max_weight)
-    s = w.sum()
-    return w / s if s > 0 else w
+    """Cap positions at max_weight, redistributing excess to uncapped assets
+    (water-filling). When n_assets * cap < 1 the constraint set is infeasible:
+    the unallocatable remainder stays as CASH rather than breaching the cap."""
+    w = np.clip(weights, 0.0, None).astype(float)
+    cap = max_weight
+    frozen = np.zeros(len(w), dtype=bool)
+    for _ in range(10):
+        over = (w > cap + 1e-12) & ~frozen
+        if not over.any():
+            break
+        excess = (w[over] - cap).sum()
+        w[over] = cap
+        frozen |= over
+        under = ~frozen
+        s = w[under].sum()
+        if s <= 0 or excess <= 0:
+            break
+        addition = excess * (w[under] / s)
+        w[under] += addition
+    return w
 
 
 def drawdown_stop(cumulative_returns: np.ndarray, limit: float = -0.15) -> bool:
