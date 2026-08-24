@@ -55,3 +55,16 @@ def test_multi_horizon_framework(isolated_research):
     import pytest as _pytest
     with _pytest.raises(__import__("dataclasses").FrozenInstanceError):
         p.prediction = 0
+
+
+def test_experiment_registry_api(isolated_research):
+    from quant_loop_trader.experiment import compare_experiments, get_experiment, list_experiments
+    r1 = run_experiment(ticker="SPY", horizon=5, start="2019-01-01", end="2024-12-31", seed=11)
+    r2 = run_experiment(ticker="SPY", horizon=5, start="2020-01-01", end="2024-12-31", seed=12)
+    # periods recorded per charter
+    cfg = get_experiment(r1["experiment_id"])["config"]
+    assert cfg["train_period"][0] < cfg["test_period"][0] <= cfg["test_period"][1]
+    listing = list_experiments()
+    assert {r1["experiment_id"], r2["experiment_id"]} <= {e["experiment_id"] for e in listing}
+    cmp_df = compare_experiments([r1["experiment_id"], r2["experiment_id"]])
+    assert cmp_df.height == 2 and {"accuracy", "sharpe_strategy"} <= set(cmp_df.columns)

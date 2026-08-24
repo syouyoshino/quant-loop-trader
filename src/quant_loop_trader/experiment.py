@@ -127,6 +127,13 @@ def run_experiment(ticker: str = "SPY", horizon: int = 5, start: str = "2018-01-
     train_i, test_i = build_train_test(ticker, start, end, horizon, add_improved_features, improved_feature_columns())
     improved = train_evaluate_from(train_i, test_i, improved_feature_columns(), horizon, seed)
 
+    # split provenance (charter: training/validation/test periods recorded per experiment)
+    periods = {
+        "train_period": [str(train_b["event_time"].min()), str(train_b["event_time"].max())],
+        "test_period": [str(test_b["event_time"].min()), str(test_b["event_time"].max())],
+        "train_rows": train_b.height, "test_rows": test_b.height,
+    }
+
     # 5. compare
     b_acc = baseline["metrics"]["accuracy"]
     i_acc = improved["metrics"]["accuracy"]
@@ -161,6 +168,7 @@ def run_experiment(ticker: str = "SPY", horizon: int = 5, start: str = "2018-01-
         "feature_version_improved": "v1+vol_regime_ret5_x_vol10",
         "model_version": "sklearn-LogReg-C1.0-scaled",
         "snapshot_definition": meta["snapshot_definition"],
+        **periods,
     }
     report = {
         # Research
@@ -345,3 +353,48 @@ def run_horizons(ticker: str = "SPY", horizons: list[int] | None = None,
     if unsupported:
         raise ValueError(f"unsupported horizons {unsupported}; supported: {SUPPORTED_HORIZONS}")
     return [run_experiment(ticker=ticker, horizon=h, start=start, end=end, seed=seed) for h in horizons]
+
+
+# --- Phase 6: experiment registry API ---------------------------------------
+
+def get_experiment(experiment_id: str) -> dict:
+    exp_dir = EXP_ROOT / experiment_id
+    return json.loads((exp_dir / "report.json").read_text())
+
+
+def list_experiments(limit: int = 100) -> list[dict]:
+    import duckdb as _d
+    migrate_db()
+    con = _d.connect(str(DB_PATH))
+    rows = con.execute(
+        "SELECT experiment_id, ticker, horizon_days, decision, created_at FROM experiments "
+        "ORDER BY created_at DESC LIMIT ?", [limit]
+    ).fetchall()
+    con.close()
+    cols = ["experiment_id", "ticker", "horizon_days", "decision", "created_at"]
+    out = []
+    seen = set()
+    for r in rows:
+        d = dict(zip(cols, r))
+        base = d["experiment_id"].replace("_baseline", "").replace("_improved", "")
+        if base in seen:
+            continue
+        seen.add(base)
+        d["experiment_id"] = base
+        out.append(d)
+    return out
+
+
+def compare_experiments(experiment_ids: list[str]) -> pl.DataFrame:
+    """Side-by-side metric comparison across experiments (improved variant)."""
+    rows = []
+    for eid in experiment_ids:
+        r = get_experiment(eid)
+        m = r["improved_metrics"]
+        rows.append({
+            "experiment_id": eid,
+            "decision": r["decision"],
+            "horizon": r["config"]["horizon"],
+            **{k: round(v, 6) for k, v in m.items() if isinstance(v, (int, float))},
+        })
+    return pl.DataFrame(rows)
