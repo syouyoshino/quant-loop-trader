@@ -39,4 +39,4 @@ def test_round_trip_equity_accounts_for_costs():
     eq_mid = t.equity({"SPY": 100.0})
     assert eq_mid == pytest.approx(10_000, abs=0.01)  # marked to market, no PnL yet
     t.execute(Order("d2", "SPY", "sell", 10), 110.0)
-    assert t.equity({}) == pytest.approx(11_000)
+    assert t.equity({}) == pytest.approx(10_100)
