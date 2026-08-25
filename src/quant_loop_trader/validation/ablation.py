@@ -12,7 +12,6 @@ def run_ablation(ticker: str, start: str, end: str, horizon: int, seed: int,
     Returns per-group delta vs full-model accuracy (negative = group was helping)."""
     from quant_loop_trader.experiment import build_train_test
     from quant_loop_trader.models.registry import LogisticModel
-    import numpy as np
     from sklearn.metrics import accuracy_score
 
     model_builder = model_builder or (lambda: LogisticModel(seed=seed))

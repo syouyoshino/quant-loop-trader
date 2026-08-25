@@ -1,7 +1,6 @@
 """Weekly research report — reads DuckDB + memory, writes markdown. No new architecture."""
 from __future__ import annotations
 
-import argparse
 import json
 import logging
 from datetime import datetime, timezone
@@ -10,9 +9,8 @@ from pathlib import Path
 import duckdb
 
 from quant_loop_trader import data as _data
-from quant_loop_trader.data import migrate_db, dataset_metadata
+from quant_loop_trader.data import migrate_db
 from quant_loop_trader.experiment import EXP_ROOT
-from quant_loop_trader.research_memory import search_memory
 from quant_loop_trader.autonomy import GRID, _already_run
 
 logger = logging.getLogger(__name__)
@@ -28,18 +26,18 @@ def generate_report(out_dir: Path | None = None) -> Path:
     migrate_db()
     con = duckdb.connect(str(_data.DB_PATH))  # resolved via module global at call time (conftest-safe)
 
-    exp_total = con.execute("SELECT count(*) FROM experiments").fetchone()[0]
+    exp_total = con.execute("SELECT count(*) FROM experiments WHERE authoritative").fetchone()[0]
     decisions = con.execute(
-        "SELECT decision, count(*) FROM experiments WHERE experiment_id NOT LIKE '%_baseline' GROUP BY decision"
+        "SELECT decision, count(*) FROM experiments WHERE authoritative AND experiment_id NOT LIKE '%_baseline' GROUP BY decision"
     ).fetchall()
     week_exps = con.execute(
         "SELECT experiment_id, decision FROM experiments "
-        "WHERE created_at >= current_timestamp - INTERVAL 7 DAY AND experiment_id NOT LIKE '%_baseline' "
+        "WHERE authoritative AND created_at >= current_timestamp - INTERVAL 7 DAY AND experiment_id NOT LIKE '%_baseline' "
         "ORDER BY created_at DESC"
     ).fetchall()
     beliefs = con.execute(
         "SELECT hypothesis, memory_type, confidence, created_at FROM research_memory m "
-        "WHERE created_at = (SELECT max(created_at) FROM research_memory x WHERE x.hypothesis = m.hypothesis) "
+        "WHERE authoritative AND created_at = (SELECT max(created_at) FROM research_memory x WHERE x.hypothesis = m.hypothesis) "
         "ORDER BY confidence DESC LIMIT 10"
     ).fetchall()
     lessons = con.execute(

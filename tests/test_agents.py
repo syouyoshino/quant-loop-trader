@@ -1,5 +1,4 @@
 import json
-from pathlib import Path
 
 import numpy as np
 import polars as pl
@@ -7,10 +6,9 @@ import pytest
 
 from quant_loop_trader.agents import (
     _verify_locks,
-    ROLES, statistical_review, adversarial_review,
-    independent_replication, validate_experiment, _msg,
+    ROLES, statistical_review, validate_experiment,
 )
-from quant_loop_trader.experiment import EXP_ROOT, run_experiment
+from quant_loop_trader.experiment import run_experiment
 
 
 @pytest.fixture(scope="module")
@@ -93,7 +91,7 @@ def test_memory_correction_fires_on_rejected_keep(isolated_research):
     report = _run_exp(ticker="SPY", horizon=5, start="2020-01-01", end="2023-12-31", seed=314)
     con = duckdb.connect(str(dm.DB_PATH))
     con.execute(
-        "INSERT OR REPLACE INTO research_memory VALUES (?, ?, 'success', ?, ?, 'KEEP', 'premature', '{}', '{}', 0.7, '{}', 'v1', current_timestamp)",
+        "INSERT OR REPLACE INTO research_memory VALUES (?, ?, 'success', ?, ?, 'KEEP', 'premature', '{}', '{}', 0.7, '{}', 'v1', current_timestamp, TRUE)",
         [f"mem_{report['experiment_id']}_success", report["experiment_id"],
          "vol regime hypothesis", "Confirmed prematurely"],
     )

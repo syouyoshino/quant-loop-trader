@@ -33,7 +33,7 @@ def add_features(df: pl.DataFrame) -> pl.DataFrame:
         pl.when(pl.col("delta") < 0).then(-pl.col("delta")).otherwise(0).alias("loss"),
     )
     df = df.with_columns(
-        pl.col("gain").rolling_mean(window_size=14).alias("avg_gain"),
+        pl.col("gain").rolling_mean(window_size=14).alias("avg_gain"),  # simple mean; NOT Wilder — registry documents this
         pl.col("loss").rolling_mean(window_size=14).alias("avg_loss"),
     )
     df = df.with_columns(

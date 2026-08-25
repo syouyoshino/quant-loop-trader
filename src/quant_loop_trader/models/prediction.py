@@ -5,7 +5,6 @@ by the evaluation system, never by the predictor.
 """
 from __future__ import annotations
 
-import dataclasses
 import hashlib
 import json
 from dataclasses import asdict, dataclass, field

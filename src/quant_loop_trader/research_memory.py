@@ -5,9 +5,9 @@ import json
 import logging
 from pathlib import Path
 
-import duckdb
 
-from quant_loop_trader.data import DB_PATH, migrate_db
+from quant_loop_trader import data as _data
+from quant_loop_trader.data import migrate_db
 
 logger = logging.getLogger(__name__)
 
@@ -15,14 +15,13 @@ logger = logging.getLogger(__name__)
 def _con(db_path=None):
     migrate_db(db_path)
     import duckdb as _duckdb
-    from quant_loop_trader.data import DB_PATH as _DB
-    return _duckdb.connect(str(Path(db_path or _DB)))
+    return _duckdb.connect(str(Path(db_path or _data.DB_PATH)))
 
 
 def search_memory(query: str, memory_type: str | None = None) -> list[dict]:
     """Search past research by keyword. Returns rows newest-first."""
     con = _con()
-    sql = "SELECT * FROM research_memory WHERE (hypothesis ILIKE ? OR lesson ILIKE ?)"
+    sql = "SELECT * FROM research_memory WHERE authoritative AND (hypothesis ILIKE ? OR lesson ILIKE ?)"
     params = [f"%{query}%", f"%{query}%"]
     if memory_type:
         sql += " AND memory_type = ?"
@@ -58,7 +57,7 @@ def record_outcome(report: dict) -> list[str]:
     memory_id = f"mem_{exp_id}_{memory_type}"
     con = _con()
     con.execute(
-        "INSERT OR REPLACE INTO research_memory VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'v1', current_timestamp)",
+        "INSERT OR REPLACE INTO research_memory VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'v1', current_timestamp, TRUE)",
         [
             memory_id,
             exp_id,
@@ -76,7 +75,7 @@ def record_outcome(report: dict) -> list[str]:
     # market/model knowledge from autopsy
     knowledge_id = f"mem_{exp_id}_knowledge"
     con.execute(
-        "INSERT OR REPLACE INTO research_memory VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'v1', current_timestamp)",
+        "INSERT OR REPLACE INTO research_memory VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'v1', current_timestamp, TRUE)",
         [
             knowledge_id,
             exp_id,

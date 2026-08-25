@@ -3,7 +3,6 @@ import datetime
 
 import numpy as np
 import polars as pl
-import pytest
 
 from quant_loop_trader.validation.holdout import apply_holdout, holdout_boundary
 

@@ -1,5 +1,3 @@
-import re
-from pathlib import Path
 
 from quant_loop_trader.report import generate_report
 

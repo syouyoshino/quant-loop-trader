@@ -26,19 +26,25 @@ def enqueue(task_type: str, payload: dict, priority: int = 5, db_path=None) -> s
     return task_id
 
 
-def claim_next(db_path=None) -> dict | None:
-    """Atomically claim the highest-priority pending task (single-writer DuckDB)."""
+def claim_next(db_path=None, worker: str = "default") -> dict | None:
+    """Atomically claim via UPDATE..RETURNING (audit: SELECT-then-UPDATE race).
+    Also requeues stale 'running' tasks older than 1h whose worker died."""
     con = duckdb.connect(str(db_path or DB_PATH))
-    row = con.execute(
-        "SELECT task_id, task_type, payload_json FROM tasks "
-        "WHERE status = 'pending' ORDER BY priority, created_at LIMIT 1"
-    ).fetchone()
-    if not row:
-        con.close()
-        return None
-    con.execute("UPDATE tasks SET status='running', updated_at=current_timestamp WHERE task_id=?", [row[0]])
+    con.execute(
+        "UPDATE tasks SET status='pending', updated_at=current_timestamp "
+        "WHERE status='running' AND updated_at < current_timestamp - INTERVAL 1 HOUR AND attempts < 3"
+    )
+    rows = con.execute(
+        "UPDATE tasks SET status='running', claimed_by=?, updated_at=current_timestamp "
+        "WHERE task_id = (SELECT task_id FROM tasks WHERE status='pending' "
+        "ORDER BY priority, created_at LIMIT 1) RETURNING task_id, task_type, payload_json",
+        [worker],
+    ).fetchall()
     con.close()
-    return {"task_id": row[0], "task_type": row[1], "payload": json.loads(row[2])}
+    if not rows:
+        return None
+    r = rows[0]
+    return {"task_id": r[0], "task_type": r[1], "payload": json.loads(r[2])}
 
 
 def complete(task_id: str, result: dict, ok: bool = True, db_path=None) -> None:

@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import json
 import logging
-from pathlib import Path
 
 import polars as pl
 import numpy as np
@@ -13,13 +12,18 @@ logger = logging.getLogger(__name__)
 
 
 def time_split(df: pl.DataFrame, train_ratio: float = 0.7, purge: int = 0) -> tuple[pl.DataFrame, pl.DataFrame]:
-    """Time-ordered split, no shuffle. Purge drops last `purge` train rows whose
-    labels read prices inside the hidden test window."""
+    """Time-ordered split with a TRUE embargo gap.
+
+    Audit C1: the previous version moved the TEST boundary along with the train
+    boundary, so the gap never existed and last-train labels read hidden-test
+    prices. Correct semantics: the test window starts at the ORIGINAL cut; training
+    ends `purge` rows earlier, guaranteeing label_t+h < first test observation."""
     df = df.sort("event_time")
     n = df.height
     cut = int(n * train_ratio)
-    cut = max(0, cut - max(0, purge))
-    train = df.slice(0, cut)
+    h = max(0, int(purge))
+    train_end = max(0, cut - h)
+    train = df.slice(0, train_end)
     test = df.slice(cut, n - cut)
     # invariant: train strictly before test
     if train.height and test.height:
@@ -93,8 +97,10 @@ def evaluate(y_true: np.ndarray, y_pred: np.ndarray, y_prob: np.ndarray, prices:
     turnover = float(changes.mean()) if len(changes) else 0.0
     strat_rets_net = strat_rets.copy()
     if len(strat_rets_net):
-        # change between bucket i-1 and i costs entry at bucket i
+        # entry into the FIRST bucket costs too when a position is taken
         strat_rets_net[1:] -= changes * 0.0005
+        if len(pos) and pos[0] > 0:
+            strat_rets_net[0] -= 0.0005
 
     ppy = 252 / h  # h-day buckets → annualization factor
     cum_strat = np.cumprod(1 + strat_rets_net) if len(strat_rets_net) else np.array([1.0])
@@ -103,12 +109,15 @@ def evaluate(y_true: np.ndarray, y_pred: np.ndarray, y_prob: np.ndarray, prices:
     # extended risk: downside deviation, Sortino, VaR/ES, Calmar
     dd_dev = _downside_dev(strat_rets_net)
     mean_p = float(strat_rets_net.mean()) * ppy if len(strat_rets_net) else 0.0
-    sortino = mean_p / (dd_dev * ppy) if dd_dev > 0 else 0.0
+    # annualized mean over ANNUALIZED downside deviation (audit: ppy cancelled before)
+    sortino = mean_p / (dd_dev * np.sqrt(ppy)) if dd_dev > 0 else 0.0
     var_95 = float(np.quantile(strat_rets_net, 0.05)) if len(strat_rets_net) else 0.0
     tail = strat_rets_net[strat_rets_net <= var_95] if len(strat_rets_net) else np.array([])
     es_95 = float(tail.mean()) if len(tail) else 0.0
     mdd = _max_drawdown(cum_strat)
-    calmar = mean_p / abs(mdd) if mdd < 0 else 0.0
+    n_buckets = max(len(cum_strat), 1)
+    cagr = (float(cum_strat[-1]) ** (ppy / n_buckets) - 1) if len(cum_strat) and cum_strat[-1] > 0 else -1.0
+    calmar = cagr / abs(mdd) if mdd < 0 else 0.0
 
     metrics = {
         "accuracy": acc,

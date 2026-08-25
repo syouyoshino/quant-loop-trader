@@ -43,11 +43,13 @@ class MomentumStrategy(Strategy):
         feat = add_features(snapshot).drop_nulls(subset=feature_columns())
         preds = []
         for row in feat.iter_rows(named=True):
-            score = 1 if (row["ret_5"] or 0) > 0 else 0
+            ret = row["ret_5"] or 0
+            score = 1 if ret > 0 else 0
             preds.append(Prediction(
                 timestamp=str(row["event_time"]), ticker=ticker.upper(), horizon=self.horizon,
                 prediction=score,
-                confidence=0.5 + min(abs(row["ret_5"] or 0), 0.05),  # bounded, honest confidence
+                # confidence IS P(up): must agree with the prediction direction (audit H-conf)
+                confidence=0.5 + min(abs(ret), 0.05) if score == 1 else 0.5 - min(abs(ret), 0.05),
                 features_used=feature_columns(),
                 model_version=f"{self.name}-{self.version}",
                 strategy_version=self.version,

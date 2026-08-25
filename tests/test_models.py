@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 
 from quant_loop_trader.models.registry import (
-    REGISTRY, build_model, LogisticModel, MajorityPredictor, RandomPredictor, XGBoostModel,
+    build_model, LogisticModel, MajorityPredictor, RandomPredictor,
 )
 
 
@@ -53,3 +53,13 @@ def test_logistic_beats_majority_on_learnable_signal():
 def test_unknown_model_rejected():
     with pytest.raises(ValueError, match="unknown model"):
         build_model("transformer-ultra")
+
+
+def test_majority_predictor_respects_class_zero_majority():
+    """Audit H3 regression: sentinel must predict DOWN when class 0 dominates."""
+    X = np.zeros((100, 2))
+    y = np.array([0] * 70 + [1] * 30)
+    m = MajorityPredictor().fit(X, y)
+    preds = m.predict(X)
+    assert (preds == 0).all(), "majority-class sentinel predicted the minority class"
+    assert m.predict_proba(X)[0] < 0.5  # P(class=1) below threshold

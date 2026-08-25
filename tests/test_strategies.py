@@ -6,7 +6,7 @@ import pytest
 from quant_loop_trader.strategies.framework import (
     MomentumStrategy, STRATEGY_REGISTRY, build_strategy,
 )
-from quant_loop_trader.replay import ReplayEngine, pit_filter
+from quant_loop_trader.replay import ReplayEngine
 
 
 def _snapshot(tmp_path):
@@ -40,4 +40,5 @@ def test_momentum_reference_produces_frozen_predictions_from_pit_only(tmp_path):
     # every prediction timestamp respects the snapshot boundary — no future peeking
     for p in preds:
         assert p.timestamp <= "2020-02-29"
-        assert 0 <= p.prediction <= 1 and 0.5 <= p.confidence <= 0.56
+        assert 0 <= p.prediction <= 1
+        assert (p.confidence > 0.5) == (p.prediction == 1)  # confidence is P(up), consistent with direction

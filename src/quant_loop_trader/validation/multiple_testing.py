@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import math
 
-import numpy as np
 
 
 def benjamini_hochberg(pvals: list[float], fdr: float = 0.10) -> list[bool]:

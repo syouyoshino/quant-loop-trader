@@ -22,11 +22,11 @@ def build_dashboard(exp_root: Path, db_path=None) -> dict:
         import time
         time.sleep(1)  # writer lock held — contention, not corruption
         con = duckdb.connect(str(db_path or _data.DB_PATH), read_only=True)
-    total_exp = con.execute("SELECT count(*) FROM experiments WHERE experiment_id NOT LIKE '%_baseline'").fetchone()[0]
+    total_exp = con.execute("SELECT count(*) FROM experiments WHERE authoritative AND experiment_id NOT LIKE '%_baseline'").fetchone()[0]
     decisions = dict(con.execute(
-        "SELECT decision, count(*) FROM experiments WHERE experiment_id NOT LIKE '%_baseline' GROUP BY decision"
+        "SELECT decision, count(*) FROM experiments WHERE authoritative AND experiment_id NOT LIKE '%_baseline' GROUP BY decision"
     ).fetchall())
-    distinct_hyp = con.execute("SELECT count(DISTINCT hypothesis) FROM experiments").fetchone()[0]
+    distinct_hyp = con.execute("SELECT count(DISTINCT hypothesis) FROM experiments WHERE authoritative").fetchone()[0]
     models = dict(con.execute("SELECT status, count(*) FROM model_registry GROUP BY status").fetchall())
     con.close()
 

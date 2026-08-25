@@ -1,7 +1,6 @@
 import json
 
 import pytest
-from pathlib import Path
 
 from quant_loop_trader.autonomy import run_session, select_candidates, review_memory, _already_run
 
@@ -16,7 +15,6 @@ def test_session_blocked_without_activation_key(monkeypatch):
     monkeypatch.delenv("QLT_AUTONOMOUS_ENABLED", raising=False)
     out = run_session(max_experiments=1)
     assert out["skipped"] == "autonomous_disabled" and out["executed"] == 0
-    from quant_loop_trader.data import migrate_db, DB_PATH as _real_unused
     import quant_loop_trader.data as _dm
     _dm.migrate_db()
     from quant_loop_trader.automation.queue import pending_count

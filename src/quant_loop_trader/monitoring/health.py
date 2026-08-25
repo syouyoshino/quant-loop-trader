@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
 from pathlib import Path
 
 import duckdb
@@ -35,12 +34,13 @@ def check_health(logs_dir: Path, exp_root: Path, db_path=None) -> dict:
         ).fetchone()[0]
         pending = con.execute("SELECT count(*) FROM tasks WHERE status='pending'").fetchone()[0]
         failed = con.execute("SELECT count(*) FROM tasks WHERE status='failed'").fetchone()[0]
+        _sev = {"healthy": 0, "degraded": 1, "broken": 2}
         con.close()
         report["checks"]["database"] = "ok"
         report["last_experiment_at"] = str(last_exp)
         report["queue"] = {"pending": pending, "failed": failed}
         if failed > 3:
-            report["status"] = max(report["status"], "degraded")
+            report["status"] = "degraded" if _sev[report["status"]] < _sev["degraded"] else report["status"]
     except Exception as e:
         report["checks"]["database"] = f"error:{str(e)[:80]}"
         report["status"] = "broken"

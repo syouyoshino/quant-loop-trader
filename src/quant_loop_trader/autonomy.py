@@ -25,7 +25,7 @@ import duckdb
 from quant_loop_trader.data import DB_PATH, migrate_db
 from quant_loop_trader.experiment import run_experiment
 from quant_loop_trader.agents import validate_experiment
-from quant_loop_trader.research_memory import search_memory, duplicate_risk
+from quant_loop_trader.research_memory import search_memory
 
 logger = logging.getLogger(__name__)
 

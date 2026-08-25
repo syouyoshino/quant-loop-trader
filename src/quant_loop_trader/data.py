@@ -153,6 +153,9 @@ def fetch_ohlcv(ticker: str = "SPY", start: str = "2018-01-01", end: str = "2024
     # 3. fixture fallback — forbidden while a key is configured (never poison research silently)
     if api_key:
         raise RuntimeError("Tiingo failed and fixture fallback is forbidden while TIINGO_API_KEY is set")
+    if ticker.upper() != "SPY":
+        # audit C4: fixture IS SPY data — serving it as another ticker corrupts dataset identity
+        raise ValueError(f"fixture fallback only covers SPY; no data source available for {ticker}")
     fixture = _load_fixture()
     if fixture is not None:
         logger.info(json.dumps({"event": "fixture_used", "ticker": ticker, "rows": fixture.height}))

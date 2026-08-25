@@ -1,5 +1,4 @@
 """Task 1 tests: hypothesis engine, novelty, ranking, config generation."""
-import pytest
 
 from quant_loop_trader.research.hypothesis_engine import (
     generate_candidates, novelty_check, token_similarity,

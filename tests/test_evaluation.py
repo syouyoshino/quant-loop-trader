@@ -1,3 +1,5 @@
+import datetime
+
 import polars as pl
 import numpy as np
 from quant_loop_trader.evaluation import time_split, evaluate
@@ -31,3 +33,24 @@ def test_bootstrap_ci_contains_point_estimate():
     rets = rng.normal(0.001, 0.01, 300)
     lo, hi = bootstrap_ci(rets)
     assert lo < rets.mean() < hi and lo < hi
+
+
+def test_purge_creates_true_embargo_gap():
+    """Audit C1 regression: last training LABEL's t+h endpoint must fall strictly
+    before the first test observation. The old boundary-shifting purge failed this."""
+    from quant_loop_trader.evaluation import time_split
+    n, h = 1000, 5
+    df = pl.DataFrame({
+        "event_time": [datetime.date(2020, 1, 1) + datetime.timedelta(days=i) for i in range(n)],
+        "close": [float(i) for i in range(n)],
+        "label": [0] * n,
+    })
+    train, test = time_split(df, 0.7, purge=h)
+    # last train row's position in the ORIGINAL ordering
+    last_train_t = train["event_time"][-1]
+    orig_idx_last_train = (last_train_t - datetime.date(2020, 1, 1)).days
+    first_test_idx = (test["event_time"][0] - datetime.date(2020, 1, 1)).days
+    # the label at t reads close[t+h]; that price must precede the test window
+    assert orig_idx_last_train + h < first_test_idx
+    # and no rows are lost: embargo gap is real but total accounting holds
+    assert first_test_idx - orig_idx_last_train == h + 1  # indices: gap rows are h+1 positions

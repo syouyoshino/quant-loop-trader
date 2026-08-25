@@ -1,7 +1,5 @@
-import json
 import polars as pl
-from quant_loop_trader.experiment import EXP_ROOT, run_experiment
-from quant_loop_trader.data import PROC_DIR, DB_PATH, FIXTURE_PATH
+from quant_loop_trader.experiment import run_experiment
 import duckdb
 
 def test_experiment_e2e_fixture(isolated_research):

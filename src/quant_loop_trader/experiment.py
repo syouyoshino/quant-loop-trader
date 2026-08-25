@@ -7,7 +7,6 @@ import json
 import logging
 import os
 import random
-import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -253,7 +252,7 @@ def run_experiment(ticker: str = "SPY", horizon: int = 5, start: str = "2018-01-
     for suffix, res, feat_ver in [("baseline", baseline, "v1"), ("improved", improved, "v1+vol_regime")]:
         eid = f"{exp_id}_{suffix}"
         con.execute(
-            "INSERT OR REPLACE INTO experiments VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, current_timestamp)",
+            "INSERT OR REPLACE INTO experiments VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, current_timestamp, TRUE)",
             [
                 eid,
                 meta["dataset_id"],
@@ -281,7 +280,7 @@ def run_experiment(ticker: str = "SPY", horizon: int = 5, start: str = "2018-01-
         {"feature_id": "ret_5", "formula": "shift(close/close.shift(5)-1, 1)"},
         {"feature_id": "ma10_gap", "formula": "shift((close-sma10)/close, 1)"},
         {"feature_id": "vol10", "formula": "shift(std(ret_1,10), 1)"},
-        {"feature_id": "rsi14", "formula": "shift(rsi(14, Wilder), 1)"},
+        {"feature_id": "rsi14", "formula": "shift(rsi(14, simple-mean gains/losses), 1)"},
         {"feature_id": "ret5_x_vol10", "formula": "shift(ret_5 * vol10, 1)", "failure_conditions": "degenerate when vol10 near zero"},
         {"feature_id": "ret5_div_vol10", "formula": "shift(ret_5 / (vol10+1e-9), 1)", "failure_conditions": "unstable at low vol"},
     ])
@@ -385,7 +384,7 @@ def list_experiments(limit: int = 100) -> list[dict]:
     con = _d.connect(str(DB_PATH))
     rows = con.execute(
         "SELECT experiment_id, ticker, horizon_days, decision, created_at FROM experiments "
-        "ORDER BY created_at DESC LIMIT ?", [limit]
+        "WHERE authoritative ORDER BY created_at DESC LIMIT ?", [limit]
     ).fetchall()
     con.close()
     cols = ["experiment_id", "ticker", "horizon_days", "decision", "created_at"]

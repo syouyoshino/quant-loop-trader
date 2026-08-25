@@ -1,7 +1,5 @@
-import json, hashlib
 import polars as pl
-from pathlib import Path
-from quant_loop_trader.data import fetch_ohlcv, save_parquet, dataset_metadata, gap_check, PROC_DIR, DB_PATH, migrate_db
+from quant_loop_trader.data import fetch_ohlcv, save_parquet, dataset_metadata, PROC_DIR, DB_PATH, migrate_db
 import duckdb
 
 def test_fetch_fallback_or_tiingo(monkeypatch):

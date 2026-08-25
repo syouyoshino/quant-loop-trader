@@ -1,4 +1,3 @@
-import pytest
 
 from quant_loop_trader.automation import queue
 from quant_loop_trader.automation.controller import ResearchController

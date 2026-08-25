@@ -1,13 +1,8 @@
-import json
-import duckdb
-import polars as pl
-from pathlib import Path
 
 from quant_loop_trader.research_memory import (
     search_memory, record_outcome, prior_confidence, duplicate_risk,
     register_features, register_model, _con,
 )
-from quant_loop_trader.data import DB_PATH
 from quant_loop_trader.experiment import run_experiment
 
 
@@ -93,3 +88,33 @@ def test_e2e_registers_memory_and_models(tmp_path=None):
     assert len(models) == 2
     assert feats >= 7
     assert len(mems) >= 2  # outcome + knowledge
+
+
+def test_quarantined_outcomes_excluded_from_decision_views(isolated_research):
+    """Audit C1 remediation: pre-fix outcomes are non-authoritative and must be
+    invisible to memory search, experiment listing, and DSR trial counts."""
+    import duckdb
+    import quant_loop_trader.data as dm
+    from quant_loop_trader.research_memory import search_memory
+    from quant_loop_trader.experiment import run_experiment, list_experiments
+    from quant_loop_trader.agents import _experiment_count
+
+    dm.migrate_db()
+    def _raw_authoritative():
+        con = duckdb.connect(str(dm.DB_PATH), read_only=True)
+        n = con.execute("SELECT count(*) FROM experiments WHERE authoritative AND experiment_id NOT LIKE '%_baseline'").fetchone()[0]
+        con.close()
+        return n
+    before = _raw_authoritative()
+    report = run_experiment(ticker="SPY", horizon=5, start="2020-01-01", end="2022-12-31", seed=404)
+    after = _raw_authoritative()
+    assert after == before + 1  # new experiment is authoritative
+
+    con = duckdb.connect(str(dm.DB_PATH))
+    con.execute("UPDATE experiments SET authoritative = FALSE")
+    con.execute("UPDATE research_memory SET authoritative = FALSE")
+    con.close()
+
+    assert list_experiments() == []                      # listing hides quarantined
+    assert search_memory("volatility regime") == []      # memory reads hide quarantined
+    assert _experiment_count() == 1  # DSR trials exclude quarantined (floor=1 is DSR-safe)

@@ -68,7 +68,9 @@ class MajorityPredictor(BaseModel):
         return self
 
     def predict_proba(self, X):
-        return np.full(len(X), max(self._p, 1 - self._p))
+        # P(class=1) — the majority CLASS, not the majority PROBABILITY.
+        # audit H3: max(p,1-p) inverted the sentinel when class 0 dominated.
+        return np.full(len(X), self._p)
 
 
 class LogisticModel(BaseModel):

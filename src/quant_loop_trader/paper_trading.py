@@ -10,9 +10,8 @@ SAFETY BOUNDARY (charter):
 """
 from __future__ import annotations
 
-import json
 import os
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 
 
 @dataclass(frozen=True)
@@ -63,7 +62,26 @@ class ExecutionSimulator:
         errs = order.validate()
         if errs:
             raise ValueError(f"invalid order: {errs}")
+        if order.order_type not in ("market", "limit"):
+            raise ValueError(f"unsupported order_type '{order.order_type}'")
         slip = bar_close * self.slippage_bps / 10_000
+        if order.order_type == "limit":
+            # audit H10: limits must actually bind — a buy fills only when the
+            # slipped market price is at/below the limit, and never above it
+            if order.side == "buy":
+                mkt = bar_close + slip
+                if mkt > order.limit_price:
+                    return {"filled": False, "reason": "limit_below_market",
+                            "limit": order.limit_price, "market": round(mkt, 4)}
+                price = min(order.limit_price, mkt)
+            else:
+                mkt = bar_close - slip
+                if mkt < order.limit_price:
+                    return {"filled": False, "reason": "limit_above_market",
+                            "limit": order.limit_price, "market": round(mkt, 4)}
+                price = max(order.limit_price, mkt)
+            return {"filled": True, "price": round(price, 4), "quantity": order.quantity,
+                    "slippage_bps": self.slippage_bps}
         price = bar_close + slip if order.side == "buy" else bar_close - slip
         return {"filled": True, "price": round(price, 4), "quantity": order.quantity,
                 "slippage_bps": self.slippage_bps}

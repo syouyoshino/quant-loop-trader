@@ -7,7 +7,6 @@ enforce hard limits (max position, drawdown stop).
 from __future__ import annotations
 
 import numpy as np
-import polars as pl
 
 
 def equal_weight(n_positions: int) -> np.ndarray:
@@ -19,7 +18,10 @@ def volatility_weight(returns: np.ndarray, lookback: int = 20) -> np.ndarray:
     r = returns[-lookback:]
     vol = r.std(axis=0)
     inv = 1.0 / np.where(vol > 1e-12, vol, np.inf)
-    w = inv / inv.sum()
+    total = inv.sum()
+    if not np.isfinite(total) or total <= 0:
+        return equal_weight(returns.shape[1])  # all-zero vol: degenerate → equal weight (audit NaN)
+    w = inv / total
     return np.nan_to_num(w)
 
 

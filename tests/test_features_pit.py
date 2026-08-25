@@ -2,11 +2,10 @@
 import datetime
 
 import polars as pl
-import pytest
 
 from quant_loop_trader.features.macro import build_macro_features
 from quant_loop_trader.features.fundamental import build_fundamental_features
-from quant_loop_trader.features.pit import asof_values, yoy_growth
+from quant_loop_trader.features.pit import asof_values
 
 
 def _dates(*d: str) -> pl.DataFrame:

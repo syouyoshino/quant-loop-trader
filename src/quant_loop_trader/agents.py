@@ -264,7 +264,9 @@ def validate_experiment(experiment_id: str) -> dict:
         if dsr["verdict"] == "PROBABLY_LUCK":
             all_issues.append("multiple_testing:deflated_sharpe_probably_luck")
     except Exception as e:
-        hardening["error"] = str(e)[:200]  # recorded, never silently dropped
+        # FAIL CLOSED (audit C2): a broken validator must make approval impossible
+        hardening["error"] = str(e)[:200]
+        all_issues.append(f"hardening_error:{str(e)[:120]}")
 
     verdict = {
         "experiment_id": experiment_id,
@@ -277,7 +279,9 @@ def validate_experiment(experiment_id: str) -> dict:
     # promotion policy: champion only survives every reviewer; enforced in DB, not prose
     import duckdb
     from quant_loop_trader.data import DB_PATH
-    status = "champion" if verdict["approval_status"] == "APPROVED" else "rejected"
+    # APPROVED ≠ champion: validation grants ELIGIBLE; only explicit holdout
+    # adjudication (audit C3) may open the hidden segment and promote.
+    status = "eligible" if verdict["approval_status"] == "APPROVED" else "rejected"
     con = duckdb.connect(str(DB_PATH))
     con.execute("UPDATE model_registry SET status=? WHERE model_id=?", [status, f"{experiment_id}_improved"])
     con.close()
@@ -297,7 +301,7 @@ def _experiment_count() -> int:
     from quant_loop_trader.data import DB_PATH, migrate_db
     migrate_db()
     con = duckdb.connect(str(DB_PATH), read_only=True)
-    n = con.execute("SELECT count(*) FROM experiments WHERE experiment_id NOT LIKE '%_baseline'").fetchone()[0]
+    n = con.execute("SELECT count(*) FROM experiments WHERE authoritative AND experiment_id NOT LIKE '%_baseline'").fetchone()[0]
     con.close()
     return max(1, n)
 

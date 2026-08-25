@@ -25,3 +25,84 @@ def apply_holdout(df, start: str, end: str, use_holdout: bool):
     if use_holdout:
         return df.filter(pl.col("event_time") >= b)
     return df.filter(pl.col("event_time") < b)
+
+
+def adjudicate_holdout(experiment_id: str) -> dict:
+    """FINAL adjudication: opens the hidden segment exactly once for an ELIGIBLE
+    experiment. Retrains on all non-holdout data, evaluates on the untouched tail,
+    and promotes to champion only if it beats the majority-class base rate there.
+    This is the only code path that may set model_registry status='champion'."""
+    import json
+    import duckdb
+    from quant_loop_trader.data import PROC_DIR, DB_PATH, migrate_db
+    from quant_loop_trader.experiment import EXP_ROOT
+    from quant_loop_trader.agents import statistical_review
+    from quant_loop_trader.models.registry import build_model
+
+    exp_dir = EXP_ROOT / experiment_id
+    cfg = json.loads((exp_dir / "config.json").read_text())
+    con = duckdb.connect(str(DB_PATH))
+    row = con.execute("SELECT status FROM model_registry WHERE model_id=?", [f"{experiment_id}_improved"]).fetchone()
+    con.close()
+    if not row or row[0] != "eligible":
+        return {"promoted": False, "reason": f"not_eligible:{row[0] if row else 'missing'}"}
+
+    ticker, h = cfg["ticker"], cfg["horizon"]
+    pq = PROC_DIR / f"{ticker}.parquet"
+    df = _load_holdout_frame(pq, cfg)
+    feats = _improved_cols(df)
+    Xte, yte = feats.select(_feature_names()).to_numpy(), feats["label"].to_numpy()
+    m = build_model(cfg.get("model_type", "logistic"), seed=cfg["seed"]).fit(
+        _train_all_nonholdout(pq, cfg), _labels_nonholdout(pq, cfg))
+    ypred = m.predict(Xte)
+    base = float(max(yte.mean(), 1 - yte.mean()))
+    acc = float((ypred == yte).mean())
+    promoted = len(yte) >= 50 and acc > base and statistical_review(exp_dir)["approval_status"] == "APPROVED"
+    result = {"promoted": promoted, "holdout_accuracy": acc,
+              "base_rate": base, "n_holdout": int(len(yte))}
+    (exp_dir / "holdout_report.json").write_text(json.dumps(result, indent=2))
+    migrate_db()
+    con = duckdb.connect(str(DB_PATH))
+    new_status = "champion" if promoted else "rejected"
+    con.execute("UPDATE model_registry SET status=? WHERE model_id=?", [new_status, f"{experiment_id}_improved"])
+    con.close()
+    return result
+
+
+def _load_holdout_frame(pq, cfg):
+    import polars as pl
+    from quant_loop_trader.replay import ReplayEngine
+    from quant_loop_trader.experiment import make_labels
+    from quant_loop_trader.features import add_improved_features
+    df = ReplayEngine(pq).get_snapshot(cfg["ticker"], cfg["end"])
+    df = df.filter(pl.col("event_time") >= pl.lit(cfg["start"]).str.strptime(pl.Date, "%Y-%m-%d"))
+    df = apply_holdout(df, cfg["start"], cfg["end"], use_holdout=True)  # THE opening
+    return add_improved_features(make_labels(df, cfg["horizon"])).drop_nulls(
+        subset=_improved_cols(df).columns)
+
+
+def _improved_cols(df):
+    from quant_loop_trader.features import improved_feature_columns
+    return df.select(improved_feature_columns() + ["label"])
+
+
+def _feature_names():
+    from quant_loop_trader.features import improved_feature_columns
+    return improved_feature_columns()
+
+
+def _train_all_nonholdout(pq, cfg):
+    import polars as pl
+    from quant_loop_trader.replay import ReplayEngine
+    from quant_loop_trader.experiment import make_labels
+    from quant_loop_trader.features import add_improved_features, improved_feature_columns
+    df = ReplayEngine(pq).get_snapshot(cfg["ticker"], cfg["end"])
+    df = df.filter(pl.col("event_time") >= pl.lit(cfg["start"]).str.strptime(pl.Date, "%Y-%m-%d"))
+    df = apply_holdout(df, cfg["start"], cfg["end"], use_holdout=False)
+    clean = add_improved_features(make_labels(df, cfg["horizon"])).drop_nulls(
+        subset=improved_feature_columns() + ["label"])
+    return clean.select(improved_feature_columns()).to_numpy(), clean["label"].to_numpy()
+
+
+def _labels_nonholdout(pq, cfg):
+    return None  # labels returned with features by _train_all_nonholdout
