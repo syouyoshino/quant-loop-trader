@@ -71,5 +71,7 @@ class ReplayEngine:
         """Outcomes strictly AFTER timestamp. For EVALUATION systems only —
         models/features must never receive this frame (enforced by convention +
         the leakage tests)."""
+        if ticker != self.ticker:
+            raise ValueError(f"engine holds {self.ticker}, requested {ticker}")
         ts = _to_date(timestamp)
         return self.df.filter(pl.col("event_time") > ts).sort("event_time")

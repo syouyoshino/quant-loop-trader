@@ -89,6 +89,11 @@ def train_evaluate_from(train: pl.DataFrame, test: pl.DataFrame, feat_cols: list
         y_prob = y_pred.astype(float)
 
     metrics = evaluate(y_test, y_pred, y_prob, prices_test, horizon)
+    # family-level FDR input: binomial p vs majority-class base rate
+    from scipy.stats import binomtest
+    base_rate = float(max(np.mean(y_test), 1 - np.mean(y_test)))
+    correct = int((np.asarray(y_pred) == np.asarray(y_test)).sum())
+    metrics["stat_pvalue"] = float(binomtest(correct, len(y_test), base_rate).pvalue)
     err = autopsy(test, y_test, y_pred)
 
     # predictions frame for storage (only test)
@@ -223,6 +228,7 @@ def run_experiment(ticker: str = "SPY", horizon: int = 5, start: str = "2018-01-
         "final_result": decision,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "config": config,
+        "stat_pvalue": baseline["metrics"].get("stat_pvalue"),
         "reproducibility": {"seed": seed, "checksum": meta["checksum"], "code_version": _code_version()},
     }
 
@@ -282,8 +288,8 @@ def run_experiment(ticker: str = "SPY", horizon: int = 5, start: str = "2018-01-
         {"feature_id": "ma10_gap", "formula": "shift((close-sma10)/close, 1)"},
         {"feature_id": "vol10", "formula": "shift(std(ret_1,10), 1)"},
         {"feature_id": "rsi14", "formula": "shift(rsi(14, simple-mean gains/losses), 1)"},
-        {"feature_id": "ret5_x_vol10", "formula": "shift(ret_5 * vol10, 1)", "failure_conditions": "degenerate when vol10 near zero"},
-        {"feature_id": "ret5_div_vol10", "formula": "shift(ret_5 / (vol10+1e-9), 1)", "failure_conditions": "unstable at low vol"},
+        {"feature_id": "ret5_x_vol10", "formula": "ret_5(shifted) * vol10(shifted) — inputs are already lagged; no extra shift", "failure_conditions": "degenerate when vol10 near zero"},
+        {"feature_id": "ret5_div_vol10", "formula": "ret_5(shifted) / (vol10(shifted)+1e-9) — inputs are already lagged; no extra shift", "failure_conditions": "unstable at low vol"},
     ])
 
     # L2: model registry — baseline + improved with lineage and status

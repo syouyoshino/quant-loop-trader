@@ -42,7 +42,7 @@ def generate_report(out_dir: Path | None = None) -> Path:
     ).fetchall()
     lessons = con.execute(
         "SELECT lesson, outcome, created_at FROM research_memory "
-        "WHERE memory_type IN ('failure','success','partial') ORDER BY created_at DESC LIMIT 8"
+        "WHERE authoritative AND memory_type IN ('failure','success','partial') ORDER BY created_at DESC LIMIT 8"
     ).fetchall()
     datasets = con.execute("SELECT dataset_id, ticker, row_count, validation_status, checksum FROM datasets").fetchall()
     models = con.execute("SELECT status, count(*) FROM model_registry GROUP BY status").fetchall()

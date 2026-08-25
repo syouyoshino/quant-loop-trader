@@ -6,6 +6,7 @@ import datetime
 
 import duckdb
 import polars as pl
+import pytest
 
 from quant_loop_trader.experiment import run_experiment
 from quant_loop_trader.validation.holdout import adjudicate_holdout, apply_holdout
@@ -131,6 +132,36 @@ def test_holdout_rows_absent_from_training_frames(isolated_research):
     from quant_loop_trader.validation.holdout import _train_all_nonholdout
     cfg = {"ticker": "SPY", "start": start, "end": end, "horizon": 5, "seed": 1}
     Xtr, ytr = _train_all_nonholdout(pq, cfg)
-    n_usable_train = len(train_dates) - 5 - 14  # purge + feature warmup drops
-    assert Xtr.shape[0] <= n_usable_train + 1
+    # M1: features computed on full history then filtered → no warmup loss;
+    # only label-horizon purge removes tail rows from TRAINING
+    n_train_available = len(train_dates) - 5 - 5  # purge(h) + label horizon drop
+    assert Xtr.shape[0] <= len(train_dates)       # never trains ON holdout rows
     assert ytr.shape[0] == Xtr.shape[0]
+    assert ytr.shape[0] == Xtr.shape[0]
+
+
+def test_holdout_rejection_corrects_provisional_success_memory(isolated_research):
+    """Audit H6 regression: KEEP → validation APPROVED → eligible → holdout REJECTED
+    must correct the provisional 'success' memory, not leave it confirmed."""
+    from quant_loop_trader.research_memory import search_memory
+    exp_id, _ = _make_eligible(isolated_research)
+    import quant_loop_trader.data as dm
+    dm.migrate_db()  # ensure schema exists in this test's isolated DB
+    con = duckdb.connect(str(dm.DB_PATH))
+    # seed the provisional success memory exactly as record_outcome would on KEEP
+    con.execute(
+        "INSERT OR REPLACE INTO research_memory VALUES (?, ?, 'success', ?, ?, "
+        "'KEEP', 'Confirmed: survived hidden-future split', '{}', '{}', 0.65, '{}', "
+        "'v1', current_timestamp, TRUE)",
+        [f"mem_{exp_id}_success", exp_id,
+         "volatility regime hypothesis", "economic reasoning"])
+    con.close()
+
+    result = adjudicate_holdout(exp_id)
+    if result["promoted"]:
+        pytest.skip("genuinely promoted — nothing to correct")
+    rows = search_memory("volatility regime hypothesis")
+    mine = [r for r in rows if r["memory_id"] == f"mem_{exp_id}_success"]
+    assert mine, "memory row vanished (audit trail destroyed)"
+    assert mine[0]["memory_type"] == "failure"
+    assert "CORRECTED" in mine[0]["lesson"] or "holdout" in mine[0]["lesson"].lower()

@@ -28,13 +28,19 @@ def build_dashboard(exp_root: Path, db_path=None) -> dict:
     ).fetchall())
     distinct_hyp = con.execute("SELECT count(DISTINCT hypothesis) FROM experiments WHERE authoritative").fetchone()[0]
     models = dict(con.execute("SELECT status, count(*) FROM model_registry GROUP BY status").fetchall())
+    auth_ids = {r[0].replace("_improved", "").replace("_baseline", "")
+                for r in con.execute(
+                    "SELECT experiment_id FROM experiments WHERE authoritative").fetchall()}
     con.close()
 
-    # scan validation artifacts for hostile-gate signal frequencies
+    # scan validation artifacts for hostile-gate signal frequencies —
+    # audit M7: quarantined experiments must not feed the dashboard
     gate_reasons: dict[str, int] = {}
     validations = 0
     unreadable = 0
     for vfile in Path(exp_root).glob("*/validation.json"):
+        if vfile.parent.name not in auth_ids:
+            continue
         try:
             v = json.loads(vfile.read_text())
         except Exception:

@@ -147,6 +147,7 @@ def evaluate(y_true: np.ndarray, y_pred: np.ndarray, y_prob: np.ndarray, prices:
         # luck quantification: percentile bootstrap CI on mean net bucket return
         "return_ci95": bootstrap_ci(strat_rets_net),
         # NOTE: accuracy uses all test rows; financial buckets drop up to h-1 tail rows
+        "n_return_buckets": int(len(strat_rets_net)),
         "n_test": int(len(y_true)),
     }
     return metrics

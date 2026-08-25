@@ -33,12 +33,19 @@ TRACKED_TAGS = {
 }
 
 
+_CIK_CACHE: dict[str, int] = {}
+
+
 def ticker_to_cik(ticker: str) -> int:
+    t = ticker.upper()
+    if t in _CIK_CACHE:
+        return _CIK_CACHE[t]
     r = requests.get(TICKERS_URL, headers={"User-Agent": _ua()}, timeout=30)
     r.raise_for_status()
     for _, row in r.json().items():
-        if row["ticker"].upper() == ticker.upper():
-            return int(row["cik_str"])
+        if row["ticker"].upper() == t:
+            _CIK_CACHE[t] = int(row["cik_str"])
+            return _CIK_CACHE[t]
     raise ValueError(f"ticker {ticker} not found in SEC map")
 
 

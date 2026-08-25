@@ -30,10 +30,16 @@ def claim_next(db_path=None, worker: str = "default") -> dict | None:
     """Atomically claim via UPDATE..RETURNING (audit: SELECT-then-UPDATE race).
     Also requeues stale 'running' tasks older than 1h whose worker died."""
     con = duckdb.connect(str(db_path or DB_PATH))
-    con.execute(
-        "UPDATE tasks SET status='pending', updated_at=current_timestamp "
-        "WHERE status='running' AND updated_at < current_timestamp - INTERVAL 1 HOUR AND attempts < 3"
+    # stale claims: requeue while retries remain; otherwise DEAD-LETTER (audit M5)
+    reaper_sql = (
+        "UPDATE tasks SET status = CASE WHEN attempts < 3 THEN 'pending' ELSE 'failed' END, "
+        "result_json = CASE WHEN attempts < 3 THEN result_json "
+        "ELSE '{\"error\": \"worker_died_terminal\"}' END, "
+        "updated_at = current_timestamp WHERE status = 'running' "
+        "AND updated_at < current_timestamp - INTERVAL 1 HOUR"
     )
+    con.execute(reaper_sql)
+
     rows = con.execute(
         "UPDATE tasks SET status='running', claimed_by=?, attempts=attempts+1, updated_at=current_timestamp "
         "WHERE task_id = (SELECT task_id FROM tasks WHERE status='pending' "

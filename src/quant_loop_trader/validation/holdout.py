@@ -55,7 +55,8 @@ def adjudicate_holdout(experiment_id: str) -> dict:
     fin = {}
     try:
         df = _load_holdout_frame(pq, cfg)
-        feats = _improved_cols(df)
+        # keep close for the economic gate; features for the classifier
+        feats = df.select(improved_feature_columns() + ["label", "close"])
         Xte, yte = feats.select(_feature_names()).to_numpy(), feats["label"].to_numpy()
         # audit remediation: fit(X, y) — the previous call passed the (X, y) tuple
         # as X and None as y, guaranteeing a crash inside sklearn
@@ -74,7 +75,10 @@ def adjudicate_holdout(experiment_id: str) -> dict:
         except Exception:
             prob = ypred.astype(float)
         fin = evaluate(yte, ypred, prob, prices_h, horizon=h)
-        economic_gate = (fin["transaction_cost_adj_return"] > 0
+        # audit H2: compounded WEALTH, not arithmetic return sums.
+        # +60%/-50% sums to +10% but loses 20% of capital — only the compounded
+        # figure reflects what the capital actually did.
+        economic_gate = (fin["cumulative_return_strategy"] > 0
                          and fin["sharpe_strategy"] >= fin["sharpe_benchmark"])
         promoted = (len(yte) >= 50 and acc > base
                     and economic_gate
@@ -91,7 +95,7 @@ def adjudicate_holdout(experiment_id: str) -> dict:
         return result
     result = {"promoted": promoted, "holdout_accuracy": acc,
               "base_rate": base, "n_holdout": int(len(yte)),
-              "economic_gate": {"net_return": fin["transaction_cost_adj_return"],
+              "economic_gate": {"compounded_net_return": fin["cumulative_return_strategy"],
                                 "sharpe_strategy": fin["sharpe_strategy"],
                                 "sharpe_benchmark": fin["sharpe_benchmark"]}}
     (exp_dir / "holdout_report.json").write_text(json.dumps(result, indent=2))
@@ -100,19 +104,43 @@ def adjudicate_holdout(experiment_id: str) -> dict:
     new_status = "champion" if promoted else "rejected"
     con.execute("UPDATE model_registry SET status=? WHERE model_id=?", [new_status, f"{experiment_id}_improved"])
     con.close()
+    # audit H6: institutional memory must agree with the FINAL evidence —
+    # provisional success is corrected on rejection, confirmed on promotion
+    from quant_loop_trader.agents import _correct_success_memories_for
+    _correct_success_memories_for(experiment_id)
+    if promoted:
+        _confirm_success_memory(experiment_id)
     return result
 
 
+def _confirm_success_memory(experiment_id: str) -> None:
+    import json
+    import duckdb
+    from quant_loop_trader.data import DB_PATH, migrate_db
+    migrate_db()
+    con = duckdb.connect(str(DB_PATH))
+    con.execute(
+        "UPDATE research_memory SET lesson=?, confidence=LEAST(confidence + 0.15, 0.95), "
+        "provenance_json=? WHERE experiment_id=? AND memory_type='success'",
+        ["CONFIRMED by final hidden-holdout adjudication.",
+         json.dumps({"confirmed_by": "adjudicate_holdout"}), experiment_id],
+    )
+    con.close()
+
+
 def _load_holdout_frame(pq, cfg):
+    """Audit M1: compute causal features over the FULL PIT history FIRST, then
+    isolate holdout rows — pre-holdout history legitimately feeds the feature
+    windows of early holdout dates (no leakage: everything is still causal)."""
     import polars as pl
     from quant_loop_trader.replay import ReplayEngine
     from quant_loop_trader.experiment import make_labels
     from quant_loop_trader.features import add_improved_features
     df = ReplayEngine(pq).get_snapshot(cfg["ticker"], cfg["end"])
     df = df.filter(pl.col("event_time") >= pl.lit(cfg["start"]).str.strptime(pl.Date, "%Y-%m-%d"))
-    df = apply_holdout(df, cfg["start"], cfg["end"], use_holdout=True)  # THE opening
-    return add_improved_features(make_labels(df, cfg["horizon"])).drop_nulls(
-        subset=improved_feature_columns() + ["label"])
+    featured = add_improved_features(make_labels(df, cfg["horizon"]))
+    hold = apply_holdout(featured, cfg["start"], cfg["end"], use_holdout=True)
+    return hold.drop_nulls(subset=improved_feature_columns() + ["label"])
 
 
 def _improved_cols(df):
@@ -132,8 +160,9 @@ def _train_all_nonholdout(pq, cfg):
     from quant_loop_trader.features import add_improved_features, improved_feature_columns
     df = ReplayEngine(pq).get_snapshot(cfg["ticker"], cfg["end"])
     df = df.filter(pl.col("event_time") >= pl.lit(cfg["start"]).str.strptime(pl.Date, "%Y-%m-%d"))
-    df = apply_holdout(df, cfg["start"], cfg["end"], use_holdout=False)
-    clean = add_improved_features(make_labels(df, cfg["horizon"])).drop_nulls(
+    # features computed on the full history first (M1), then holdout rows removed
+    featured = add_improved_features(make_labels(df, cfg["horizon"]))
+    clean = apply_holdout(featured, cfg["start"], cfg["end"], use_holdout=False).drop_nulls(
         subset=improved_feature_columns() + ["label"])
     return clean.select(improved_feature_columns()).to_numpy(), clean["label"].to_numpy()
 

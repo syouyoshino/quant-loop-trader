@@ -54,7 +54,9 @@ class ResearchController:
                 continue
             try:
                 result = worker(**task["payload"])
-                q.complete(task["task_id"], {"ok": True}, ok=True, db_path=db_path)
+                q.complete(task["task_id"],
+                           {"ok": True, "result": json.dumps(result, default=str)[:4000]},
+                           ok=True, db_path=db_path)
                 ran.append({"task_id": task["task_id"], "result": result})
             except Exception as e:
                 q.complete(task["task_id"], {"error": str(e)[:300]}, ok=False, db_path=db_path)

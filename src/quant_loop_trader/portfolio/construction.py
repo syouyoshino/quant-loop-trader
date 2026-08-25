@@ -26,6 +26,8 @@ def volatility_weight(returns: np.ndarray, lookback: int = 20) -> np.ndarray:
 
 
 def apply_max_position(weights: np.ndarray, max_weight: float = 0.25) -> np.ndarray:
+    if not 0 < max_weight <= 1:
+        raise ValueError(f"max_weight must be in (0, 1], got {max_weight}")
     """Cap positions at max_weight, redistributing excess to uncapped assets
     (water-filling). When n_assets * cap < 1 the constraint set is infeasible:
     the unallocatable remainder stays as CASH rather than breaching the cap."""
@@ -60,6 +62,8 @@ def drawdown_stop(cumulative_returns: np.ndarray, limit: float = -0.15) -> bool:
 def size_positions(returns_window: np.ndarray, scheme: str = "equal",
                    max_weight: float = 0.25) -> np.ndarray:
     """Unified entry point. returns_window shape = (lookback, n_assets)."""
+    if returns_window.ndim != 2 or returns_window.shape[1] == 0:
+        raise ValueError("returns_window must be 2-D with at least one asset")
     if scheme == "equal":
         w = equal_weight(returns_window.shape[1])
     elif scheme == "volatility":

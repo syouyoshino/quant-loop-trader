@@ -39,7 +39,7 @@ class WalkForwardValidator:
         dates = df["event_time"].to_list()
         folds_spec = make_folds(dates, self.n_folds)
         results = []
-        all_accs = []
+        all_accs, all_bases = [], []
         for spec in folds_spec:
             a, b = spec["train_idx"]
             c, d = spec["validation_idx"]
@@ -58,6 +58,8 @@ class WalkForwardValidator:
             prices = test["close"].to_numpy() if "close" in test.columns else np.array([])
             metrics = evaluate(yte, ypred, prob, prices, horizon=horizon)  # real label horizon (audit QA2)
             acc = metrics["accuracy"]
+            # per-fold majority-class baseline (audit M2: 0.5 is not the bar)
+            base_i = float(max(np.mean(yte), 1 - np.mean(yte)))
             rec = {
                 "window_id": spec["window_id"],
                 "training_period": [str(train["event_time"].min()), str(train["event_time"].max())],
@@ -67,17 +69,21 @@ class WalkForwardValidator:
                 "risk_metrics": {"max_drawdown_strategy": metrics["max_drawdown_strategy"],
                                  "sharpe_strategy": metrics["sharpe_strategy"]},
                 "prediction_accuracy": acc,
+                "fold_base_rate": base_i,
+                "beats_fold_baseline": bool(acc > base_i),
                 "n_validation": test.height,
             }
             results.append(rec)
             all_accs.append(acc)
+            all_bases.append(base_i)
 
-        # stability answer: did accuracy persist across folds?
+        # stability answer: persisted accuracy AND beat each fold's own baseline
         stable = len(all_accs) >= 2 and (max(all_accs) - min(all_accs)) <= 0.15 \
                  and float(np.mean(all_accs)) > 0.5
         return {
             "folds": results,
             "mean_accuracy": round(float(np.mean(all_accs)), 4),
             "accuracy_dispersion": round(float(np.std(all_accs)), 4),
-            "stable_across_time": bool(stable),
+            "stable_across_time": bool(stable and all(b < a for a, b in zip(all_accs, all_bases))),
+            "folds_beat_baseline": int(sum(1 for a, b in zip(all_accs, all_bases) if a > b)),
         }

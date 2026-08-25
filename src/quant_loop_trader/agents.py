@@ -210,15 +210,29 @@ def independent_replication(experiment_id: str, tolerance: float = 1e-9) -> dict
     from sklearn.pipeline import Pipeline
     pipe = Pipeline([("scaler", StandardScaler()),
                      ("clf", LogisticRegression(max_iter=1000, random_state=cfg["seed"]))])
-    pipe.fit(train.select(improved_feature_columns()).to_numpy(), train["label"].to_numpy())
+    Xte = test.select(improved_feature_columns()).to_numpy()
     yte = test["label"].to_numpy()
-    acc = float((pipe.predict(test.select(improved_feature_columns()).to_numpy()) == yte).mean())
+    pipe.fit(train.select(improved_feature_columns()).to_numpy(), train["label"].to_numpy())
+    ypred = pipe.predict(Xte)
+    acc = float((ypred == yte).mean())
+    try:
+        prob = pipe.predict_proba(Xte)
+    except Exception:
+        prob = ypred.astype(float)
+    from quant_loop_trader.evaluation import evaluate as _evaluate
+    rep_metrics = _evaluate(yte, ypred, prob, test["close"].to_numpy(), horizon=cfg["horizon"])
 
-    claimed = report["improved_metrics"]["accuracy"]
+    claimed = report["improved_metrics"]
     issues = []
-    if abs(acc - claimed) > tolerance:
-        issues.append(f"replication_mismatch:got{acc:.6f}_claimed{claimed:.6f}")
-    logger.info(json.dumps({"event": "independent_replication", "got": acc, "claimed": claimed}))
+    if abs(acc - claimed["accuracy"]) > tolerance:
+        issues.append(f"replication_mismatch:got{acc:.6f}_claimed{claimed['accuracy']:.6f}")
+    # audit H5: verify the ECONOMIC result too, not just classification accuracy —
+    # a creator/reviewer-shared evaluate() bug must be caught by metric disagreement
+    for key in ("sharpe_strategy", "cumulative_return_strategy",
+                "transaction_cost_adj_return", "max_drawdown_strategy", "brier_score"):
+        got_v, claim_v = rep_metrics[key], claimed[key]
+        if abs(got_v - claim_v) > max(tolerance * 1000, 1e-9):
+            issues.append(f"replication_metric_mismatch:{key}:got{got_v:.6f}_claimed{claim_v:.6f}")
     return _msg("independent_replicator",
                 ["dataset_reconstruction", "feature_rebuild", "retrain_same_seed",
                  "metric_comparison"], issues)
@@ -261,11 +275,41 @@ def validate_experiment(experiment_id: str) -> dict:
         sharpe = json.loads((exp_dir / "metrics.json").read_text())["improved"]["sharpe_strategy"]
         # DSR needs the EMPIRICAL dispersion of trial Sharpes (audit round-2) —
         # pulled from every authoritative improved experiment in the family
-        trial_sharpes = _authoritative_trial_sharpes()  # current run is part of the family
-        dsr = deflated_sharpe_ratio(sharpe, n_obs=int(test.height), n_trials=trial_sharpes)
-        hardening["multiple_testing"] = {"n_trials": len(trial_sharpes), **dsr}
+        m_improved = json.loads((exp_dir / "metrics.json").read_text())["improved"]
+        ppy = 252 / horizon
+        n_buckets = int(m_improved.get("n_return_buckets", test.height))
+        # audit H3: PSR/DSR sampling variance must use the SAME units as the Sharpe —
+        # per-bucket Sharpe over the actual number of h-day return observations.
+        # audit H4: family scope = same ticker + horizon; LOW_CONFIDENCE blocks too.
+        trial_sharpes_periodic = [s / np.sqrt(ppy)
+                                  for s in _authoritative_trial_sharpes(ticker=ticker, horizon=horizon)]
+        dsr = deflated_sharpe_ratio(m_improved["sharpe_strategy"] / np.sqrt(ppy),
+                                    n_obs=n_buckets, n_trials=trial_sharpes_periodic)
+        hardening["multiple_testing"] = {"n_trials": len(trial_sharpes_periodic),
+                                         "n_return_buckets": n_buckets, **dsr}
         if dsr["verdict"] == "PROBABLY_LUCK":
             all_issues.append("multiple_testing:deflated_sharpe_probably_luck")
+        elif dsr["verdict"] == "LOW_CONFIDENCE":
+            all_issues.append(f"multiple_testing:dsr_low_confidence:{dsr['dsr']}")
+
+        # FDR across the family's stored significance tests
+        from quant_loop_trader.validation.multiple_testing import benjamini_hochberg
+        family_pvals, current_p = _family_pvalues(exp_dir, ticker, horizon)
+        if current_p is not None and len(family_pvals) >= 5:
+            rejects = benjamini_hochberg(family_pvals, fdr=0.10)
+            if not rejects[family_pvals.index(current_p)]:
+                all_issues.append(f"multiple_testing:fdr_not_significant:p{current_p:.4f}")
+
+        # ablation (audit H7): removing a kept component must never IMPROVE accuracy
+        from quant_loop_trader.validation.ablation import run_ablation as _run_ablation
+        abl = _run_ablation(ticker, start, end, horizon, seed, {
+            "momentum": ["ret_1", "ret_5", "ma10_gap"],
+            "volatility": ["vol10", "rsi14"],
+        })
+        hardening["ablation"] = abl.to_dicts()
+        removable = abl.filter(pl.col("removed") != "(none)")
+        if removable.height and removable["delta_vs_full"].max() > 0.02:
+            all_issues.append(f"ablation:removal_improves_accuracy:{removable['delta_vs_full'].max():.3f}")
     except Exception as e:
         # FAIL CLOSED (audit C2): a broken validator must make approval impossible
         hardening["error"] = str(e)[:200]
@@ -282,9 +326,18 @@ def validate_experiment(experiment_id: str) -> dict:
     # promotion policy: champion only survives every reviewer; enforced in DB, not prose
     import duckdb
     from quant_loop_trader.data import DB_PATH
-    # APPROVED ≠ champion: validation grants ELIGIBLE; only explicit holdout
-    # adjudication (audit C3) may open the hidden segment and promote.
-    status = "eligible" if verdict["approval_status"] == "APPROVED" else "rejected"
+    # APPROVED ≠ champion, and approval ≠ eligibility for every decision:
+    # the experiment's PREDECLARED success criterion is authoritative.
+    #   KEEP    → may become eligible → holdout may promote
+    #   IMPROVE → research candidate (Sharpe degraded; never promotable)
+    #   REJECT  → terminal rejected; validation can NEVER resurrect it
+    decision = json.loads((exp_dir / "report.json").read_text())["decision"]
+    if verdict["approval_status"] == "APPROVED" and decision == "KEEP":
+        status = "eligible"
+    elif decision == "REJECT":
+        status = "rejected"
+    else:
+        status = "candidate"
     con = duckdb.connect(str(DB_PATH))
     con.execute("UPDATE model_registry SET status=? WHERE model_id=?", [status, f"{experiment_id}_improved"])
     con.close()
@@ -299,15 +352,19 @@ def validate_experiment(experiment_id: str) -> dict:
     return verdict
 
 
-def _authoritative_trial_sharpes() -> list[float]:
-    """Empirical Sharpe dispersion across authoritative improved experiments."""
+def _authoritative_trial_sharpes(ticker: str | None = None,
+                                 horizon: int | None = None) -> list[float]:
+    """Empirical Sharpe dispersion across the authoritative experiment family
+    (audit H4: family scope = same ticker + horizon)."""
     import duckdb
     from quant_loop_trader.data import DB_PATH, migrate_db
     migrate_db()
     con = duckdb.connect(str(DB_PATH), read_only=True)
     rows = con.execute(
         "SELECT metrics_json FROM experiments WHERE authoritative "
-        "AND experiment_id NOT LIKE '%_baseline'"
+        "AND experiment_id NOT LIKE '%_baseline' "
+        "AND (? IS NULL OR ticker = ?) AND (? IS NULL OR horizon_days = ?)",
+        [ticker, ticker, horizon, horizon],
     ).fetchall()
     con.close()
     out = []
@@ -367,3 +424,32 @@ def _correct_success_memory(memory_id: str) -> None:
     )
     con.close()
     logger.info(json.dumps({"event": "memory_corrected", "memory_id": memory_id, "confidence": new_conf}))
+
+
+def _family_pvalues(current_exp_dir, ticker: str, horizon: int):
+    """Stored binomial p-values across the authoritative same-ticker/same-horizon
+    family, plus the current experiment's own p-value (audit H4 FDR wiring)."""
+    pvals, current_p = [], None
+    import duckdb
+    from quant_loop_trader.data import DB_PATH, migrate_db
+    migrate_db()
+    con = duckdb.connect(str(DB_PATH), read_only=True)
+    ids = [r[0].replace("_improved", "") for r in con.execute(
+        "SELECT experiment_id FROM experiments WHERE authoritative AND ticker=? "
+        "AND horizon_days=? AND experiment_id NOT LIKE '%_baseline'",
+        [ticker, horizon]).fetchall()]
+    con.close()
+    for eid in ids:
+        try:
+            rep_file = EXP_ROOT / eid / "report.json"
+            if not rep_file.exists():
+                continue
+            pv = json.loads(rep_file.read_text()).get("stat_pvalue")
+            if pv is None:
+                continue
+            if eid == current_exp_dir.name:
+                current_p = float(pv)
+            pvals.append(float(pv))
+        except Exception:
+            continue
+    return pvals, current_p

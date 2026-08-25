@@ -131,6 +131,7 @@ class PaperBroker:
             )
         self.simulator = ExecutionSimulator()
         self.tracker = PortfolioTracker(starting_cash)
+        self.enabled = True  # truthful post-construction state (audit L2)
 
     def submit(self, order: Order, bar_close: float) -> dict:
         fill = self.simulator.fill(order, bar_close)

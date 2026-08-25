@@ -132,6 +132,7 @@ def test_sec_facts_exact_pit_from_filing_dates(monkeypatch, tmp_path):
 
 
 def test_sec_caches_raw_payload(monkeypatch, tmp_path):
+    sec._CIK_CACHE.clear()
     _mock(monkeypatch, "company_tickers.json", "sec_tickers.json")
     n = [0]
     orig = __import__("requests").get
@@ -149,6 +150,7 @@ def test_sec_caches_raw_payload(monkeypatch, tmp_path):
     sec.fetch_company_facts("AAPL", cache_dir=cache)
     raw = list(cache.glob("*.json"))
     assert len(raw) == 1
-    # second call serves from cache: no facts request fired
+    # second call serves from cache: NO further requests of any kind
+    before = n[0]
     sec.fetch_company_facts("AAPL", cache_dir=cache)
-    assert n[0] == 3  # tickers map fetched per call (uncached); facts payload served from disk cache
+    assert n[0] == before  # facts payload served from disk; CIK cached in-process

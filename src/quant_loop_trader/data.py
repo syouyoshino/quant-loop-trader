@@ -18,7 +18,10 @@ logger = logging.getLogger(__name__)
 
 ROOT = Path(os.environ.get("QLT_ROOT", Path.cwd()))
 PROC_DIR = ROOT / "data" / "processed"
-MIGR_DIR = ROOT / "data" / "migrations"
+# migrations ship INSIDE the package (audit AR3): env/cwd-relative paths silently
+# produced table-less databases on non-repo-CWD deployments
+PKG_MIGR_DIR = Path(__file__).resolve().parent / "migrations"
+MIGR_DIR = PKG_MIGR_DIR
 DB_PATH = ROOT / "data" / "research.duckdb"
 FIXTURE_PATH = ROOT / "tests" / "fixtures" / "SPY.csv"
 
@@ -35,7 +38,15 @@ _MIGRATED: set[str] = set()
 
 
 def migrate_db(db_path: Path | None = None) -> None:
-    """Apply migrations once per (process, resolved db path). Idempotent SQL either way."""
+    """Apply unapplied migrations, tracked PERSISTENTLY in the database itself.
+
+    Audit round-2 (Critical): the process-local memo meant every fresh process
+    re-executed data migrations — migration 004's unconditional UPDATE would
+    re-quarantine legitimately authoritative results on each restart. Now a
+    `_schema_migrations` table records what actually ran, per database, forever.
+    Legacy databases (pre-tracker) are adopted: DDL re-runs safely; one-time
+    DATA migrations are seeded as applied when their effects are already present.
+    """
     import duckdb
 
     db_path = Path(db_path or DB_PATH).resolve()
@@ -43,8 +54,38 @@ def migrate_db(db_path: Path | None = None) -> None:
         return
     db_path.parent.mkdir(parents=True, exist_ok=True)
     con = duckdb.connect(str(db_path))
+
+    tracker_existed = True
+    try:
+        con.execute("SELECT 1 FROM _schema_migrations LIMIT 1")
+    except duckdb.CatalogException:
+        tracker_existed = False
+    con.execute(
+        "CREATE TABLE IF NOT EXISTS _schema_migrations ("
+        "name TEXT PRIMARY KEY, applied_at TIMESTAMP DEFAULT current_timestamp)"
+    )
+    applied = {r[0] for r in con.execute("SELECT name FROM _schema_migrations").fetchall()}
+
+    tables = {r[0] for r in con.execute("SHOW TABLES").fetchall()}
+    legacy_adopted = not tracker_existed and "experiments" in tables
+    # does this legacy DB already carry the quarantine backfill's effects?
+    legacy_backfilled = False
+    if legacy_adopted and "experiments" in tables:
+        cols = [r[1] for r in con.execute("PRAGMA table_info('experiments')").fetchall()]
+        legacy_backfilled = "authoritative" in cols
+
     for sql_file in sorted(MIGR_DIR.glob("*.sql")):
+        name = sql_file.name
+        if name in applied:
+            continue
+        if legacy_adopted and name == "005_quarantine_backfill.sql" and legacy_backfilled:
+            # one-time data migration whose effects are already on disk — record, never replay
+            con.execute("INSERT INTO _schema_migrations VALUES (?, current_timestamp)", [name])
+            continue
         con.execute(sql_file.read_text())
+        con.execute("INSERT INTO _schema_migrations VALUES (?, current_timestamp)", [name])
+    con.close()
+    _MIGRATED.add(str(db_path))
     con.close()
     _MIGRATED.add(str(db_path))
 
@@ -78,15 +119,21 @@ def _parse_tiingo(rows: list[dict]) -> pl.DataFrame:
     if not rows:
         return pl.DataFrame(schema={"event_time": pl.Date, "available_time": pl.Date, "open": pl.Float64, "high": pl.Float64, "low": pl.Float64, "close": pl.Float64, "volume": pl.Int64})
     df = pl.DataFrame(rows)
-    # tiingo returns "date" like "2024-01-02T00:00:00.000Z"
+    # audit H8: prefer ADJUSTED fields — splits/dividends must not appear as fake
+    # returns and economic backtests need total-return prices. Tiingo returns
+    # adjOpen/adjHigh/adjLow/adjClose alongside raw fields.
+    has_adj = "adjClose" in df.columns
+    prefix = "adj" if has_adj else ""
     df = df.select(
         pl.col("date").str.strptime(pl.Datetime, "%Y-%m-%dT%H:%M:%S%.fZ", strict=False).alias("event_time"),
-        pl.col("open").cast(pl.Float64),
-        pl.col("high").cast(pl.Float64),
-        pl.col("low").cast(pl.Float64),
-        pl.col("close").cast(pl.Float64),
+        pl.col(f"{prefix}Open").cast(pl.Float64).alias("open"),
+        pl.col(f"{prefix}High").cast(pl.Float64).alias("high"),
+        pl.col(f"{prefix}Low").cast(pl.Float64).alias("low"),
+        pl.col(f"{prefix}Close").cast(pl.Float64).alias("close"),
         pl.col("volume").cast(pl.Int64),
     )
+    if has_adj:
+        logger.info(json.dumps({"event": "tiingo_adjusted_prices_used"}))
     df = df.with_columns(
         pl.col("event_time").dt.date().alias("event_time"),
         pl.col("event_time").dt.date().alias("available_time"),  # L1: available at close; future datasets may lag

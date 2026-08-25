@@ -160,8 +160,9 @@ def _run_session_body(ticker: str, horizon: int, max_experiments: int,
     con = duckdb.connect(str(DB_PATH))
     con.execute("CHECKPOINT")
     con.close()
-    shutil.copy2(DB_PATH, bdir / f"research_{datetime.now(timezone.utc).strftime('%Y%m%d')}.duckdb")
-    for old in sorted(bdir.glob("research_*.duckdb"))[:-8]:
+    stamp = datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')
+    shutil.copy2(DB_PATH, bdir / f"research_{stamp}.duckdb")
+    for old in sorted(bdir.glob("research_*.duckdb"))[:-24]:
         old.unlink()
 
     summary = {

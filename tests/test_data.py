@@ -40,3 +40,16 @@ def test_migration_tables_exist():
     for c in ["created_at", "version", "provenance_json"]:
         assert c in cols2
     con.close()
+
+
+def test_tiingo_prefers_adjusted_fields(monkeypatch):
+    """Audit H8: splits/dividends must not masquerade as returns."""
+    import quant_loop_trader.data as dm
+    rows = [{"date": "2024-01-02T00:00:00.000Z", "open": 500.0, "high": 505.0,
+             "low": 495.0, "close": 502.0, "adjOpen": 250.0, "adjHigh": 252.5,
+             "adjLow": 247.5, "adjClose": 251.0, "volume": 1000},
+            {"date": "2024-01-03T00:00:00.000Z", "open": 502.0, "high": 506.0,
+             "low": 500.0, "close": 504.0, "adjOpen": 251.0, "adjHigh": 253.0,
+             "adjLow": 250.0, "adjClose": 252.0, "volume": 1100}]
+    df = dm._parse_tiingo(rows)
+    assert abs(df["close"][0] - 251.0) < 1e-9  # adjusted close selected
