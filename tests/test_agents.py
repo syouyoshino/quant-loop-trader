@@ -80,3 +80,35 @@ def test_prediction_lock_detects_tampering(isolated_research):
     assert any("artifact_tampered:predictions_improved.parquet" in i for i in issues)
     verdict = validate_experiment(report["experiment_id"])
     assert "artifact_tampered:predictions_improved.parquet" in verdict["issues_found"]
+
+
+def test_memory_correction_fires_on_rejected_keep(isolated_research):
+    # simulate: KEEP wrote a success memory, then validation REJECTS it
+    import duckdb
+    import quant_loop_trader.data as dm
+    from quant_loop_trader.research_memory import search_memory
+    from quant_loop_trader.agents import validate_experiment
+    from quant_loop_trader.experiment import run_experiment as _run_exp
+
+    report = _run_exp(ticker="SPY", horizon=5, start="2020-01-01", end="2023-12-31", seed=314)
+    con = duckdb.connect(str(dm.DB_PATH))
+    con.execute(
+        "INSERT OR REPLACE INTO research_memory VALUES (?, ?, 'success', ?, ?, 'KEEP', 'premature', '{}', '{}', 0.7, '{}', 'v1', current_timestamp)",
+        [f"mem_{report['experiment_id']}_success", report["experiment_id"],
+         "vol regime hypothesis", "Confirmed prematurely"],
+    )
+    con.close()
+
+    verdict = validate_experiment(report["experiment_id"])
+    rows = search_memory("vol regime hypothesis")
+    mine = [r for r in rows if r["memory_id"] == f"mem_{report['experiment_id']}_success"]
+    if verdict["approval_status"] == "REJECTED":
+        assert mine and mine[0]["memory_type"] == "failure"      # corrected, not deleted
+        assert "CORRECTED" in mine[0]["lesson"]                  # audit trail preserved
+
+
+def test_dataset_parquet_lock_key_not_treated_as_artifact(isolated_research):
+    from quant_loop_trader.agents import _verify_locks
+    report = run_experiment(ticker="SPY", horizon=5, start="2020-01-01", end="2023-12-31", seed=315)
+    issues = _verify_locks(isolated_research / report["experiment_id"])
+    assert not any("locked_artifact_missing:dataset_parquet" in i for i in issues)

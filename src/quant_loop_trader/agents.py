@@ -83,7 +83,7 @@ def _verify_locks(exp_dir: Path) -> list[str]:
         if actual != want:
             issues.append("dataset_drift:input_data_changed_since_experiment")
     for name, expected in locks.items():
-        if name == "locked_at":
+        if name in ("locked_at", "dataset_parquet"):  # non-artifact anchors
             continue
         f = exp_dir / name
         if not f.exists():
@@ -285,10 +285,7 @@ def validate_experiment(experiment_id: str) -> dict:
     # belief correction (audit AD1): a REJECTED verdict must supersede the premature
     # 'success' memory written at KEEP time — otherwise false beliefs persist forever
     if verdict["approval_status"] == "REJECTED":
-        from quant_loop_trader.research_memory import search_memory
-        for m in search_memory(experiment_id.replace("_improved", "")):
-            if m["memory_type"] == "success":
-                _correct_success_memory(m["memory_id"])
+        _correct_success_memories_for(experiment_id)
 
     logger.info(json.dumps({"event": "validation_complete", "experiment_id": experiment_id,
                             "status": verdict["approval_status"], "registry_status": status}))
@@ -303,6 +300,22 @@ def _experiment_count() -> int:
     n = con.execute("SELECT count(*) FROM experiments WHERE experiment_id NOT LIKE '%_baseline'").fetchone()[0]
     con.close()
     return max(1, n)
+
+
+def _correct_success_memories_for(experiment_id: str) -> None:
+    """Find premature success memories by their experiment_id column (audit cycle-2:
+    free-text search could never match) and supersede them."""
+    import duckdb
+    from quant_loop_trader.data import DB_PATH, migrate_db
+    migrate_db()
+    con = duckdb.connect(str(DB_PATH))
+    ids = [r[0] for r in con.execute(
+        "SELECT memory_id FROM research_memory WHERE experiment_id = ? AND memory_type = 'success'",
+        [experiment_id],
+    ).fetchall()]
+    con.close()
+    for mid in ids:
+        _correct_success_memory(mid)
 
 
 def _correct_success_memory(memory_id: str) -> None:

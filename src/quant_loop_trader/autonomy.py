@@ -97,6 +97,7 @@ def run_session(ticker: str = "SPY", horizon: int = 5,
         fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
         logger.warning(json.dumps({"event": "session_locked", "detail": "another session holds the lock"}))
+        lock_file.close()  # audit cycle-2: no fd leak on the blocked path
         return {"mode": "OBSERVATION", "executed": 0, "results": [], "skipped": "session_locked"}
 
     try:
