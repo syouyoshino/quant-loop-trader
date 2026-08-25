@@ -73,6 +73,15 @@ def _verify_locks(exp_dir: Path) -> list[str]:
         return ["missing_predictions_lock"]
     locks = json.loads(lock_path.read_text())
     issues = []
+    cfg_path = exp_dir / "config.json"
+    # dataset drift check: parquet bytes now vs locked-at-experiment-time
+    want = locks.get("dataset_parquet")
+    ticker_name = json.loads(cfg_path.read_text()).get("ticker", "SPY") if cfg_path.exists() else "SPY"
+    pq = PROC_DIR / f"{ticker_name}.parquet"
+    if want and pq.exists():
+        actual = hashlib.sha256(pq.read_bytes()).hexdigest()
+        if actual != want:
+            issues.append("dataset_drift:input_data_changed_since_experiment")
     for name, expected in locks.items():
         if name == "locked_at":
             continue
@@ -99,14 +108,14 @@ def statistical_review(exp_dir: Path, alpha: float = 0.05) -> dict:
     # degenerate classifier: predicts a single class regardless of features
     if len(set(pred["y_pred"].to_list())) < 2:
         issues.append(f"degenerate_constant_predictions:{sorted(set(pred['y_pred'].to_list()))}")
+    # near-degenerate: minority class of PREDICTIONS < 5% → majority collapse in disguise
+    counts = pred["y_pred"].value_counts().sort("count")["count"]
+    if n and counts[0] / n < 0.05:
+        issues.append(f"near_degenerate_minority_rate:{counts[0] / n:.3f}")
     # null = majority-class accuracy on the same test labels
     p_base = float(max(pred["y_true"].mean(), 1 - pred["y_true"].mean()))
     from scipy.stats import binomtest
     pvalue = float(binomtest(correct, n, p_base).pvalue)
-    if n < 100:
-        issues.append(f"sample_size_too_small:{n}")
-    if pvalue >= alpha:
-        issues.append(f"not_significant_vs_base_rate{p_base:.3f}:p={pvalue:.4f}")
     if n < 100:
         issues.append(f"sample_size_too_small:{n}")
     if pvalue >= alpha:
@@ -232,9 +241,35 @@ def validate_experiment(experiment_id: str) -> dict:
         independent_replication(experiment_id),
     ]
     all_issues = [i for r in reviews for i in r["issues_found"]] + lock_issues
+
+    # --- hardening layer (Task 1-3 wiring): walk-forward, ablation, DSR ---------
+    hardening: dict = {}
+    try:
+        from quant_loop_trader.experiment import build_train_test
+        from quant_loop_trader.validation.walkforward import WalkForwardValidator
+        from quant_loop_trader.models.registry import LogisticModel
+        train, test = build_train_test(ticker, start, end, horizon,
+                                       add_improved_features, improved_feature_columns())
+        full = pl.concat([train, test]).sort("event_time")
+        wf = WalkForwardValidator(lambda: LogisticModel(seed=seed), n_folds=3)
+        hardening["walk_forward"] = wf.run(full, improved_feature_columns(), horizon=horizon)
+        if not hardening["walk_forward"]["stable_across_time"]:
+            all_issues.append("walk_forward:not_stable_across_folds")
+
+        from quant_loop_trader.validation.multiple_testing import deflated_sharpe_ratio
+        sharpe = json.loads((exp_dir / "metrics.json").read_text())["improved"]["sharpe_strategy"]
+        n_trials = max(1, _experiment_count())
+        dsr = deflated_sharpe_ratio(sharpe, n_obs=int(test.height), n_trials=n_trials)
+        hardening["multiple_testing"] = {"n_trials": n_trials, **dsr}
+        if dsr["verdict"] == "PROBABLY_LUCK":
+            all_issues.append("multiple_testing:deflated_sharpe_probably_luck")
+    except Exception as e:
+        hardening["error"] = str(e)[:200]  # recorded, never silently dropped
+
     verdict = {
         "experiment_id": experiment_id,
         "reviews": reviews,
+        "hardening": hardening,
         "approval_status": "APPROVED" if not all_issues else "REJECTED",
         "issues_found": all_issues,
     }
@@ -246,6 +281,47 @@ def validate_experiment(experiment_id: str) -> dict:
     con = duckdb.connect(str(DB_PATH))
     con.execute("UPDATE model_registry SET status=? WHERE model_id=?", [status, f"{experiment_id}_improved"])
     con.close()
+
+    # belief correction (audit AD1): a REJECTED verdict must supersede the premature
+    # 'success' memory written at KEEP time — otherwise false beliefs persist forever
+    if verdict["approval_status"] == "REJECTED":
+        from quant_loop_trader.research_memory import search_memory
+        for m in search_memory(experiment_id.replace("_improved", "")):
+            if m["memory_type"] == "success":
+                _correct_success_memory(m["memory_id"])
+
     logger.info(json.dumps({"event": "validation_complete", "experiment_id": experiment_id,
                             "status": verdict["approval_status"], "registry_status": status}))
     return verdict
+
+
+def _experiment_count() -> int:
+    import duckdb
+    from quant_loop_trader.data import DB_PATH, migrate_db
+    migrate_db()
+    con = duckdb.connect(str(DB_PATH), read_only=True)
+    n = con.execute("SELECT count(*) FROM experiments WHERE experiment_id NOT LIKE '%_baseline'").fetchone()[0]
+    con.close()
+    return max(1, n)
+
+
+def _correct_success_memory(memory_id: str) -> None:
+    """Supersede (never delete) a premature success memory — audit trail preserved."""
+    import duckdb
+    from quant_loop_trader.data import DB_PATH, migrate_db
+    migrate_db()
+    con = duckdb.connect(str(DB_PATH))
+    row = con.execute("SELECT confidence FROM research_memory WHERE memory_id=?", [memory_id]).fetchone()
+    if row is None:
+        con.close()
+        return
+    new_conf = max(0.05, float(row[0]) - 0.2)
+    con.execute(
+        "UPDATE research_memory SET memory_type='failure', lesson=?, confidence=?, "
+        "provenance_json=? WHERE memory_id=?",
+        ["CORRECTED: validation gate rejected this KEEP after promotion-time optimism.",
+         new_conf,
+         json.dumps({"corrected_by": "validate_experiment"}), memory_id],
+    )
+    con.close()
+    logger.info(json.dumps({"event": "memory_corrected", "memory_id": memory_id, "confidence": new_conf}))

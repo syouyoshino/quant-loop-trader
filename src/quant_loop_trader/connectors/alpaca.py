@@ -27,6 +27,7 @@ def fetch_bars(symbol: str, start: str, end: str, feed: str = "iex", limit: int 
 
     rows: list[dict] = []
     page_token = None
+    rate_limit_hits = 0
     while True:
         params = {
             "timeframe": "1Day",
@@ -46,7 +47,10 @@ def fetch_bars(symbol: str, start: str, end: str, feed: str = "iex", limit: int 
         )
         if r.status_code == 429:
             import time
-            time.sleep(min(60, 2 ** 2))
+            rate_limit_hits += 1
+            if rate_limit_hits >= 3:  # audit M6: was an infinite loop under persistent limits
+                raise RuntimeError(f"Alpaca rate-limited after {rate_limit_hits} attempts")
+            time.sleep(min(60, 2 ** rate_limit_hits))
             continue
         r.raise_for_status()
         payload = r.json()
@@ -65,5 +69,5 @@ def fetch_bars(symbol: str, start: str, end: str, feed: str = "iex", limit: int 
         pl.col("o").alias("open"), pl.col("h").alias("high"), pl.col("l").alias("low"),
         pl.col("c").alias("close"), pl.col("v").cast(pl.Int64).alias("volume"),
     )
-    df = df.with_columns(pl.col("available_time").alias("available_time")) if "available_time" in df.columns else df.with_columns(pl.col("event_time").alias("available_time"))
+    df = df.with_columns(pl.col("event_time").alias("available_time"))
     return to_pit_frame(df, "event_time", "available_time"), "alpaca"

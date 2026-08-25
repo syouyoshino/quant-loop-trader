@@ -71,9 +71,9 @@ def evaluate(y_true: np.ndarray, y_pred: np.ndarray, y_prob: np.ndarray, prices:
     prec = float(precision_score(y_true, y_pred, zero_division=0)) if len(y_true) else 0.0
     rec = float(recall_score(y_true, y_pred, zero_division=0)) if len(y_true) else 0.0
     try:
-        brier = float(brier_score_loss(y_true, y_prob)) if len(y_true) else 0.0
+        brier = float(brier_score_loss(y_true, y_prob)) if len(y_true) else float("nan")
     except Exception:
-        brier = 0.0
+        brier = float("nan")  # 0.0 would read as perfect calibration
 
     # financial: position held for `horizon` days (matches label horizon), long if pred=1 else flat.
     # Non-overlapping horizon buckets: signal from bucket start, return over the bucket.
@@ -124,7 +124,9 @@ def evaluate(y_true: np.ndarray, y_pred: np.ndarray, y_prob: np.ndarray, prices:
         "cumulative_return_strategy": float(cum_strat[-1] - 1) if len(cum_strat) else 0.0,
         "cumulative_return_benchmark": float(cum_bench[-1] - 1) if len(cum_bench) else 0.0,
         "turnover": turnover,
-        "transaction_cost_adj_return": float(strat_rets.sum()) if len(strat_rets) else 0.0,
+        # charter-critical: NET of costs (was gross under this name — audit QA7)
+        "transaction_cost_adj_return": float(strat_rets_net.sum()) if len(strat_rets_net) else 0.0,
+        "gross_return": float(strat_rets.sum()) if len(strat_rets) else 0.0,
         # risk-adjusted extras
         "sortino_ratio": sortino,
         "downside_deviation": dd_dev,
@@ -133,6 +135,9 @@ def evaluate(y_true: np.ndarray, y_pred: np.ndarray, y_prob: np.ndarray, prices:
         "calmar_ratio": calmar,
         # trade quality
         **_trade_quality(strat_rets),
+        # luck quantification: percentile bootstrap CI on mean net bucket return
+        "return_ci95": bootstrap_ci(strat_rets_net),
+        # NOTE: accuracy uses all test rows; financial buckets drop up to h-1 tail rows
         "n_test": int(len(y_true)),
     }
     return metrics

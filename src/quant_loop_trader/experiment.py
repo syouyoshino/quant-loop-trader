@@ -50,13 +50,18 @@ def make_labels(df: pl.DataFrame, horizon: int = 5) -> pl.DataFrame:
 
 def build_train_test(ticker: str, start: str, end: str, horizon: int, feature_fn, feat_cols: list[str]):
     """Single pipeline used by creator AND every reviewer. Divergence here was the
-    root cause of false replication rejections — do not copy this logic elsewhere."""
+    root cause of false replication rejections — do not copy this logic elsewhere.
+
+    The final HOLDOUT_FRACTION of the window is permanently excluded (research
+    must never train, tune, or select on it) — charter out-of-time holdout."""
     pq = PROC_DIR / f"{ticker}.parquet"
     if not pq.exists():
         df_raw, _ = fetch_ohlcv(ticker, start, end)
         save_parquet(df_raw, pq)
     df = ReplayEngine(pq).get_snapshot(ticker, end)  # PIT cut at prediction_timestamp
     df = df.filter(pl.col("event_time") >= pl.lit(start).str.strptime(pl.Date, "%Y-%m-%d"))
+    from quant_loop_trader.validation.holdout import apply_holdout
+    df = apply_holdout(df, start, end, use_holdout=False)
     df = make_labels(df, horizon)
     df_clean = feature_fn(df).drop_nulls(subset=feat_cols + ["label"])
     if df_clean.height < 100:
@@ -168,6 +173,7 @@ def run_experiment(ticker: str = "SPY", horizon: int = 5, start: str = "2018-01-
         "feature_version_improved": "v1+vol_regime_ret5_x_vol10",
         "model_version": "sklearn-LogReg-C1.0-scaled",
         "snapshot_definition": meta["snapshot_definition"],
+        "dataset_checksum": meta["checksum"],  # reviewers fail on data drift (audit M4)
         **periods,
     }
     report = {
@@ -233,6 +239,9 @@ def run_experiment(ticker: str = "SPY", horizon: int = 5, start: str = "2018-01-
         "predictions_baseline.parquet": _sha(exp_dir / "predictions_baseline.parquet"),
         "predictions_improved.parquet": _sha(exp_dir / "predictions_improved.parquet"),
         "config.json": _sha(exp_dir / "config.json"),
+        "report.json": _sha(exp_dir / "report.json"),  # replication compares against THIS file
+        # input-data anchor: byte hash of the parquet AT EXPERIMENT TIME (drift detector)
+        "dataset_parquet": _sha(PROC_DIR / f"{ticker}.parquet"),
         "locked_at": report["created_at"],
     }, indent=2))
     # DuckDB experiments table is the single idempotent ledger — no second source of truth
@@ -304,17 +313,25 @@ def run_experiment(ticker: str = "SPY", horizon: int = 5, start: str = "2018-01-
     return report
 
 
-def reproduce(experiment_id: str) -> dict:
+def reproduce(experiment_id: str, tolerance: float = 1e-9) -> dict:
+    """Re-run from documented config and VERIFY against the original locked metrics.
+    Audit AR7/M10: reproduction that verifies nothing is fake validation."""
     exp_dir = EXP_ROOT / experiment_id
     if not exp_dir.exists():
-        # try without suffix
-        # find closest
         candidates = list(EXP_ROOT.glob(f"{experiment_id}*"))
         if not candidates:
             raise FileNotFoundError(f"experiment {experiment_id} not found")
         exp_dir = candidates[0]
-    cfg = json.loads((exp_dir / "config.json").read_text())
-    return run_experiment(ticker=cfg["ticker"], horizon=cfg["horizon"], start=cfg["start"], end=cfg["end"], seed=cfg["seed"])
+    original = json.loads((exp_dir / "report.json").read_text())
+    report = run_experiment(ticker=original["config"]["ticker"], horizon=original["config"]["horizon"],
+                            start=original["config"]["start"], end=original["config"]["end"],
+                            seed=original["config"]["seed"])
+    acc_delta = abs(report["improved_metrics"]["accuracy"] - original["improved_metrics"]["accuracy"])
+    reproduced = acc_delta <= tolerance and report["decision"] == original["decision"]
+    report["parent_experiment_id"] = original["experiment_id"]  # lineage (audit AR7)
+    report["reproduction_check"] = {"reproduced": reproduced, "accuracy_delta": acc_delta,
+                                    "tolerance": tolerance}
+    return report
 
 
 def main():

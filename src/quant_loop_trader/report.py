@@ -9,7 +9,8 @@ from pathlib import Path
 
 import duckdb
 
-from quant_loop_trader.data import DB_PATH, migrate_db, dataset_metadata
+from quant_loop_trader import data as _data
+from quant_loop_trader.data import migrate_db, dataset_metadata
 from quant_loop_trader.experiment import EXP_ROOT
 from quant_loop_trader.research_memory import search_memory
 from quant_loop_trader.autonomy import GRID, _already_run
@@ -25,7 +26,7 @@ def _frontier(ticker: str = "SPY", horizon: int = 5) -> dict:
 
 def generate_report(out_dir: Path | None = None) -> Path:
     migrate_db()
-    con = duckdb.connect(str(DB_PATH))
+    con = duckdb.connect(str(_data.DB_PATH))  # resolved via module global at call time (conftest-safe)
 
     exp_total = con.execute("SELECT count(*) FROM experiments").fetchone()[0]
     decisions = con.execute(
@@ -88,7 +89,7 @@ def generate_report(out_dir: Path | None = None) -> Path:
 
     out_dir = Path(out_dir or Path.cwd() / "data" / "reports")
     out_dir.mkdir(parents=True, exist_ok=True)
-    out = out_dir / f"weekly_{now.strftime('%Y-W%V')}.md"
+    out = out_dir / f"weekly_{now.strftime('%G-W%V')}.md"
     out.write_text("\n".join(lines) + "\n")
     logger.info(json.dumps({"event": "report_written", "path": str(out)}))
     return out

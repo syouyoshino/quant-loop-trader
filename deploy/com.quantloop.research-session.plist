@@ -12,6 +12,11 @@
         <string>--max-experiments</string>
         <string>4</string>
     </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>QLT_AUTONOMOUS_ENABLED</key>
+        <string>true</string>
+    </dict>
     <key>WorkingDirectory</key>
     <string>/Users/syouyoshino/Desktop/projects_1/quant-loop-trader</string>
     <key>StartCalendarInterval</key>

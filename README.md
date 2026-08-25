@@ -48,7 +48,6 @@ Single-command end-to-end loop — fetch → PIT snapshot → train baseline →
 #   data/research.duckdb              — datasets + experiments tables (migrated)
 #   data/experiments/{id}/report.json — full Experiment Framework record (20 fields)
 #   data/experiments/{id}/predictions_*.parquet
-#   data/experiments/experiments.jsonl — ledger
 
 # reproduce a prior experiment
 .venv/bin/python -m quant_loop_trader.experiment --reproduce 20260822_SPY_5d_cca02216

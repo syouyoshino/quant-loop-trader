@@ -7,11 +7,13 @@ from pathlib import Path
 
 import duckdb
 
-from quant_loop_trader.data import DB_PATH
+from quant_loop_trader import data as _data
+from quant_loop_trader.data import migrate_db
 from quant_loop_trader.monitoring.heartbeat import is_stale
 
 
-def check_health(logs_dir: Path, exp_root: Path, db_path: Path = DB_PATH) -> dict:
+def check_health(logs_dir: Path, exp_root: Path, db_path=None) -> dict:
+    migrate_db(db_path)
     report: dict = {"status": "healthy", "checks": {}}
 
     # 1. heartbeat liveness
@@ -22,7 +24,12 @@ def check_health(logs_dir: Path, exp_root: Path, db_path: Path = DB_PATH) -> dic
 
     # 2. database reachable + experiment activity
     try:
-        con = duckdb.connect(str(db_path), read_only=True)
+        try:
+            con = duckdb.connect(str(db_path or _data.DB_PATH), read_only=True)
+        except duckdb.IOException:
+            import time
+            time.sleep(1)  # writer lock held — distinguish contention from corruption
+            con = duckdb.connect(str(db_path or _data.DB_PATH), read_only=True)
         last_exp = con.execute(
             "SELECT max(created_at) FROM experiments"
         ).fetchone()[0]

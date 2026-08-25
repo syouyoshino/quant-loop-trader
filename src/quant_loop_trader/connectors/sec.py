@@ -51,7 +51,8 @@ def fetch_company_facts(ticker: str, cache_dir: Path | None = None) -> tuple[pl.
     """All tracked XBRL facts, long format. available_time = filing date (exact PIT).
     Raw JSON cached on disk (large, rate-limited API). Returns (df, 'sec_edgar')."""
     cik = ticker_to_cik(ticker)
-    cache = (cache_dir or Path("data") / "raw" / "sec")
+    from quant_loop_trader.data import ROOT
+    cache = (cache_dir or ROOT / "data" / "raw" / "sec")
     cache.mkdir(parents=True, exist_ok=True)
     raw_path = cache / f"{cik}.json"
 

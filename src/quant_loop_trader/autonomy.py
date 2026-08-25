@@ -16,6 +16,7 @@ import argparse
 import hashlib
 import itertools
 import json
+import os
 import logging
 from datetime import datetime, timezone
 
@@ -80,7 +81,14 @@ def select_candidates(ticker: str, horizon: int, budget: int) -> list[dict]:
 
 def run_session(ticker: str = "SPY", horizon: int = 5,
                 max_experiments: int = 3, validate: bool = True) -> dict:
-    """One bounded autonomous research session. Lockfile-guarded; writes heartbeat."""
+    """One bounded autonomous research session.
+
+    SAFETY (audit AD3): gated on env QLT_AUTONOMOUS_ENABLED=true — the launchd path
+    was previously ungated. Lockfile-guarded; heartbeat written even on crash."""
+    if os.getenv("QLT_AUTONOMOUS_ENABLED", "").lower() != "true":
+        logger.warning(json.dumps({"event": "session_blocked", "reason": "QLT_AUTONOMOUS_ENABLED not true"}))
+        return {"mode": "OBSERVATION", "executed": 0, "results": [], "skipped": "autonomous_disabled"}
+
     import fcntl
     ROOT = DB_PATH.parent
     lock_path = ROOT / ".session.lock"
@@ -91,6 +99,23 @@ def run_session(ticker: str = "SPY", horizon: int = 5,
         logger.warning(json.dumps({"event": "session_locked", "detail": "another session holds the lock"}))
         return {"mode": "OBSERVATION", "executed": 0, "results": [], "skipped": "session_locked"}
 
+    try:
+        summary = _run_session_body(ticker, horizon, max_experiments, validate, ROOT)
+    except Exception as e:
+        # a crashed session must be LOUD (audit H5/AD4): alert + crashed heartbeat
+        from quant_loop_trader.monitoring.heartbeat import write_heartbeat
+        from quant_loop_trader.monitoring.alerts import send_alert
+        write_heartbeat(ROOT / "logs", status="crashed", details={"error": str(e)[:200]})
+        send_alert("session_crashed", "critical", {"error": str(e)[:200]})
+        raise
+    finally:
+        fcntl.flock(lock_file, fcntl.LOCK_UN)
+        lock_file.close()
+    return summary
+
+
+def _run_session_body(ticker: str, horizon: int, max_experiments: int,
+                      validate: bool, ROOT) -> dict:
     started = datetime.now(timezone.utc).isoformat()
     memory_review = review_memory()
     candidates = select_candidates(ticker, horizon, max_experiments)
@@ -127,10 +152,13 @@ def run_session(ticker: str = "SPY", horizon: int = 5,
         send_alert("research_grid_exhausted", "warning",
                    {"ticker": ticker, "horizon": horizon,
                     "note": "no new candidates — hypothesis refresh required"})
-    # nightly insurance: single-file DB backup, keep last 8
+    # nightly insurance: checkpointed DB backup, keep last 8 (torn-copy guard, audit L4)
     bdir = ROOT / "backups"
     bdir.mkdir(exist_ok=True)
     import shutil
+    con = duckdb.connect(str(DB_PATH))
+    con.execute("CHECKPOINT")
+    con.close()
     shutil.copy2(DB_PATH, bdir / f"research_{datetime.now(timezone.utc).strftime('%Y%m%d')}.duckdb")
     for old in sorted(bdir.glob("research_*.duckdb"))[:-8]:
         old.unlink()
