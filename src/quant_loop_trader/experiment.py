@@ -13,9 +13,6 @@ from pathlib import Path
 import polars as pl
 import numpy as np
 import duckdb
-from sklearn.linear_model import LogisticRegression
-from sklearn.preprocessing import StandardScaler
-from sklearn.pipeline import Pipeline
 
 from quant_loop_trader.data import fetch_ohlcv, save_parquet, dataset_metadata, upsert_dataset, migrate_db, DB_PATH, PROC_DIR
 from quant_loop_trader.replay import ReplayEngine
@@ -71,7 +68,11 @@ def build_train_test(ticker: str, start: str, end: str, horizon: int, feature_fn
 
 
 def train_evaluate_from(train: pl.DataFrame, test: pl.DataFrame, feat_cols: list[str], horizon: int, seed: int) -> dict:
-    """Train on prebuilt train frames, evaluate on hidden test. Creator path only."""
+    """Train on prebuilt train frames, evaluate on hidden test.
+    Uses the REGISTRY model definition so final holdout adjudication evaluates the
+    exact candidate that earned eligibility (audit round-2 drift risk).
+    NOTE: independent_replication deliberately does NOT use this path."""
+    from quant_loop_trader.models.registry import build_model
     _seed_all(seed)
     X_train = train.select(feat_cols).to_numpy()
     y_train = train["label"].to_numpy()
@@ -79,11 +80,11 @@ def train_evaluate_from(train: pl.DataFrame, test: pl.DataFrame, feat_cols: list
     y_test = test["label"].to_numpy()
     prices_test = test["close"].to_numpy()
 
-    pipe = Pipeline([("scaler", StandardScaler()), ("clf", LogisticRegression(max_iter=1000, random_state=seed))])
-    pipe.fit(X_train, y_train)
-    y_pred = pipe.predict(X_test)
+    model = build_model("logistic", seed=seed)
+    model.fit(X_train, y_train, train_period=(str(train["event_time"].min()), str(train["event_time"].max())))
+    y_pred = model.predict(X_test)
     try:
-        y_prob = pipe.predict_proba(X_test)[:, 1]
+        y_prob = model.predict_proba(X_test)
     except Exception:
         y_prob = y_pred.astype(float)
 
@@ -99,7 +100,7 @@ def train_evaluate_from(train: pl.DataFrame, test: pl.DataFrame, feat_cols: list
         "y_pred": y_pred,
         "y_prob": y_prob,
     })
-    return {"metrics": metrics, "error_analysis": err, "pred_df": pred_df, "train_n": train.height, "test_n": test.height, "model": pipe}
+    return {"metrics": metrics, "error_analysis": err, "pred_df": pred_df, "train_n": train.height, "test_n": test.height, "model": model}
 
 
 def _code_version() -> str:

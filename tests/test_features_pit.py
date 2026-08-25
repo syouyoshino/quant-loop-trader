@@ -73,7 +73,7 @@ def test_fundamental_exact_pit_from_filing_date():
     before = out.row(0, named=True)
     after = out.row(1, named=True)
     # Nov 1: FY2023 filed? fixture says available 2023-11-03 → nothing yet (only prior years absent here) → None
-    assert before["revenue_growth"] is None or True  # depends on >=2 annuals; with this fixture None expected
+    assert before["revenue_growth"] is None  # only one annual filing visible on Nov 1
     # Dec 1: filing visible → growth computable from the two annual rows
     dec = out.filter(pl.col("date") == datetime.date(2023, 12, 1))
     # two Revenues annuals exist (380.0, 394.3): growth = 394.3/380 - 1

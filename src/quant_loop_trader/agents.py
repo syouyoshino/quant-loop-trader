@@ -8,6 +8,7 @@ separate pipeline owned by reviewer roles below.
 from __future__ import annotations
 
 import hashlib
+import math
 import json
 import logging
 from pathlib import Path
@@ -258,9 +259,11 @@ def validate_experiment(experiment_id: str) -> dict:
 
         from quant_loop_trader.validation.multiple_testing import deflated_sharpe_ratio
         sharpe = json.loads((exp_dir / "metrics.json").read_text())["improved"]["sharpe_strategy"]
-        n_trials = max(1, _experiment_count())
-        dsr = deflated_sharpe_ratio(sharpe, n_obs=int(test.height), n_trials=n_trials)
-        hardening["multiple_testing"] = {"n_trials": n_trials, **dsr}
+        # DSR needs the EMPIRICAL dispersion of trial Sharpes (audit round-2) —
+        # pulled from every authoritative improved experiment in the family
+        trial_sharpes = _authoritative_trial_sharpes()  # current run is part of the family
+        dsr = deflated_sharpe_ratio(sharpe, n_obs=int(test.height), n_trials=trial_sharpes)
+        hardening["multiple_testing"] = {"n_trials": len(trial_sharpes), **dsr}
         if dsr["verdict"] == "PROBABLY_LUCK":
             all_issues.append("multiple_testing:deflated_sharpe_probably_luck")
     except Exception as e:
@@ -294,6 +297,28 @@ def validate_experiment(experiment_id: str) -> dict:
     logger.info(json.dumps({"event": "validation_complete", "experiment_id": experiment_id,
                             "status": verdict["approval_status"], "registry_status": status}))
     return verdict
+
+
+def _authoritative_trial_sharpes() -> list[float]:
+    """Empirical Sharpe dispersion across authoritative improved experiments."""
+    import duckdb
+    from quant_loop_trader.data import DB_PATH, migrate_db
+    migrate_db()
+    con = duckdb.connect(str(DB_PATH), read_only=True)
+    rows = con.execute(
+        "SELECT metrics_json FROM experiments WHERE authoritative "
+        "AND experiment_id NOT LIKE '%_baseline'"
+    ).fetchall()
+    con.close()
+    out = []
+    for (mj,) in rows:
+        try:
+            s_val = json.loads(mj).get("sharpe_strategy")
+            if isinstance(s_val, (int, float)) and math.isfinite(s_val):
+                out.append(float(s_val))
+        except Exception:
+            continue
+    return out
 
 
 def _experiment_count() -> int:

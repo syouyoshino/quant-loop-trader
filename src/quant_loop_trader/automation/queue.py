@@ -35,7 +35,7 @@ def claim_next(db_path=None, worker: str = "default") -> dict | None:
         "WHERE status='running' AND updated_at < current_timestamp - INTERVAL 1 HOUR AND attempts < 3"
     )
     rows = con.execute(
-        "UPDATE tasks SET status='running', claimed_by=?, updated_at=current_timestamp "
+        "UPDATE tasks SET status='running', claimed_by=?, attempts=attempts+1, updated_at=current_timestamp "
         "WHERE task_id = (SELECT task_id FROM tasks WHERE status='pending' "
         "ORDER BY priority, created_at LIMIT 1) RETURNING task_id, task_type, payload_json",
         [worker],
@@ -49,7 +49,7 @@ def claim_next(db_path=None, worker: str = "default") -> dict | None:
 
 def complete(task_id: str, result: dict, ok: bool = True, db_path=None) -> None:
     con = duckdb.connect(str(db_path or DB_PATH))
-    con.execute("UPDATE tasks SET status=?, result_json=?, attempts=attempts+1, updated_at=current_timestamp WHERE task_id=?",
+    con.execute("UPDATE tasks SET status=?, result_json=?, updated_at=current_timestamp WHERE task_id=?",
                 ["done" if ok else "failed", json.dumps(result), task_id])
     con.close()
 

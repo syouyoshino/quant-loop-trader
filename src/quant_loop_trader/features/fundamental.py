@@ -56,7 +56,7 @@ def _prev_annual(facts: pl.DataFrame, metric: str, date) -> float | None:
     f = (
         facts.filter((pl.col("metric") == metric) & (pl.col("form") == ANNUAL_FORM))
         .filter(pl.col("available_time") <= date)
-        # dedupe restatements: one row per fiscal period (latest filed wins)
+        .sort("available_time")  # latest KNOWN filing wins, independent of payload order
         .unique(subset=["event_time"], keep="last")
         .sort("event_time")
     )

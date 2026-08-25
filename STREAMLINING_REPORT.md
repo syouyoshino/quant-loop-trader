@@ -1,3 +1,5 @@
+# [HISTORICAL SNAPSHOT — as of commit d8b1060. Dependency claims below may be stale; e.g. metrics.json is now READ by the multiple-testing gate. Do not use for cleanup decisions.]
+
 # STREAMLINING_REPORT.md
 
 **Mission:** maximum research capability, minimum unnecessary complexity.

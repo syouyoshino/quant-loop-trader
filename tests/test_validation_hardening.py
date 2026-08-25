@@ -60,10 +60,38 @@ def test_bh_fdr_controls_familywise_error():
     assert not rejects[-1]                 # weak finding rejected
 
 
-def test_deflated_sharpe_penalizes_many_trials():
-    lucky = deflated_sharpe_ratio(sharpe=2.1, n_obs=500, n_trials=1000)
-    lone = deflated_sharpe_ratio(sharpe=2.1, n_obs=500, n_trials=1)
-    assert lucky["dsr"] < lone["dsr"]                       # same Sharpe, less believable after mining
-    assert lucky["verdict"] != "GENUINE" or lone["dsr"] > lucky["dsr"]
-    assert deflated_sharpe_ratio(-1.0, 500, 5)["verdict"] == "PROBABLY_LUCK"
+def test_deflated_sharpe_penalizes_dispersion():
+    # many dispersed trials → higher E[max] under H0 → lower DSR for same Sharpe
+    few = deflated_sharpe_ratio(1.2, n_obs=250, n_trials=[0.8, 1.2])
+    many = deflated_sharpe_ratio(1.2, n_obs=250,
+                                 n_trials=[-1.0, 0.1, 0.5, 0.9, 1.2, 1.6, 2.2])
+    assert many["dsr"] <= few["dsr"]
+    assert deflated_sharpe_ratio(-1.0, 500, [0.5, -1.0])["verdict"] == "PROBABLY_LUCK"
     assert family_wise_stats({"total": 100, "successes": 3, "failures": 97})["failed_candidates"] == 97
+
+
+def test_dsr_uses_empirical_dispersion_not_count():
+    """Audit round-2: same count with different dispersions must give different DSR;
+    n_trials=1 must NOT fabricate a negative deflation threshold."""
+    from quant_loop_trader.validation.multiple_testing import deflated_sharpe_ratio
+    tight = deflated_sharpe_ratio(1.5, n_obs=500, n_trials=[1.4, 1.5, 1.6])
+    wide = deflated_sharpe_ratio(1.5, n_obs=500, n_trials=[0.0, 1.5, 3.0])
+    assert wide["dsr"] < tight["dsr"]  # more dispersion → less believable
+    single = deflated_sharpe_ratio(2.1, n_obs=500, n_trials=1)
+    assert single["expected_max_sharpe_h0"] == 0.0      # no fabricated negative threshold
+    assert single["verdict"] == "GENUINE"               # plain PSR at high Sharpe
+    count_only = deflated_sharpe_ratio(2.1, n_obs=500, n_trials=50)
+    assert count_only["dispersion_note"] == "count_only_no_dispersion"
+    assert count_only["expected_max_sharpe_h0"] == 0.0
+
+
+def test_dsr_luck_still_flagged_with_empirical_input():
+    from quant_loop_trader.validation.multiple_testing import deflated_sharpe_ratio
+    # short observation window + dispersed trials: Sharpe 1.0 cannot clear the bar
+    short_lived = deflated_sharpe_ratio(1.0, n_obs=60,
+                                        n_trials=[-1.0, 0.2, 0.4, 1.0, 0.9, 0.1, -0.3, 0.6])
+    # dispersed trials raise E[max] to ~0.96 → DSR collapses from certain to coin-flip
+    assert short_lived["verdict"] == "LOW_CONFIDENCE" and short_lived["dsr"] < 0.7
+    # a lone identical run (no deflation) stays confident — proving dispersion bites
+    lone = deflated_sharpe_ratio(1.0, n_obs=60, n_trials=[1.0])
+    assert lone["dsr"] > short_lived["dsr"] and lone["expected_max_sharpe_h0"] == 0.0

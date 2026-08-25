@@ -134,5 +134,8 @@ class PaperBroker:
 
     def submit(self, order: Order, bar_close: float) -> dict:
         fill = self.simulator.fill(order, bar_close)
+        if not fill.get("filled"):
+            # audit round-2: unfilled limits must NOT touch the tracker
+            return {**fill, "cash_after": round(self.tracker.cash, 2)}
         self.tracker.execute(order, fill["price"])
-        return fill
+        return {**fill, "cash_after": round(self.tracker.cash, 2)}

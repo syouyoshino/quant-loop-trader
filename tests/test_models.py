@@ -47,7 +47,14 @@ def test_logistic_beats_majority_on_learnable_signal():
     X, y, Xt, yt = _toy(seed=3)
     acc = lambda m: float(np.mean(m.fit(X, y).predict(Xt) == yt))
     assert acc(LogisticModel()) > acc(MajorityPredictor())
-    assert acc(RandomPredictor()) < acc(MajorityPredictor()) or True  # random ~ base rate
+    majority_acc = acc(MajorityPredictor())
+    random_acc = acc(RandomPredictor(seed=7))
+    # sentinel always predicts the TRAIN majority class; accuracy equals that
+    # class's share of the test set (whatever the test base rate turns out to be)
+    train_majority = max(np.mean(y), 1 - np.mean(y))
+    expected_share = (yt == (np.mean(y) >= 0.5)).mean()
+    assert majority_acc == pytest.approx(expected_share)
+    assert abs(random_acc - max(yt.mean(), 1 - yt.mean())) < 0.15  # random ≈ test base rate
 
 
 def test_unknown_model_rejected():

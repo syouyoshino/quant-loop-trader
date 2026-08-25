@@ -52,6 +52,7 @@ def adjudicate_holdout(experiment_id: str) -> dict:
 
     ticker, h = cfg["ticker"], cfg["horizon"]
     pq = PROC_DIR / f"{ticker}.parquet"
+    fin = {}
     try:
         df = _load_holdout_frame(pq, cfg)
         feats = _improved_cols(df)
@@ -63,18 +64,36 @@ def adjudicate_holdout(experiment_id: str) -> dict:
         ypred = m.predict(Xte)
         base = float(max(yte.mean(), 1 - yte.mean()))
         acc = float((ypred == yte).mean())
-        promoted = len(yte) >= 50 and acc > base and statistical_review(exp_dir)["approval_status"] == "APPROVED"
+        # predeclared ECONOMIC objective (audit round-2): classification accuracy
+        # alone never promotes — the hidden tail must also clear costs and beat
+        # buy-and-hold on risk-adjusted net terms
+        from quant_loop_trader.evaluation import evaluate
+        prices_h = feats["close"].to_numpy()
+        try:
+            prob = m.predict_proba(Xte)
+        except Exception:
+            prob = ypred.astype(float)
+        fin = evaluate(yte, ypred, prob, prices_h, horizon=h)
+        economic_gate = (fin["transaction_cost_adj_return"] > 0
+                         and fin["sharpe_strategy"] >= fin["sharpe_benchmark"])
+        promoted = (len(yte) >= 50 and acc > base
+                    and economic_gate
+                    and statistical_review(exp_dir)["approval_status"] == "APPROVED")
     except Exception as e:
         # fail closed: a broken adjudication can never promote (audit cycle-2 D)
         import traceback
         logger = logging.getLogger(__name__)
         logger.error(f"adjudication failed: {e}")
         result = {"promoted": False, "reason": f"adjudication_error:{str(e)[:150]}",
+                  "economic_gate": fin or None,
                   "traceback_tail": traceback.format_exc()[-300:]}
         (exp_dir / "holdout_report.json").write_text(json.dumps(result, indent=2))
         return result
     result = {"promoted": promoted, "holdout_accuracy": acc,
-              "base_rate": base, "n_holdout": int(len(yte))}
+              "base_rate": base, "n_holdout": int(len(yte)),
+              "economic_gate": {"net_return": fin["transaction_cost_adj_return"],
+                                "sharpe_strategy": fin["sharpe_strategy"],
+                                "sharpe_benchmark": fin["sharpe_benchmark"]}}
     (exp_dir / "holdout_report.json").write_text(json.dumps(result, indent=2))
     migrate_db()
     con = duckdb.connect(str(DB_PATH))
