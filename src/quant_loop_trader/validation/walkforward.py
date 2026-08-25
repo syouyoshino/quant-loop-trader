@@ -31,7 +31,7 @@ class WalkForwardValidator:
         self.model_builder = model_builder
         self.n_folds = n_folds
 
-    def run(self, df: pl.DataFrame, feature_cols: list[str]) -> dict:
+    def run(self, df: pl.DataFrame, feature_cols: list[str], horizon: int = 1) -> dict:
         from quant_loop_trader.evaluation import evaluate
         import numpy as np
 
@@ -39,11 +39,13 @@ class WalkForwardValidator:
         dates = df["event_time"].to_list()
         folds_spec = make_folds(dates, self.n_folds)
         results = []
-        all_accs, all_rets = [], []
+        all_accs = []
         for spec in folds_spec:
             a, b = spec["train_idx"]
             c, d = spec["validation_idx"]
-            train, test = df.slice(a, b - a), df.slice(c, d - c)
+            # purge h boundary rows: their labels read validation-window prices (audit QA2)
+            train = df.slice(a, max(1, (b - a) - horizon))
+            test = df.slice(c, d - c)
             m = self.model_builder()
             m.fit(train.select(feature_cols).to_numpy(), train["label"].to_numpy(),
                   train_period=(str(train["event_time"].min()), str(train["event_time"].max())))
@@ -54,7 +56,7 @@ class WalkForwardValidator:
             except Exception:
                 prob = ypred.astype(float)
             prices = test["close"].to_numpy() if "close" in test.columns else np.array([])
-            metrics = evaluate(yte, ypred, prob, prices, horizon=1)
+            metrics = evaluate(yte, ypred, prob, prices, horizon=horizon)  # real label horizon (audit QA2)
             acc = metrics["accuracy"]
             rec = {
                 "window_id": spec["window_id"],
