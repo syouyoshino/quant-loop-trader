@@ -5,6 +5,8 @@ from __future__ import annotations
 
 from datetime import datetime
 
+from quant_loop_trader.features import improved_feature_columns
+
 HOLDOUT_FRACTION = 0.15
 
 
@@ -33,6 +35,7 @@ def adjudicate_holdout(experiment_id: str) -> dict:
     and promotes to champion only if it beats the majority-class base rate there.
     This is the only code path that may set model_registry status='champion'."""
     import json
+    import logging
     import duckdb
     from quant_loop_trader.data import PROC_DIR, DB_PATH, migrate_db
     from quant_loop_trader.experiment import EXP_ROOT
@@ -49,15 +52,27 @@ def adjudicate_holdout(experiment_id: str) -> dict:
 
     ticker, h = cfg["ticker"], cfg["horizon"]
     pq = PROC_DIR / f"{ticker}.parquet"
-    df = _load_holdout_frame(pq, cfg)
-    feats = _improved_cols(df)
-    Xte, yte = feats.select(_feature_names()).to_numpy(), feats["label"].to_numpy()
-    m = build_model(cfg.get("model_type", "logistic"), seed=cfg["seed"]).fit(
-        _train_all_nonholdout(pq, cfg), _labels_nonholdout(pq, cfg))
-    ypred = m.predict(Xte)
-    base = float(max(yte.mean(), 1 - yte.mean()))
-    acc = float((ypred == yte).mean())
-    promoted = len(yte) >= 50 and acc > base and statistical_review(exp_dir)["approval_status"] == "APPROVED"
+    try:
+        df = _load_holdout_frame(pq, cfg)
+        feats = _improved_cols(df)
+        Xte, yte = feats.select(_feature_names()).to_numpy(), feats["label"].to_numpy()
+        # audit remediation: fit(X, y) — the previous call passed the (X, y) tuple
+        # as X and None as y, guaranteeing a crash inside sklearn
+        Xtr, ytr = _train_all_nonholdout(pq, cfg)
+        m = build_model(cfg.get("model_type", "logistic"), seed=cfg["seed"]).fit(Xtr, ytr)
+        ypred = m.predict(Xte)
+        base = float(max(yte.mean(), 1 - yte.mean()))
+        acc = float((ypred == yte).mean())
+        promoted = len(yte) >= 50 and acc > base and statistical_review(exp_dir)["approval_status"] == "APPROVED"
+    except Exception as e:
+        # fail closed: a broken adjudication can never promote (audit cycle-2 D)
+        import traceback
+        logger = logging.getLogger(__name__)
+        logger.error(f"adjudication failed: {e}")
+        result = {"promoted": False, "reason": f"adjudication_error:{str(e)[:150]}",
+                  "traceback_tail": traceback.format_exc()[-300:]}
+        (exp_dir / "holdout_report.json").write_text(json.dumps(result, indent=2))
+        return result
     result = {"promoted": promoted, "holdout_accuracy": acc,
               "base_rate": base, "n_holdout": int(len(yte))}
     (exp_dir / "holdout_report.json").write_text(json.dumps(result, indent=2))
@@ -78,7 +93,7 @@ def _load_holdout_frame(pq, cfg):
     df = df.filter(pl.col("event_time") >= pl.lit(cfg["start"]).str.strptime(pl.Date, "%Y-%m-%d"))
     df = apply_holdout(df, cfg["start"], cfg["end"], use_holdout=True)  # THE opening
     return add_improved_features(make_labels(df, cfg["horizon"])).drop_nulls(
-        subset=_improved_cols(df).columns)
+        subset=improved_feature_columns() + ["label"])
 
 
 def _improved_cols(df):
@@ -104,5 +119,3 @@ def _train_all_nonholdout(pq, cfg):
     return clean.select(improved_feature_columns()).to_numpy(), clean["label"].to_numpy()
 
 
-def _labels_nonholdout(pq, cfg):
-    return None  # labels returned with features by _train_all_nonholdout

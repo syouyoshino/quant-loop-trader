@@ -52,3 +52,16 @@ def test_experiment_config_generation_and_validation():
     bad = {"ticker": "SPY"}
     errs = validate_config(bad)
     assert "missing_field:hypothesis_id" in errs and "end_before_start" not in errs
+
+
+def test_macro_families_gated_behind_alfred(monkeypatch):
+    """FRED-revision ceiling: macro feature families are excluded from hypothesis
+    generation unless the operator explicitly accepts revised-data exposure."""
+    monkeypatch.delenv("QLT_ALLOW_REVISED_MACRO", raising=False)
+    cands = generate_candidates([], max_candidates=50)
+    for h in cands:
+        assert not (set(h.feature_groups) & {"macro_rates", "macro_inflation", "macro_labor"})
+    # operator override reopens them
+    monkeypatch.setenv("QLT_ALLOW_REVISED_MACRO", "true")
+    cands2 = generate_candidates([], max_candidates=50)
+    assert any("macro_rates" in h.feature_groups for h in cands2)

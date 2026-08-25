@@ -7,6 +7,7 @@ here claims an idea works.
 from __future__ import annotations
 
 import hashlib
+import os
 import json
 import logging
 from dataclasses import asdict, dataclass, field
@@ -46,6 +47,11 @@ FEATURE_FAMILIES: dict[str, list[str]] = {
     "fundamental_quality": ["net_margin", "return_on_equity"],
     "fundamental_growth": ["revenue_growth", "earnings_growth"],
 }
+
+# Audit ceiling enforcement: macro series carry revised-history risk until ALFRED
+# vintages are wired. These families are excluded from generation unless the
+# operator explicitly accepts revised-data exposure.
+ALFRED_REQUIRED = {"macro_rates", "macro_inflation", "macro_labor"}
 
 MECHANISMS = {
     "technical_momentum": "information_delay — prices under-react to news",
@@ -93,7 +99,11 @@ def generate_candidates(previous_texts: list[str], horizons: list[int] = (5,),
     Memory-driven: pairs whose mechanism already failed repeatedly get skipped."""
     from quant_loop_trader.research_memory import search_memory
 
-    families = sorted(FEATURE_FAMILIES)
+    allow_revised_macro = os.getenv("QLT_ALLOW_REVISED_MACRO", "").lower() == "true"
+    families = sorted(
+        f for f in FEATURE_FAMILIES
+        if allow_revised_macro or f not in ALFRED_REQUIRED
+    )
     out: list[ResearchHypothesis] = []
     for i, fa in enumerate(families):
         for fb in families[i + 1:]:
