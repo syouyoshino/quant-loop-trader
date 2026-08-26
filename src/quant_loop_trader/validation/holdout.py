@@ -124,6 +124,7 @@ def adjudicate_holdout(experiment_id: str) -> dict:
 
 
 def _confirm_success_memory(experiment_id: str) -> None:
+    import json
     import duckdb
     from quant_loop_trader.data import DB_PATH, migrate_db
     migrate_db()
