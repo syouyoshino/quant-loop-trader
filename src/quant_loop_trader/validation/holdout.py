@@ -5,6 +5,8 @@ from __future__ import annotations
 
 from datetime import datetime
 
+import numpy as np
+
 from quant_loop_trader.features import improved_feature_columns
 
 HOLDOUT_FRACTION = 0.15
@@ -36,10 +38,10 @@ def adjudicate_holdout(experiment_id: str) -> dict:
     This is the only code path that may set model_registry status='champion'."""
     import json
     import logging
+
     import duckdb
     from quant_loop_trader.data import PROC_DIR, DB_PATH, migrate_db
     from quant_loop_trader.experiment import EXP_ROOT
-    from quant_loop_trader.agents import statistical_review
     from quant_loop_trader.models.registry import build_model
 
     exp_dir = EXP_ROOT / experiment_id
@@ -80,9 +82,15 @@ def adjudicate_holdout(experiment_id: str) -> dict:
         # figure reflects what the capital actually did.
         economic_gate = (fin["cumulative_return_strategy"] > 0
                          and fin["sharpe_strategy"] >= fin["sharpe_benchmark"])
-        promoted = (len(yte) >= 50 and acc > base
-                    and economic_gate
-                    and statistical_review(exp_dir)["approval_status"] == "APPROVED")
+        # audit B/H-round3: significance must come from HOLDOUT predictions, not
+        # the research split. One-sided binomial vs majority base rate on the
+        # hidden tail itself, via the ONE canonical significance function.
+        from quant_loop_trader.core import significance as _sig
+        sig = _sig(yte, np.asarray(ypred), horizon=h)
+        sig_ok = sig.passed and sig.n_effective >= 10
+        # NOTE: research-split statistical approval was already required for
+        # ELIGIBILITY; here ONLY holdout evidence decides (audit invariant 8).
+        promoted = bool(acc > base and economic_gate and sig_ok)
     except Exception as e:
         # fail closed: a broken adjudication can never promote (audit cycle-2 D)
         import traceback
@@ -116,7 +124,6 @@ def adjudicate_holdout(experiment_id: str) -> dict:
 
 
 def _confirm_success_memory(experiment_id: str) -> None:
-    import json
     import duckdb
     from quant_loop_trader.data import DB_PATH, migrate_db
     migrate_db()

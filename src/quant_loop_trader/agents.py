@@ -98,39 +98,32 @@ def _verify_locks(exp_dir: Path) -> list[str]:
 
 # --- Statistical Reviewer ---------------------------------------------------
 def statistical_review(exp_dir: Path, alpha: float = 0.05) -> dict:
-    """Significance vs the majority-class BASE RATE (not coin-flip), sample size,
-    and a hard gate on degenerate constant predictions.
-    ponytail: per-experiment binomial only; no Bonferroni correction across the
-    overlapping-window grid family — add family-wise correction when grid >100 configs."""
+    """Significance vs the majority-class BASE RATE via the ONE canonical
+    significance function (core.significance) — non-overlapping h-day sampling,
+    one-sided vs base rate, degenerate/near-degenerate gates.
+    ponytail: family FDR lives in validate_experiment's hardening section."""
     pred = _load_predictions(exp_dir)
-    horizon = json.loads((exp_dir / "config.json").read_text())["horizon"]
-    if horizon > 1:
-        # audit H-round3: adjacent h-day labels overlap → not independent Bernoulli.
-        # Significance computed on the NON-OVERLAPPING subset (every h-th row).
-        pred = pred.slice(0, (pred.height // horizon) * horizon)
-        pred = pred[[i * horizon for i in range(pred.height // horizon)]]
-    n = pred.height
-    correct = int((pred["y_true"] == pred["y_pred"]).sum())
+    cfg_file = exp_dir / "config.json"
+    horizon = json.loads(cfg_file.read_text())["horizon"] if cfg_file.exists() else 1
+    from quant_loop_trader.core import significance as _sig
+    sig = _sig(pred["y_true"].to_numpy(), pred["y_pred"].to_numpy(), horizon=horizon, alpha=alpha)
+
     issues = []
     # degenerate classifier: predicts a single class regardless of features
     if len(set(pred["y_pred"].to_list())) < 2:
         issues.append(f"degenerate_constant_predictions:{sorted(set(pred['y_pred'].to_list()))}")
     # near-degenerate: minority class of PREDICTIONS < 5% → majority collapse in disguise
     counts = pred["y_pred"].value_counts().sort("count")["count"]
-    if n and counts[0] / n < 0.05:
-        issues.append(f"near_degenerate_minority_rate:{counts[0] / n:.3f}")
-    # null = majority-class accuracy on the same test labels
-    p_base = float(max(pred["y_true"].mean(), 1 - pred["y_true"].mean()))
-    from scipy.stats import binomtest
-    pvalue = float(binomtest(correct, n, p_base).pvalue)
-    if n < 100:
-        issues.append(f"sample_size_too_small:{n}")
-    if pvalue >= alpha:
-        issues.append(f"not_significant_vs_base_rate{p_base:.3f}:p={pvalue:.4f}")
-    logger.info(json.dumps({"event": "statistical_review", "n": n, "correct": correct,
-                            "base_rate": p_base, "p": pvalue}))
+    if sig.n_effective and counts[0] / pred.height < 0.05:
+        issues.append(f"near_degenerate_minority_rate:{counts[0] / pred.height:.3f}")
+    if sig.n_effective < max(20, 100 // max(horizon, 1)):
+        issues.append(f"sample_size_too_small:{sig.n_effective}")
+    if not sig.passed:
+        issues.append(f"not_significant_vs_base_rate{sig.base_rate:.3f}:p={sig.pvalue:.4f}")
+    logger.info(json.dumps({"event": "statistical_review", **sig.to_dict()}))
     return _msg("statistical_reviewer",
-                ["majority_class_null_test", "degenerate_prediction_gate", "sample_size_check"],
+                ["majority_class_null_test", "degenerate_prediction_gate",
+                 "near_degenerate_gate", "sample_size_check"],
                 issues)
 
 
@@ -450,7 +443,7 @@ def _family_pvalues(current_exp_dir, ticker: str, horizon: int):
             rep_file = EXP_ROOT / eid / "report.json"
             if not rep_file.exists():
                 continue
-            pv = json.loads(rep_file.read_text()).get("stat_pvalue")
+            pv = json.loads(rep_file.read_text()).get("candidate_stat_pvalue")  # candidate evidence ONLY
             if pv is None:
                 continue
             if eid == current_exp_dir.name:

@@ -44,13 +44,14 @@ def make_labels(df: pl.DataFrame, horizon: int = 5) -> pl.DataFrame:
     return df
 
 
-def build_train_test(ticker: str, start: str, end: str, horizon: int, feature_fn, feat_cols: list[str]):
+def build_train_test(ticker: str, start: str, end: str, horizon: int, feature_fn, feat_cols: list[str],
+                     parquet_path: Path | None = None):
     """Single pipeline used by creator AND every reviewer. Divergence here was the
     root cause of false replication rejections — do not copy this logic elsewhere.
 
-    The final HOLDOUT_FRACTION of the window is permanently excluded (research
-    must never train, tune, or select on it) — charter out-of-time holdout."""
-    pq = PROC_DIR / f"{ticker}.parquet"
+    Input resolution (INVARIANT 3): callers SHOULD pass the experiment's immutable
+    content-addressed snapshot; default is the shared acquisition cache."""
+    pq = Path(parquet_path) if parquet_path else PROC_DIR / f"{ticker}.parquet"
     if not pq.exists():
         df_raw, _ = fetch_ohlcv(ticker, start, end)
         save_parquet(df_raw, pq)
@@ -191,7 +192,11 @@ def run_experiment(ticker: str = "SPY", horizon: int = 5, start: str = "2018-01-
         logger.warning(json.dumps({"event": "duplicate_risk", "similar_failures": dup["similar_failures"], "hypothesis": hypothesis[:60]}))
 
     # dataset version etc
+    from quant_loop_trader.core import ExperimentSpec
+    spec = ExperimentSpec(ticker=ticker, start=start, end=end, horizon=horizon,
+                          seed=seed, pipeline_version=_pipeline_version())
     config = {
+        "spec_fingerprint": spec.fingerprint(),
         "pipeline_version": _pipeline_version(),
         "ticker": ticker,
         "horizon": horizon,
@@ -204,6 +209,7 @@ def run_experiment(ticker: str = "SPY", horizon: int = 5, start: str = "2018-01-
         "model_version": "sklearn-LogReg-C1.0-scaled",
         "snapshot_definition": meta["snapshot_definition"],
         "dataset_checksum": meta["checksum"],  # reviewers fail on data drift (audit M4)
+        "dataset_snapshot": str(ROOT / "data" / "datasets" / f"{meta['dataset_id']}.parquet"),
         **periods,
     }
     report = {

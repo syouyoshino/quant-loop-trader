@@ -52,7 +52,9 @@ def test_ablation_identifies_signal_group():
         out = run_ablation("SPY", "2020-01-01", "2021-08-01", 5, 42, groups,
                            model_builder=lambda: __import__(
                                "quant_loop_trader.models.registry", fromlist=["LogisticModel"]
-                           ).LogisticModel(seed=42))
+                           ).LogisticModel(seed=42),
+                           feature_fn=lambda df: df,
+                           feat_cols=["signal_feat", "noise_a", "noise_b"])
         sig_delta = out.filter(pl.col("removed") == "signal")["delta_vs_full"][0]
         noise_delta = out.filter(pl.col("removed") == "noiseA")["delta_vs_full"][0]
         # removing the signal group must hurt; removing noise must not help/hurt much

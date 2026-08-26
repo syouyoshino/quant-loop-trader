@@ -1,5 +1,6 @@
 import polars as pl
-from quant_loop_trader.data import fetch_ohlcv, save_parquet, dataset_metadata, PROC_DIR, DB_PATH, migrate_db
+import quant_loop_trader.data as dm
+from quant_loop_trader.data import fetch_ohlcv, save_parquet, dataset_metadata, PROC_DIR, migrate_db
 import duckdb
 
 def test_fetch_fallback_or_tiingo(monkeypatch):
@@ -29,7 +30,7 @@ def test_checksum_stable(monkeypatch):
 
 def test_migration_tables_exist():
     migrate_db()
-    con = duckdb.connect(str(DB_PATH))
+    con = duckdb.connect(str(dm.DB_PATH))
     tables = [r[0] for r in con.execute("show tables").fetchall()]
     assert "datasets" in tables and "experiments" in tables
     # check required columns
