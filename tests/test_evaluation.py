@@ -2,6 +2,7 @@ import datetime
 
 import polars as pl
 import numpy as np
+import pytest
 from quant_loop_trader.evaluation import time_split, evaluate
 from quant_loop_trader.data import PROC_DIR
 from quant_loop_trader.features import add_features, feature_columns
@@ -54,3 +55,11 @@ def test_purge_creates_true_embargo_gap():
     assert orig_idx_last_train + h < first_test_idx
     # and no rows are lost: embargo gap is real but total accounting holds
     assert first_test_idx - orig_idx_last_train == h + 1  # indices: gap rows are h+1 positions
+
+
+def test_max_drawdown_counts_first_bucket_loss():
+    """Audit round-3: wealth curve must start at initial capital 1.0 so an
+    immediate first-bucket loss registers as drawdown."""
+    from quant_loop_trader.evaluation import _max_drawdown
+    curve = np.cumprod(1 + np.array([-0.20, 0.10]))   # ends at 0.88
+    assert _max_drawdown(curve) == pytest.approx(-0.20)

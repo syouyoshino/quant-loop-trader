@@ -108,6 +108,13 @@ def train_evaluate_from(train: pl.DataFrame, test: pl.DataFrame, feat_cols: list
     return {"metrics": metrics, "error_analysis": err, "pred_df": pred_df, "train_n": train.height, "test_n": test.height, "model": model}
 
 
+_PIPELINE_REVISION = 2  # bump on any change to split/label/feature semantics
+
+
+def _pipeline_version() -> int:
+    return _PIPELINE_REVISION
+
+
 def _code_version() -> str:
     """Git SHA of the code that produced this result (best-effort)."""
     import subprocess
@@ -118,15 +125,32 @@ def _code_version() -> str:
 
 
 def run_experiment(ticker: str = "SPY", horizon: int = 5, start: str = "2018-01-01", end: str = "2024-12-31", seed: int = 42) -> dict:
-    exp_id = f"{datetime.now(timezone.utc).strftime('%Y%m%d')}_{ticker}_{horizon}d_{hashlib.sha256(f'{ticker}{horizon}{seed}{start}{end}'.encode()).hexdigest()[:8]}"
+    config_hash = hashlib.sha256(f'{ticker}{horizon}{seed}{start}{end}'.encode()).hexdigest()[:8]
+    day = datetime.now(timezone.utc).strftime('%Y%m%d')
+    # audit round-3 CRITICAL: date+config IDs collided on same-day reruns and
+    # OVERWROTE locked evidence. Run IDs are now unique; rerunning an identical
+    # config on the same day creates a sibling run instead of destroying history.
+    exp_id = f"{day}_{ticker}_{horizon}d_{config_hash}"
     exp_dir = EXP_ROOT / exp_id
-    exp_dir.mkdir(parents=True, exist_ok=True)
+    run_suffix = 0
+    while exp_dir.exists():
+        run_suffix += 1
+        exp_id = f"{day}_{ticker}_{horizon}d_{config_hash}_r{run_suffix}"
+        exp_dir = EXP_ROOT / exp_id
+    exp_dir.mkdir(parents=True, exist_ok=False)
 
     # 1. data
     df_raw, source = fetch_ohlcv(ticker, start, end)
     meta = dataset_metadata(df_raw, ticker, source, extra_provenance={"start": start, "end": end})
     parquet_path = PROC_DIR / f"{ticker}.parquet"  # fetch_ohlcv guarantees persistence
     upsert_dataset(meta)
+    # content-addressed snapshot: the exact bytes behind this dataset_id stay
+    # reconstructible even if the shared ticker cache is later refreshed/revised
+    snap_dir = ROOT / "data" / "datasets"
+    snap_dir.mkdir(parents=True, exist_ok=True)
+    snap_path = snap_dir / f"{meta['dataset_id']}.parquet"
+    if not snap_path.exists():
+        df_raw.write_parquet(str(snap_path))
 
     # 2. shared PIT pipeline (same path reviewers use — no divergence possible)
 
@@ -168,6 +192,7 @@ def run_experiment(ticker: str = "SPY", horizon: int = 5, start: str = "2018-01-
 
     # dataset version etc
     config = {
+        "pipeline_version": _pipeline_version(),
         "ticker": ticker,
         "horizon": horizon,
         "start": start,
@@ -229,6 +254,7 @@ def run_experiment(ticker: str = "SPY", horizon: int = 5, start: str = "2018-01-
         "created_at": datetime.now(timezone.utc).isoformat(),
         "config": config,
         "stat_pvalue": baseline["metrics"].get("stat_pvalue"),
+        "candidate_stat_pvalue": improved["metrics"].get("stat_pvalue"),
         "reproducibility": {"seed": seed, "checksum": meta["checksum"], "code_version": _code_version()},
     }
 
@@ -245,6 +271,7 @@ def run_experiment(ticker: str = "SPY", horizon: int = 5, start: str = "2018-01-
         "predictions_baseline.parquet": _sha(exp_dir / "predictions_baseline.parquet"),
         "predictions_improved.parquet": _sha(exp_dir / "predictions_improved.parquet"),
         "config.json": _sha(exp_dir / "config.json"),
+        "metrics.json": _sha(exp_dir / "metrics.json"),  # DSR reads Sharpe from here (audit H-round3)
         "report.json": _sha(exp_dir / "report.json"),  # replication compares against THIS file
         # input-data anchor: byte hash of the parquet AT EXPERIMENT TIME (drift detector)
         "dataset_parquet": _sha(PROC_DIR / f"{ticker}.parquet"),

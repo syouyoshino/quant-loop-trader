@@ -103,6 +103,12 @@ def statistical_review(exp_dir: Path, alpha: float = 0.05) -> dict:
     ponytail: per-experiment binomial only; no Bonferroni correction across the
     overlapping-window grid family — add family-wise correction when grid >100 configs."""
     pred = _load_predictions(exp_dir)
+    horizon = json.loads((exp_dir / "config.json").read_text())["horizon"]
+    if horizon > 1:
+        # audit H-round3: adjacent h-day labels overlap → not independent Bernoulli.
+        # Significance computed on the NON-OVERLAPPING subset (every h-th row).
+        pred = pred.slice(0, (pred.height // horizon) * horizon)
+        pred = pred[[i * horizon for i in range(pred.height // horizon)]]
     n = pred.height
     correct = int((pred["y_true"] == pred["y_pred"]).sum())
     issues = []

@@ -5,6 +5,8 @@ import json
 import logging
 
 import polars as pl
+import math
+
 import numpy as np
 from sklearn.metrics import accuracy_score, precision_score, recall_score, brier_score_loss
 
@@ -38,10 +40,13 @@ def _sharpe(returns: np.ndarray, periods_per_year: float = 252) -> float:
 
 
 def _max_drawdown(cum_returns: np.ndarray) -> float:
+    """Max drawdown of a wealth path. The path is prefixed with initial capital 1.0
+    (audit round-3): without it, a first-bucket loss never registers as drawdown."""
     if len(cum_returns) == 0:
         return 0.0
-    peak = np.maximum.accumulate(cum_returns)
-    dd = (cum_returns - peak) / (peak + 1e-12)
+    curve = np.concatenate([[1.0], cum_returns])
+    peak = np.maximum.accumulate(curve)
+    dd = (curve - peak) / (peak + 1e-12)
     return float(dd.min())
 
 
@@ -143,7 +148,7 @@ def evaluate(y_true: np.ndarray, y_pred: np.ndarray, y_prob: np.ndarray, prices:
         "expected_shortfall_95": es_95,
         "calmar_ratio": calmar,
         # trade quality
-        **_trade_quality(strat_rets),
+        **_trade_quality(strat_rets_net),  # net of costs — comparable to headline metrics
         # luck quantification: percentile bootstrap CI on mean net bucket return
         "return_ci95": bootstrap_ci(strat_rets_net),
         # NOTE: accuracy uses all test rows; financial buckets drop up to h-1 tail rows
@@ -182,12 +187,21 @@ def autopsy(df_test: pl.DataFrame, y_true: np.ndarray, y_pred: np.ndarray) -> di
     return out
 
 
-def bootstrap_ci(returns: np.ndarray, n_boot: int = 1000, seed: int = 42, alpha: float = 0.05) -> tuple[float, float]:
-    """Percentile bootstrap CI on mean return — how much of a result is sampling luck."""
-    if len(returns) < 2:
+def bootstrap_ci(returns: np.ndarray, n_boot: int = 1000, seed: int = 42,
+                 alpha: float = 0.05, block: int = 5) -> tuple[float, float]:
+    """MOVING-BLOCK bootstrap CI on mean return (audit round-3): IID resampling
+    ignored volatility clustering in overlapping h-day buckets."""
+    n = len(returns)
+    if n < 2:
         return (0.0, 0.0)
+    block = max(1, min(int(block), n))
+    n_blocks = math.ceil(n / block)
     rng = np.random.default_rng(seed)
-    means = [float(rng.choice(returns, len(returns), replace=True).mean()) for _ in range(n_boot)]
+    starts = rng.integers(0, n - block + 1, size=(n_boot, n_blocks))
+    means = []
+    for row in starts:
+        sample = np.concatenate([returns[s:s + block] for s in row])[:n]
+        means.append(float(sample.mean()))
     lo = float(np.quantile(means, alpha / 2))
     hi = float(np.quantile(means, 1 - alpha / 2))
     return (lo, hi)

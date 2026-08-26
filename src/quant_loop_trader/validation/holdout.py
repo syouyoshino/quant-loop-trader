@@ -104,12 +104,14 @@ def adjudicate_holdout(experiment_id: str) -> dict:
     new_status = "champion" if promoted else "rejected"
     con.execute("UPDATE model_registry SET status=? WHERE model_id=?", [new_status, f"{experiment_id}_improved"])
     con.close()
-    # audit H6: institutional memory must agree with the FINAL evidence —
-    # provisional success is corrected on rejection, confirmed on promotion
+    # audit H6 + round-3 branch fix: confirm on promotion, correct on rejection —
+    # the previous unconditional correct→confirm sequence left real champions
+    # recorded as failures because their success rows no longer existed to confirm.
     from quant_loop_trader.agents import _correct_success_memories_for
-    _correct_success_memories_for(experiment_id)
     if promoted:
         _confirm_success_memory(experiment_id)
+    else:
+        _correct_success_memories_for(experiment_id)
     return result
 
 
@@ -162,8 +164,12 @@ def _train_all_nonholdout(pq, cfg):
     df = df.filter(pl.col("event_time") >= pl.lit(cfg["start"]).str.strptime(pl.Date, "%Y-%m-%d"))
     # features computed on the full history first (M1), then holdout rows removed
     featured = add_improved_features(make_labels(df, cfg["horizon"]))
-    clean = apply_holdout(featured, cfg["start"], cfg["end"], use_holdout=False).drop_nulls(
-        subset=improved_feature_columns() + ["label"])
+    clean = apply_holdout(featured, cfg["start"], cfg["end"], use_holdout=False)
+    # EMBARGO (audit round-3 CRITICAL): drop the last h pre-boundary rows whose
+    # labels were computed from prices INSIDE the hidden holdout. Features keep
+    # their full causal warmup; outcomes that peek into the holdout do not.
+    clean = clean.sort("event_time").slice(0, max(0, clean.height - cfg["horizon"]))
+    clean = clean.drop_nulls(subset=improved_feature_columns() + ["label"])
     return clean.select(improved_feature_columns()).to_numpy(), clean["label"].to_numpy()
 
 
