@@ -18,8 +18,6 @@ logger = logging.getLogger(__name__)
 
 ROOT = Path(os.environ.get("QLT_ROOT", Path.cwd()))
 PROC_DIR = ROOT / "data" / "processed"
-# migrations ship INSIDE the package (audit AR3): env/cwd-relative paths silently
-# produced table-less databases on non-repo-CWD deployments
 PKG_MIGR_DIR = Path(__file__).resolve().parent / "migrations"
 MIGR_DIR = PKG_MIGR_DIR
 DB_PATH = ROOT / "data" / "research.duckdb"
@@ -29,7 +27,6 @@ TIINGO_URL = "https://api.tiingo.com/tiingo/daily/{ticker}/prices"
 
 
 def _checksum_df(df: pl.DataFrame) -> str:
-    # ponytail: hash csv bytes, stable across polars versions; upgrade to parquet bytes hash if needed
     b = df.write_csv().encode()
     return hashlib.sha256(b).hexdigest()[:16]
 
@@ -38,15 +35,7 @@ _MIGRATED: set[str] = set()
 
 
 def migrate_db(db_path: Path | None = None) -> None:
-    """Apply unapplied migrations, tracked PERSISTENTLY in the database itself.
-
-    Audit round-2 (Critical): the process-local memo meant every fresh process
-    re-executed data migrations — migration 004's unconditional UPDATE would
-    re-quarantine legitimately authoritative results on each restart. Now a
-    `_schema_migrations` table records what actually ran, per database, forever.
-    Legacy databases (pre-tracker) are adopted: DDL re-runs safely; one-time
-    DATA migrations are seeded as applied when their effects are already present.
-    """
+    """Apply unapplied migrations, tracked persistently in the database."""
     import duckdb
 
     db_path = Path(db_path or DB_PATH).resolve()
@@ -68,7 +57,6 @@ def migrate_db(db_path: Path | None = None) -> None:
 
     tables = {r[0] for r in con.execute("SHOW TABLES").fetchall()}
     legacy_adopted = not tracker_existed and "experiments" in tables
-    # does this legacy DB already carry the quarantine backfill's effects?
     legacy_backfilled = False
     if legacy_adopted and "experiments" in tables:
         cols = [r[1] for r in con.execute("PRAGMA table_info('experiments')").fetchall()]
@@ -79,13 +67,10 @@ def migrate_db(db_path: Path | None = None) -> None:
         if name in applied:
             continue
         if legacy_adopted and name == "005_quarantine_backfill.sql" and legacy_backfilled:
-            # one-time data migration whose effects are already on disk — record, never replay
             con.execute("INSERT INTO _schema_migrations VALUES (?, current_timestamp)", [name])
             continue
         con.execute(sql_file.read_text())
         con.execute("INSERT INTO _schema_migrations VALUES (?, current_timestamp)", [name])
-    con.close()
-    _MIGRATED.add(str(db_path))
     con.close()
     _MIGRATED.add(str(db_path))
 
@@ -117,11 +102,16 @@ def _tiingo_fetch(ticker: str, start: str, end: str, api_key: str) -> list[dict]
 
 def _parse_tiingo(rows: list[dict]) -> pl.DataFrame:
     if not rows:
-        return pl.DataFrame(schema={"event_time": pl.Date, "available_time": pl.Date, "open": pl.Float64, "high": pl.Float64, "low": pl.Float64, "close": pl.Float64, "volume": pl.Int64})
+        return pl.DataFrame(schema={
+            "event_time": pl.Date,
+            "available_time": pl.Date,
+            "open": pl.Float64,
+            "high": pl.Float64,
+            "low": pl.Float64,
+            "close": pl.Float64,
+            "volume": pl.Int64,
+        })
     df = pl.DataFrame(rows)
-    # audit H8: prefer ADJUSTED fields — splits/dividends must not appear as fake
-    # returns and economic backtests need total-return prices. Tiingo returns
-    # adjOpen/adjHigh/adjLow/adjClose alongside raw fields.
     has_adj = "adjClose" in df.columns
     prefix = "adj" if has_adj else ""
     df = df.select(
@@ -136,7 +126,7 @@ def _parse_tiingo(rows: list[dict]) -> pl.DataFrame:
         logger.info(json.dumps({"event": "tiingo_adjusted_prices_used"}))
     df = df.with_columns(
         pl.col("event_time").dt.date().alias("event_time"),
-        pl.col("event_time").dt.date().alias("available_time"),  # L1: available at close; future datasets may lag
+        pl.col("event_time").dt.date().alias("available_time"),
     )
     return df.sort("event_time")
 
@@ -144,7 +134,6 @@ def _parse_tiingo(rows: list[dict]) -> pl.DataFrame:
 def _load_fixture() -> pl.DataFrame | None:
     if FIXTURE_PATH.exists():
         df = pl.read_csv(str(FIXTURE_PATH), try_parse_dates=True)
-        # ensure date cols are Date
         if "event_time" in df.columns:
             df = df.with_columns(
                 pl.col("event_time").cast(pl.Date),
@@ -154,20 +143,18 @@ def _load_fixture() -> pl.DataFrame | None:
     return None
 
 
-def fetch_ohlcv(ticker: str = "SPY", start: str = "2018-01-01", end: str = "2024-12-31", use_cache: bool = True) -> tuple[pl.DataFrame, str]:
+def fetch_ohlcv(ticker: str = "SPY", start: str = "2018-01-01", end: str = "2024-12-31",
+                use_cache: bool = True) -> tuple[pl.DataFrame, str]:
     """Fetch OHLCV with PIT columns. Returns (df, actual_source)."""
     PROC_DIR.mkdir(parents=True, exist_ok=True)
-
     parquet_path = PROC_DIR / f"{ticker}.parquet"
 
-    # 1. parquet cache hit
     if use_cache and parquet_path.exists():
         try:
             df = pl.read_parquet(str(parquet_path))
             if df.height > 0:
-                # parsed-date coverage check with a small grace window: a request
-                # starting on a holiday/weekend is covered by the next trading day
                 import datetime as _dt
+
                 s = _dt.date.fromisoformat(start)
                 e = _dt.date.fromisoformat(end)
                 min_d, max_d = df["event_time"].min(), df["event_time"].max()
@@ -181,7 +168,6 @@ def fetch_ohlcv(ticker: str = "SPY", start: str = "2018-01-01", end: str = "2024
         except Exception:
             pass
 
-    # 2. Tiingo if key present
     api_key = os.getenv("TIINGO_API_KEY", "").strip()
     if api_key:
         try:
@@ -189,7 +175,6 @@ def fetch_ohlcv(ticker: str = "SPY", start: str = "2018-01-01", end: str = "2024
             df = _parse_tiingo(rows)
             if df.height == 0:
                 raise ValueError("Tiingo returned 0 rows")
-            # missing data detection: gaps >3 trading days
             gap_check(df)
             save_parquet(df, parquet_path)
             logger.info(json.dumps({"event": "tiingo_fetch_ok", "ticker": ticker, "rows": df.height}))
@@ -197,17 +182,18 @@ def fetch_ohlcv(ticker: str = "SPY", start: str = "2018-01-01", end: str = "2024
         except Exception as e:
             logger.warning(json.dumps({"event": "tiingo_failed_fallback_fixture", "error": str(e)[:200]}))
 
-    # 3. fixture fallback — forbidden while a key is configured (never poison research silently)
     if api_key:
         raise RuntimeError("Tiingo failed and fixture fallback is forbidden while TIINGO_API_KEY is set")
     if ticker.upper() != "SPY":
-        # audit C4: fixture IS SPY data — serving it as another ticker corrupts dataset identity
         raise ValueError(f"fixture fallback only covers SPY; no data source available for {ticker}")
     fixture = _load_fixture()
     if fixture is not None:
         logger.info(json.dumps({"event": "fixture_used", "ticker": ticker, "rows": fixture.height}))
-        fixture = fixture.filter((pl.col("event_time") >= pl.lit(start).str.strptime(pl.Date, "%Y-%m-%d")) & (pl.col("event_time") <= pl.lit(end).str.strptime(pl.Date, "%Y-%m-%d")))
-        save_parquet(fixture, parquet_path)  # single persistence site — downstream always finds the parquet
+        fixture = fixture.filter(
+            (pl.col("event_time") >= pl.lit(start).str.strptime(pl.Date, "%Y-%m-%d"))
+            & (pl.col("event_time") <= pl.lit(end).str.strptime(pl.Date, "%Y-%m-%d"))
+        )
+        save_parquet(fixture, parquet_path)
         return fixture, "fixture"
 
     raise FileNotFoundError("No Tiingo key and no fixture at tests/fixtures/SPY.csv — cannot fetch data")
@@ -216,7 +202,6 @@ def fetch_ohlcv(ticker: str = "SPY", start: str = "2018-01-01", end: str = "2024
 def gap_check(df: pl.DataFrame) -> None:
     if df.height < 2:
         return
-    # trading days: expect gaps <=4 days (weekend+ holiday). >7 is suspicious
     diffs = df.select((pl.col("event_time").diff().dt.total_days()).alias("gap")).drop_nulls()
     max_gap = diffs["gap"].max()
     if max_gap is not None and max_gap > 7:
@@ -231,7 +216,8 @@ def save_parquet(df: pl.DataFrame, path: Path) -> str:
     return cs
 
 
-def dataset_metadata(df: pl.DataFrame, ticker: str, source: str, extra_provenance: dict | None = None) -> dict:
+def dataset_metadata(df: pl.DataFrame, ticker: str, source: str,
+                     extra_provenance: dict | None = None) -> dict:
     cs = _checksum_df(df)
     start = str(df["event_time"].min())
     end = str(df["event_time"].max())
