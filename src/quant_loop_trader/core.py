@@ -1,9 +1,8 @@
-"""Canonical research primitives (simplification refactor).
+"""Canonical research primitives.
 
-ONE definition each for: experiment specification + fingerprint, significance,
-uniform gate results, dataset snapshot identity, and derived lifecycle state.
-
-If you are tempted to recompute any of these elsewhere — don't. Import from here.
+One definition each for experiment identity, significance, gate semantics, and
+lifecycle state. Authoritative paths import these primitives rather than rebuild
+their own policy.
 """
 from __future__ import annotations
 
@@ -13,10 +12,8 @@ from dataclasses import asdict, dataclass, field
 
 import numpy as np
 
+PIPELINE_VERSION = 2
 
-# ---------------------------------------------------------------------------
-# Experiment specification — the ONE immutable identity of requested research
-# ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
 class ExperimentSpec:
@@ -28,24 +25,20 @@ class ExperimentSpec:
     hypothesis_id: str = "baseline_vol_regime"
     hypothesis: str = ""
     economic_reasoning: str = ""
-    pipeline_version: int = 2
+    pipeline_version: int = PIPELINE_VERSION
 
     def fingerprint(self) -> str:
-        """Deterministic identity of the REQUESTED experiment (not the run)."""
+        """Deterministic identity of the requested experiment, not a run."""
         payload = json.dumps(asdict(self), sort_keys=True)
         return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 
-# ---------------------------------------------------------------------------
-# Significance — the ONE statistical significance calculation
-# ---------------------------------------------------------------------------
-
 @dataclass(frozen=True)
 class SignificanceResult:
-    n_effective: int      # non-overlapping observations actually tested
+    n_effective: int
     correct: int
-    base_rate: float      # majority-class accuracy of the same rows
-    pvalue: float         # one-sided: P(>= correct | base rate)
+    base_rate: float
+    pvalue: float
     alpha: float
     passed: bool
 
@@ -55,16 +48,15 @@ class SignificanceResult:
 
 def significance(y_true: np.ndarray, y_pred: np.ndarray,
                  horizon: int = 1, alpha: float = 0.05) -> SignificanceResult:
-    """Binomial significance of directional accuracy vs the majority-class base
-    rate, computed on NON-OVERLAPPING h-day observations (audit H-round3):
-    adjacent h-day labels share price paths, so every row is not an independent
-    Bernoulli trial. One-sided 'greater' — the research question is whether the
-    model is BETTER than the trivial baseline, not merely different."""
+    """One-sided binomial significance vs the same-sample majority base rate.
+
+    h-day directional labels overlap in price paths, so only every h-th aligned
+    observation is treated as an independent Bernoulli trial.
+    """
     yt = np.asarray(y_true)
     yp = np.asarray(y_pred)
     h = max(1, int(horizon))
     n_pairs = min(len(yt), len(yp))
-    # non-overlapping stride: keep every h-th aligned pair
     idx = np.arange(0, n_pairs - h + 1, h) if n_pairs >= h else np.arange(0)
     if len(idx) == 0:
         return SignificanceResult(0, 0, 0.5, 1.0, alpha, False)
@@ -74,13 +66,14 @@ def significance(y_true: np.ndarray, y_pred: np.ndarray,
     correct = int((t == p).sum())
     base_rate = float(max(t.mean(), 1 - t.mean()))
     from scipy.stats import binomtest
-    pvalue = float(binomtest(correct, n_eff, base_rate, alternative="greater").pvalue)
-    return SignificanceResult(n_eff, correct, base_rate, pvalue, alpha, pvalue < alpha)
 
+    pvalue = float(
+        binomtest(correct, n_eff, base_rate, alternative="greater").pvalue
+    )
+    return SignificanceResult(
+        n_eff, correct, base_rate, pvalue, alpha, pvalue < alpha
+    )
 
-# ---------------------------------------------------------------------------
-# Uniform gate results — every required check resolves to exactly one of these
-# ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
 class CheckResult:
@@ -90,53 +83,66 @@ class CheckResult:
     issues: tuple[str, ...] = ()
 
     @staticmethod
-    def fail(name: str, issues: list[str] | tuple[str, ...], evidence: dict | None = None) -> "CheckResult":
+    def fail(name: str, issues: list[str] | tuple[str, ...],
+             evidence: dict | None = None) -> "CheckResult":
         return CheckResult(name, False, evidence or {}, tuple(issues))
 
     @staticmethod
-    def ok(name: str, evidence: dict | None = None) -> CheckResult:
+    def ok(name: str, evidence: dict | None = None) -> "CheckResult":
         return CheckResult(name, True, evidence or {}, ())
 
     def to_dict(self) -> dict:
-        return {"name": self.name, "passed": self.passed,
-                "issues_found": list(self.issues), "evidence": self.evidence}
+        return {
+            "name": self.name,
+            "passed": self.passed,
+            "issues_found": list(self.issues),
+            "evidence": self.evidence,
+        }
 
 
 def gate(checks: list[CheckResult]) -> tuple[bool, list[str]]:
-    """Generic fail-closed gate semantics, defined ONCE.
-    Any check that did not resolve to passed=True blocks approval."""
+    """Generic fail-closed gate semantics."""
     issues = []
-    for c in checks:
-        for i in c.issues:
-            issues.append(f"{c.name}:{i}" if ":" not in i else i)
-        if not c.passed and not c.issues:
-            issues.append(f"{c.name}:failed")
-    return (len(issues) == 0), issues
+    for check in checks:
+        for issue in check.issues:
+            issues.append(
+                f"{check.name}:{issue}" if ":" not in issue else issue
+            )
+        if not check.passed and not check.issues:
+            issues.append(f"{check.name}:failed")
+    return len(issues) == 0, issues
 
-
-# ---------------------------------------------------------------------------
-# Derived lifecycle state — evidence facts in, one status out
-# ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
 class LifecycleEvidence:
-    research_screen: str          # KEEP | IMPROVE | REJECT
-    validation: str = "NOT_RUN"   # NOT_RUN | PASS | FAIL
-    holdout: str = "NOT_RUN"      # NOT_RUN | PASS | FAIL
+    research_screen: str
+    validation: str = "NOT_RUN"
+    holdout: str = "NOT_RUN"
 
 
 def final_state(e: LifecycleEvidence) -> str:
-    """THE lifecycle policy. Components record evidence; this derives status.
-    No component may independently declare eligible/champion."""
+    """Derive the only model lifecycle state from recorded evidence.
+
+    Invalid or causally impossible evidence is rejected loudly rather than being
+    allowed to fall through to a promotable state.
+    """
+    if e.research_screen not in {"KEEP", "IMPROVE", "REJECT"}:
+        raise ValueError(f"invalid research_screen:{e.research_screen}")
+    if e.validation not in {"NOT_RUN", "PASS", "FAIL"}:
+        raise ValueError(f"invalid validation:{e.validation}")
+    if e.holdout not in {"NOT_RUN", "PASS", "FAIL"}:
+        raise ValueError(f"invalid holdout:{e.holdout}")
+    if e.holdout != "NOT_RUN" and e.validation != "PASS":
+        raise ValueError("holdout evidence requires validation=PASS")
+
     if e.research_screen == "REJECT":
         return "rejected"
     if e.validation == "FAIL" or e.holdout == "FAIL":
         return "rejected"
     if e.research_screen == "IMPROVE":
-        return "candidate"                      # Sharpe degraded → never promotable
-    # research_screen == KEEP from here
+        return "candidate"
     if e.validation == "NOT_RUN":
         return "candidate"
     if e.holdout == "NOT_RUN":
         return "eligible"
-    return "champion"                           # holdout PASS
+    return "champion"

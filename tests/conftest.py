@@ -1,5 +1,4 @@
-"""Every test runs against isolated DB + experiments + processed cache.
-The real research state must never be mutated by the test suite."""
+"""Every test runs against isolated DB, experiments, cache, and snapshots."""
 import shutil
 from pathlib import Path
 
@@ -15,19 +14,20 @@ def isolated_research(tmp_path, monkeypatch):
     import quant_loop_trader.agents as agents_mod
     import quant_loop_trader.automation.queue as queue_mod
 
-    db = tmp_path / "research.duckdb"
+    db = tmp_path / "data" / "research.duckdb"
     for m in (data_mod, exp_mod, rm_mod, auto_mod, queue_mod):
         if hasattr(m, "DB_PATH"):
             monkeypatch.setattr(m, "DB_PATH", db)
-    # processed cache: tmp copy so reads work but writes never touch prod cache
-    proc = tmp_path / "processed"
-    proc.mkdir()
+
+    proc = tmp_path / "data" / "processed"
+    proc.mkdir(parents=True)
     real_parquet = Path("data/processed/SPY.parquet")
     if real_parquet.exists():
         shutil.copy(real_parquet, proc / "SPY.parquet")
     monkeypatch.setattr(data_mod, "PROC_DIR", proc)
     monkeypatch.setattr(exp_mod, "PROC_DIR", proc)
-    monkeypatch.setattr(agents_mod, "PROC_DIR", proc)
+    monkeypatch.setattr(exp_mod, "ROOT", tmp_path)
+
     exp_root = tmp_path / "experiments"
     exp_root.mkdir()
     for m in (exp_mod, agents_mod):

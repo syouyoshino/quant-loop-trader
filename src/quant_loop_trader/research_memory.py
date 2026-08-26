@@ -5,7 +5,6 @@ import json
 import logging
 from pathlib import Path
 
-
 from quant_loop_trader import data as _data
 from quant_loop_trader.data import migrate_db
 
@@ -34,22 +33,30 @@ def search_memory(query: str, memory_type: str | None = None) -> list[dict]:
 
 
 def record_outcome(report: dict) -> list[str]:
-    """Store experiment outcome as institutional memory. Returns memory_ids."""
+    """Store the research-screen outcome; final confirmation belongs to holdout."""
     decision = report["decision"]
     exp_id = report["experiment_id"]
     hypothesis = report["hypothesis"]
 
     if decision == "KEEP":
+        # Keep the legacy memory_type for correction/confirmation machinery, but
+        # do not claim hidden-holdout success or increase belief before validation.
         memory_type = "success"
-        lesson = f"Confirmed: {hypothesis} Survived hidden-future test; evidence supports vol-regime conditioning."
-        confidence = min(0.95, prior_confidence(hypothesis) + 0.15)
+        lesson = (
+            f"Provisional KEEP: {hypothesis} Passed the research split and "
+            "predeclared screen; pending independent validation and hidden holdout."
+        )
+        confidence = prior_confidence(hypothesis)
     elif decision == "IMPROVE":
         memory_type = "partial"
-        lesson = f"Partial: accuracy improved but Sharpe degraded. Refine risk control before retest."
-        confidence = max(0.05, prior_confidence(hypothesis) - 0.0)
+        lesson = "Partial: accuracy improved but Sharpe degraded. Refine risk control before retest."
+        confidence = prior_confidence(hypothesis)
     else:
         memory_type = "failure"
-        lesson = f"Rejected: {report['failure_condition']} Vol-interaction features did not change predictions materially."
+        lesson = (
+            f"Rejected: {report['failure_condition']} Vol-interaction features "
+            "did not change predictions materially."
+        )
         confidence = max(0.05, prior_confidence(hypothesis) - 0.2)
 
     autopsy = report.get("error_analysis", {})
@@ -67,12 +74,18 @@ def record_outcome(report: dict) -> list[str]:
             decision,
             lesson,
             conditions,
-            json.dumps({"metrics": report.get("improved_metrics", {}), "delta_acc": report.get("improvement_delta_accuracy")}),
+            json.dumps({
+                "metrics": report.get("improved_metrics", {}),
+                "delta_acc": report.get("improvement_delta_accuracy"),
+            }),
             confidence,
-            json.dumps({"branch": report.get("research_branch"), "creator": report.get("creator_agent")}),
+            json.dumps({
+                "branch": report.get("research_branch"),
+                "creator": report.get("creator_agent"),
+            }),
         ],
     )
-    # market/model knowledge from autopsy
+
     knowledge_id = f"mem_{exp_id}_knowledge"
     con.execute(
         "INSERT OR REPLACE INTO research_memory VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'v1', current_timestamp, TRUE)",
@@ -83,7 +96,10 @@ def record_outcome(report: dict) -> list[str]:
             f"Baseline regime performance for {report['config']['ticker']} {report['config']['horizon']}d",
             None,
             decision,
-            f"Autopsy: {autopsy.get('overall_accuracy', 'n/a')} overall accuracy across vol regimes; false_positive_rate={autopsy.get('false_positive_rate')}",
+            (
+                f"Autopsy: {autopsy.get('overall_accuracy', 'n/a')} overall accuracy "
+                f"across vol regimes; false_positive_rate={autopsy.get('false_positive_rate')}"
+            ),
             conditions,
             json.dumps(autopsy),
             0.6,
@@ -91,7 +107,11 @@ def record_outcome(report: dict) -> list[str]:
         ],
     )
     con.close()
-    logger.info(json.dumps({"event": "memory_recorded", "memory_id": memory_id, "confidence": confidence}))
+    logger.info(json.dumps({
+        "event": "memory_recorded",
+        "memory_id": memory_id,
+        "confidence": confidence,
+    }))
     return [memory_id, knowledge_id]
 
 
@@ -100,7 +120,6 @@ def prior_confidence(hypothesis: str) -> float:
     rows = search_memory(hypothesis[:60])
     if not rows:
         return 0.5
-    # most recent memory's confidence is the running belief
     return float(rows[0]["confidence"])
 
 
@@ -111,15 +130,21 @@ def duplicate_risk(hypothesis: str, max_rejects: int = 3) -> dict:
 
 
 def register_features(feature_defs: list[dict]) -> None:
-    """Idempotent feature registration. Each def: feature_id, formula, creator, data_dependencies, available_time_logic, validation_status."""
+    """Idempotent feature registration."""
     con = _con()
     for f in feature_defs:
         con.execute(
             "INSERT OR REPLACE INTO feature_registry VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'v1', current_timestamp)",
             [
-                f["feature_id"], f["formula"], f.get("creator", "feature_engineer_v0"),
-                f.get("data_dependencies", "SPY daily close"), f.get("available_time_logic", "shift(1): uses data up to t-1"),
-                f.get("validation_status", "validated"), "{}", f.get("failure_conditions", ""), "{}",
+                f["feature_id"],
+                f["formula"],
+                f.get("creator", "feature_engineer_v0"),
+                f.get("data_dependencies", "SPY daily close"),
+                f.get("available_time_logic", "shift(1): uses data up to t-1"),
+                f.get("validation_status", "validated"),
+                "{}",
+                f.get("failure_conditions", ""),
+                "{}",
             ],
         )
     con.close()
@@ -131,10 +156,16 @@ def register_model(model: dict) -> None:
     con.execute(
         "INSERT OR REPLACE INTO model_registry VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'v1', current_timestamp)",
         [
-            model["model_id"], model.get("parent_model_id"), model["training_data_version"],
-            model["feature_version"], model.get("parameters_json", "{}"), model.get("performance_history_json", "{}"),
-            model.get("failure_modes", ""), model.get("research_lineage", ""),
-            model.get("status", "candidate"), "{}",
+            model["model_id"],
+            model.get("parent_model_id"),
+            model["training_data_version"],
+            model["feature_version"],
+            model.get("parameters_json", "{}"),
+            model.get("performance_history_json", "{}"),
+            model.get("failure_modes", ""),
+            model.get("research_lineage", ""),
+            model.get("status", "candidate"),
+            "{}",
         ],
     )
     con.close()

@@ -1,36 +1,23 @@
-"""Autonomous research loop — L4.
-
-OBSERVATION MODE by default: runs experiments + full validation gate, stores
-knowledge, but never promotes champions or alters scientific standards without
-explicit human approval (--approve-champions is intentionally NOT implemented;
-promotion stays a human decision per REVIEW MODE).
-
-Compute governance: hard experiment budget + duplicate prevention via the
-experiments ledger. Scheduling: invoke this module from cron/launchd — one
-invocation = one bounded research session (crash-safe: partial sessions leave
-valid stored experiments).
-"""
+"""Autonomous research loop — bounded observation-mode sessions."""
 from __future__ import annotations
 
 import argparse
 import hashlib
 import itertools
 import json
-import os
 import logging
+import os
 from datetime import datetime, timezone
 
 import duckdb
 
+from quant_loop_trader.agents import validate_experiment
 from quant_loop_trader.data import DB_PATH, migrate_db
 from quant_loop_trader.experiment import run_experiment
-from quant_loop_trader.agents import validate_experiment
 from quant_loop_trader.research_memory import search_memory
 
 logger = logging.getLogger(__name__)
 
-# Candidate research grid — the "research director" priority queue.
-# Ordered by expected information gain: unseen windows first, then unseen seeds.
 GRID = [
     {"start": a, "end": b, "seed": s}
     for a, b, s in itertools.product(
@@ -41,34 +28,66 @@ GRID = [
 ]
 
 
-def _config_key(ticker: str, horizon: int, start: str, end: str, seed: int) -> str:
+def _spec_fingerprint(ticker: str, horizon: int, start: str, end: str, seed: int) -> str:
+    from quant_loop_trader.core import ExperimentSpec
+
+    return ExperimentSpec(
+        ticker=ticker,
+        start=start,
+        end=end,
+        horizon=horizon,
+        seed=seed,
+        pipeline_version=2,
+    ).fingerprint()
+
+
+def _legacy_config_key(ticker: str, horizon: int, start: str, end: str, seed: int) -> str:
+    """Pre-ExperimentSpec identity, retained only to avoid rerunning legacy rows."""
     return hashlib.sha256(f"{ticker}{horizon}{seed}{start}{end}".encode()).hexdigest()[:8]
 
 
+def _config_key(ticker: str, horizon: int, start: str, end: str, seed: int) -> str:
+    """Canonical requested-experiment identity used by new run IDs."""
+    return _spec_fingerprint(ticker, horizon, start, end, seed)[:8]
+
+
 def _already_run(ticker: str, horizon: int, start: str, end: str, seed: int) -> bool:
+    """Recognise both canonical and pre-refactor experiment identities."""
     migrate_db()
+    fingerprint = _spec_fingerprint(ticker, horizon, start, end, seed)
+    new_key = f"%{fingerprint[:8]}%"
+    legacy_key = f"%{_legacy_config_key(ticker, horizon, start, end, seed)}%"
+    fingerprint_json = f"%{fingerprint}%"
     con = duckdb.connect(str(DB_PATH))
-    key = f"%{_config_key(ticker, horizon, start, end, seed)}%"
-    n = con.execute("SELECT count(*) FROM experiments WHERE experiment_id LIKE ?", [key]).fetchone()[0]
+    n = con.execute(
+        "SELECT count(*) FROM experiments WHERE experiment_id LIKE ? "
+        "OR experiment_id LIKE ? OR config_json LIKE ?",
+        [new_key, legacy_key, fingerprint_json],
+    ).fetchone()[0]
     con.close()
     return n > 0
 
 
 def _frontier_remaining(ticker: str = "SPY", horizon: int = 5) -> int:
-    return sum(1 for c in GRID if not _already_run(ticker, horizon, c["start"], c["end"], c["seed"]))
+    return sum(
+        1
+        for c in GRID
+        if not _already_run(ticker, horizon, c["start"], c["end"], c["seed"])
+    )
 
 
 def review_memory() -> dict:
-    """Research director step 1: what do we already believe?"""
     fails = search_memory("volatility regime")
     return {
         "total_memory_rows": len(fails),
-        "recent_beliefs": [{"type": r["memory_type"], "confidence": r["confidence"]} for r in fails[:3]],
+        "recent_beliefs": [
+            {"type": r["memory_type"], "confidence": r["confidence"]}
+            for r in fails[:3]
+        ],
     }
 
 
 def select_candidates(ticker: str, horizon: int, budget: int) -> list[dict]:
-    """Priority queue: skip duplicates, cap at remaining budget."""
     out = []
     for cand in GRID:
         if len(out) >= budget:
@@ -81,33 +100,46 @@ def select_candidates(ticker: str, horizon: int, budget: int) -> list[dict]:
 
 def run_session(ticker: str = "SPY", horizon: int = 5,
                 max_experiments: int = 3, validate: bool = True) -> dict:
-    """One bounded autonomous research session.
-
-    SAFETY (audit AD3): gated on env QLT_AUTONOMOUS_ENABLED=true — the launchd path
-    was previously ungated. Lockfile-guarded; heartbeat written even on crash."""
     if os.getenv("QLT_AUTONOMOUS_ENABLED", "").lower() != "true":
-        logger.warning(json.dumps({"event": "session_blocked", "reason": "QLT_AUTONOMOUS_ENABLED not true"}))
-        return {"mode": "OBSERVATION", "executed": 0, "results": [], "skipped": "autonomous_disabled"}
+        logger.warning(json.dumps({
+            "event": "session_blocked",
+            "reason": "QLT_AUTONOMOUS_ENABLED not true",
+        }))
+        return {
+            "mode": "OBSERVATION",
+            "executed": 0,
+            "results": [],
+            "skipped": "autonomous_disabled",
+        }
 
     import fcntl
-    ROOT = DB_PATH.parent
-    lock_path = ROOT / ".session.lock"
+
+    root = DB_PATH.parent
+    lock_path = root / ".session.lock"
     lock_file = open(lock_path, "w")
     try:
         fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
-        logger.warning(json.dumps({"event": "session_locked", "detail": "another session holds the lock"}))
-        lock_file.close()  # audit cycle-2: no fd leak on the blocked path
-        return {"mode": "OBSERVATION", "executed": 0, "results": [], "skipped": "session_locked"}
+        logger.warning(json.dumps({
+            "event": "session_locked",
+            "detail": "another session holds the lock",
+        }))
+        lock_file.close()
+        return {
+            "mode": "OBSERVATION",
+            "executed": 0,
+            "results": [],
+            "skipped": "session_locked",
+        }
 
     try:
-        summary = _run_session_body(ticker, horizon, max_experiments, validate, ROOT)
-    except Exception as e:
-        # a crashed session must be LOUD (audit H5/AD4): alert + crashed heartbeat
-        from quant_loop_trader.monitoring.heartbeat import write_heartbeat
+        summary = _run_session_body(ticker, horizon, max_experiments, validate, root)
+    except Exception as exc:
         from quant_loop_trader.monitoring.alerts import send_alert
-        write_heartbeat(ROOT / "logs", status="crashed", details={"error": str(e)[:200]})
-        send_alert("session_crashed", "critical", {"error": str(e)[:200]})
+        from quant_loop_trader.monitoring.heartbeat import write_heartbeat
+
+        write_heartbeat(root / "logs", status="crashed", details={"error": str(exc)[:200]})
+        send_alert("session_crashed", "critical", {"error": str(exc)[:200]})
         raise
     finally:
         fcntl.flock(lock_file, fcntl.LOCK_UN)
@@ -116,17 +148,26 @@ def run_session(ticker: str = "SPY", horizon: int = 5,
 
 
 def _run_session_body(ticker: str, horizon: int, max_experiments: int,
-                      validate: bool, ROOT) -> dict:
+                      validate: bool, root) -> dict:
     started = datetime.now(timezone.utc).isoformat()
     memory_review = review_memory()
     candidates = select_candidates(ticker, horizon, max_experiments)
 
     results = []
     for i, cand in enumerate(candidates):
-        logger.info(json.dumps({"event": "session_experiment_start", "index": i + 1,
-                                "config": cand, "remaining_budget": max_experiments - i}))
-        report = run_experiment(ticker=ticker, horizon=horizon,
-                                start=cand["start"], end=cand["end"], seed=cand["seed"])
+        logger.info(json.dumps({
+            "event": "session_experiment_start",
+            "index": i + 1,
+            "config": cand,
+            "remaining_budget": max_experiments - i,
+        }))
+        report = run_experiment(
+            ticker=ticker,
+            horizon=horizon,
+            start=cand["start"],
+            end=cand["end"],
+            seed=cand["seed"],
+        )
         entry = {
             "experiment_id": report["experiment_id"],
             "decision": report["decision"],
@@ -140,27 +181,39 @@ def _run_session_body(ticker: str, horizon: int, max_experiments: int,
             entry["issues"] = verdict["issues_found"]
         results.append(entry)
 
-    # heartbeat + alerting via monitoring layer (distinguishes healthy-idle from broken-silent)
-    from quant_loop_trader.monitoring.heartbeat import write_heartbeat
     from quant_loop_trader.monitoring.alerts import send_alert
+    from quant_loop_trader.monitoring.heartbeat import write_heartbeat
+
     remaining = _frontier_remaining(ticker, horizon)
-    write_heartbeat(ROOT / "logs", status="healthy",
-                    last_task=results[-1]["experiment_id"] if results else None,
-                    details={"executed": len(results),
-                             "decisions": [r["decision"] for r in results],
-                             "grid_remaining": remaining})
-    if len(results) == 0:
-        send_alert("research_grid_exhausted", "warning",
-                   {"ticker": ticker, "horizon": horizon,
-                    "note": "no new candidates — hypothesis refresh required"})
-    # nightly insurance: checkpointed DB backup, keep last 8 (torn-copy guard, audit L4)
-    bdir = ROOT / "backups"
+    write_heartbeat(
+        root / "logs",
+        status="healthy",
+        last_task=results[-1]["experiment_id"] if results else None,
+        details={
+            "executed": len(results),
+            "decisions": [r["decision"] for r in results],
+            "grid_remaining": remaining,
+        },
+    )
+    if not results:
+        send_alert(
+            "research_grid_exhausted",
+            "warning",
+            {
+                "ticker": ticker,
+                "horizon": horizon,
+                "note": "no new candidates — hypothesis refresh required",
+            },
+        )
+
+    bdir = root / "backups"
     bdir.mkdir(exist_ok=True)
     import shutil
+
     con = duckdb.connect(str(DB_PATH))
     con.execute("CHECKPOINT")
     con.close()
-    stamp = datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     shutil.copy2(DB_PATH, bdir / f"research_{stamp}.duckdb")
     for old in sorted(bdir.glob("research_*.duckdb"))[:-24]:
         old.unlink()
@@ -169,7 +222,7 @@ def _run_session_body(ticker: str, horizon: int, max_experiments: int,
         "session_started": started,
         "session_finished": datetime.now(timezone.utc).isoformat(),
         "mode": "OBSERVATION",
-        "memory_review": memory_review,  # research-director traceability: what we believed entering the session
+        "memory_review": memory_review,
         "budget": max_experiments,
         "executed": len(results),
         "grid_remaining": remaining,
@@ -187,7 +240,9 @@ def main():
     p.add_argument("--no-validate", action="store_true")
     args = p.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(message)s")
-    summary = run_session(args.ticker, args.horizon, args.max_experiments, not args.no_validate)
+    summary = run_session(
+        args.ticker, args.horizon, args.max_experiments, not args.no_validate
+    )
     print(json.dumps(summary, indent=2))
 
 

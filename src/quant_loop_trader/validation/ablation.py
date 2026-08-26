@@ -2,16 +2,16 @@
 A strategy dependent on one fragile group dies here."""
 from __future__ import annotations
 
+from pathlib import Path
+
 import polars as pl
 
 
 def run_ablation(ticker: str, start: str, end: str, horizon: int, seed: int,
                  feature_groups: dict[str, list[str]],
-                 model_builder=None, feature_fn=None, feat_cols=None) -> pl.DataFrame:
-    """Train on all features, then with each single group removed.
-    Returns per-group delta vs full-model accuracy (negative = group was helping).
-    audit H7: feature_fn must be the REAL engineered-feature builder — an identity
-    function cannot produce the requested columns from raw OHLCV."""
+                 model_builder=None, feature_fn=None, feat_cols=None,
+                 parquet_path: Path | None = None) -> pl.DataFrame:
+    """Train on all features, then with each single group removed."""
     from quant_loop_trader.experiment import build_train_test
     from quant_loop_trader.features import add_improved_features, improved_feature_columns
     from quant_loop_trader.models.registry import LogisticModel
@@ -25,7 +25,11 @@ def run_ablation(ticker: str, start: str, end: str, horizon: int, seed: int,
     if missing:
         raise ValueError(f"ablation groups reference unknown features: {missing}")
 
-    train, test = build_train_test(ticker, start, end, horizon, feature_fn, feat_cols)
+    args = (ticker, start, end, horizon, feature_fn, feat_cols)
+    if parquet_path is None:
+        train, test = build_train_test(*args)
+    else:
+        train, test = build_train_test(*args, parquet_path=parquet_path)
     yte = test["label"].to_numpy()
 
     def _acc(cols: list[str]) -> float:

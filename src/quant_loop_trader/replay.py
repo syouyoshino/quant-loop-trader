@@ -29,36 +29,36 @@ def pit_filter(df: pl.DataFrame, timestamp) -> pl.DataFrame:
 
 
 class ReplayEngine:
-    """Reconstruct information state at prediction time."""
+    """Reconstruct information state at prediction time.
 
-    def __init__(self, parquet_path: str | Path):
+    ``ticker`` is explicit when the parquet filename is content-addressed rather
+    than ticker-named. This lets immutable dataset snapshots remain the canonical
+    post-acquisition input without weakening ticker validation.
+    """
+
+    def __init__(self, parquet_path: str | Path, ticker: str | None = None):
         p = Path(parquet_path)
         if not p.exists():
             raise FileNotFoundError(f"parquet not found: {p}")
         df = pl.read_parquet(str(p))
-        # required columns
         needed = {"event_time", "available_time", "close"}
         missing = needed - set(df.columns)
         if missing:
             raise ValueError(f"missing columns {missing} in {p}")
-        # ensure Date type
         for c in ("event_time", "available_time"):
             if df[c].dtype != pl.Date:
                 df = df.with_columns(pl.col(c).cast(pl.Date))
-        # sort and validate available_time <= event_time? For L1 equal, future may have available > event
-        # but never available < event is impossible; we only enforce available_time <= prediction_timestamp later
         self.df = df.sort("event_time")
-        self.ticker = p.stem  # SPY
-        logger.info(json.dumps({"event": "replay_loaded", "rows": self.df.height, "path": str(p)}))
+        self.ticker = str(ticker or p.stem)
+        logger.info(json.dumps({"event": "replay_loaded", "rows": self.df.height,
+                                "path": str(p), "ticker": self.ticker}))
 
     def get_snapshot(self, ticker: str, timestamp) -> pl.DataFrame:
-        """Return rows where available_time <= timestamp. ticker validated for multi-ticker future."""
+        """Return rows where available_time <= timestamp, with ticker validation."""
         if ticker != self.ticker:
-            # ponytail: single-ticker engine, raise if mismatch; upgrade to multi-ticker DuckDB when needed
             raise ValueError(f"engine holds {self.ticker}, requested {ticker}")
         ts = _to_date(timestamp)
         snap = self.df.filter(pl.col("available_time") <= ts)
-        # verify invariant (filter is the enforcement; assert is the tripwire)
         if snap.height > 0:
             max_av = snap["available_time"].max()
             assert max_av <= ts, f"leakage: max available {max_av} > {ts}"
@@ -68,9 +68,7 @@ class ReplayEngine:
         return self.df
 
     def evaluate_future(self, ticker: str, timestamp) -> pl.DataFrame:
-        """Outcomes strictly AFTER timestamp. For EVALUATION systems only —
-        models/features must never receive this frame (enforced by convention +
-        the leakage tests)."""
+        """Outcomes strictly AFTER timestamp. For EVALUATION systems only."""
         if ticker != self.ticker:
             raise ValueError(f"engine holds {self.ticker}, requested {ticker}")
         ts = _to_date(timestamp)
