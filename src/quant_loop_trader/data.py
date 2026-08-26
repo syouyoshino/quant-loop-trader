@@ -238,13 +238,14 @@ def dataset_metadata(df: pl.DataFrame, ticker: str, source: str,
 
 
 def upsert_dataset(meta: dict, db_path: Path | None = None) -> None:
+    """Register a content-addressed dataset once; later reuse cannot rewrite provenance."""
     import duckdb
 
     db_path = Path(db_path or DB_PATH)
     migrate_db(db_path)
     con = duckdb.connect(str(db_path))
     con.execute(
-        "INSERT OR REPLACE INTO datasets VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, current_timestamp)",
+        "INSERT OR IGNORE INTO datasets VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, current_timestamp)",
         [
             meta["dataset_id"],
             meta["ticker"],
