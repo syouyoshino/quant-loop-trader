@@ -25,10 +25,11 @@ def run_ablation(ticker: str, start: str, end: str, horizon: int, seed: int,
     if missing:
         raise ValueError(f"ablation groups reference unknown features: {missing}")
 
-    train, test = build_train_test(
-        ticker, start, end, horizon, feature_fn, feat_cols,
-        parquet_path=parquet_path,
-    )
+    args = (ticker, start, end, horizon, feature_fn, feat_cols)
+    if parquet_path is None:
+        train, test = build_train_test(*args)
+    else:
+        train, test = build_train_test(*args, parquet_path=parquet_path)
     yte = test["label"].to_numpy()
 
     def _acc(cols: list[str]) -> float:
