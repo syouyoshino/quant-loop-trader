@@ -13,7 +13,7 @@ from pathlib import Path
 
 import polars as pl
 
-from quant_loop_trader.data import PROC_DIR
+from quant_loop_trader import data as _data
 
 
 class BundleIntegrityError(RuntimeError):
@@ -41,7 +41,7 @@ class ExperimentBundle:
     @property
     def dataset_snapshot(self) -> Path:
         """Immutable content-addressed input for all post-acquisition work."""
-        return PROC_DIR.parent / "datasets" / f"{self.config['dataset_id']}.parquet"
+        return _data.PROC_DIR.parent / "datasets" / f"{self.config['dataset_id']}.parquet"
 
     @property
     def predictions(self) -> pl.DataFrame:
@@ -67,8 +67,6 @@ class ExperimentBundle:
         metrics = json.loads((exp_dir / "metrics.json").read_text())
         issues: list[str] = []
 
-        # Verify sealed experiment-local artifacts. Dataset anchors are handled
-        # separately because the snapshot lives outside the experiment directory.
         for name, expected in lock.items():
             if name in ("locked_at", "dataset_parquet", "dataset_snapshot_sha256"):
                 continue
@@ -78,7 +76,7 @@ class ExperimentBundle:
             elif _sha(f) != expected:
                 issues.append(f"artifact_tampered:{name}")
 
-        snapshot = PROC_DIR.parent / "datasets" / f"{cfg['dataset_id']}.parquet"
+        snapshot = _data.PROC_DIR.parent / "datasets" / f"{cfg['dataset_id']}.parquet"
         snapshot_expected = lock.get("dataset_snapshot_sha256")
         if snapshot_expected:
             if not snapshot.exists():
@@ -89,7 +87,7 @@ class ExperimentBundle:
             # Backward compatibility for pre-snapshot-lock experiments. New runs
             # never depend on this mutable-cache anchor.
             cache_expected = lock.get("dataset_parquet")
-            cache = PROC_DIR / f"{cfg.get('ticker', 'SPY')}.parquet"
+            cache = _data.PROC_DIR / f"{cfg.get('ticker', 'SPY')}.parquet"
             if cache_expected and cache.exists() and _sha(cache) != cache_expected:
                 issues.append("dataset_drift:legacy_input_data_changed_since_experiment")
 
