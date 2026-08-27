@@ -36,7 +36,7 @@ def test_adjudication_real_training_call_succeeds(isolated_research):
     the REAL LogisticModel.fit(X, y) without raising."""
     exp_id, status = _make_eligible(isolated_research)
     assert status == "eligible"
-    result = adjudicate_holdout(exp_id)  # pre-fix: raises inside sklearn .fit
+    result = adjudicate_holdout(exp_id)
     assert isinstance(result, dict) and "promoted" in result
 
 
@@ -72,9 +72,8 @@ def test_failed_adjudication_cannot_promote_and_fails_closed(isolated_research, 
         raise RuntimeError("validator exploded")
 
     monkeypatch.setattr(ho, "_load_holdout_frame", boom)
-    out = ho.adjudicate_holdout(exp_id)  # must fail closed, never raise-then-promote
+    out = ho.adjudicate_holdout(exp_id)
     assert out["promoted"] is False
-    import quant_loop_trader.data as dm
     con = duckdb.connect(str(dm.DB_PATH))
     status = con.execute("SELECT status FROM model_registry WHERE model_id=?",
                          [f"{exp_id}_improved"]).fetchone()[0]
@@ -131,28 +130,21 @@ def test_holdout_rows_absent_from_training_frames(isolated_research):
     assert not (train_dates & hold_dates), "training and holdout windows overlap"
     assert min(hold_dates) > max(train_dates)
 
-    # the REAL training matrix comes only from non-holdout rows: verify the exact
-    # helper used by adjudication against the boundary timestamps
     from quant_loop_trader.validation.holdout import _train_all_nonholdout
     cfg = {"ticker": "SPY", "start": start, "end": end, "horizon": 5, "seed": 1}
     Xtr, ytr = _train_all_nonholdout(pq, cfg)
-    # M1: features computed on full history then filtered → no warmup loss;
-    # only label-horizon purge removes tail rows from TRAINING
-    n_train_available = len(train_dates) - 5 - 5  # purge(h) + label horizon drop
-    assert Xtr.shape[0] <= len(train_dates)       # never trains ON holdout rows
-    assert ytr.shape[0] == Xtr.shape[0]
+    assert Xtr.shape[0] <= len(train_dates)
     assert ytr.shape[0] == Xtr.shape[0]
 
 
 def test_holdout_rejection_corrects_provisional_success_memory(isolated_research):
-    """Audit H6 regression: KEEP → validation APPROVED → eligible → holdout REJECTED
-    must correct the provisional 'success' memory, not leave it confirmed."""
+    """KEEP → validation APPROVED → eligible → holdout REJECTED must correct the
+    provisional success memory, not leave it confirmed."""
     from quant_loop_trader.research_memory import search_memory
     exp_id, _ = _make_eligible(isolated_research)
     import quant_loop_trader.data as dm
-    dm.migrate_db()  # ensure schema exists in this test's isolated DB
+    dm.migrate_db()
     con = duckdb.connect(str(dm.DB_PATH))
-    # seed the provisional success memory exactly as record_outcome would on KEEP
     con.execute(
         "INSERT OR REPLACE INTO research_memory VALUES (?, ?, 'success', ?, ?, "
         "'KEEP', 'Confirmed: survived hidden-future split', '{}', '{}', 0.65, '{}', "
@@ -174,7 +166,6 @@ def test_holdout_rejection_corrects_provisional_success_memory(isolated_research
 # --- F. the hidden holdout is consumable exactly once ------------------------
 
 def test_holdout_cannot_be_adjudicated_twice(isolated_research):
-    """`Evaluate an eligible model exactly once` has to survive a second call."""
     exp_id, _ = _make_eligible(isolated_research)
     first = adjudicate_holdout(exp_id)
     assert "holdout_already_consumed" not in str(first.get("reason", ""))
@@ -190,8 +181,7 @@ def test_holdout_cannot_be_adjudicated_twice(isolated_research):
 
 
 def test_crash_after_holdout_is_read_fails_closed(isolated_research):
-    """Simulate dying between claiming the holdout and committing the verdict:
-    the claim stays open and re-adjudication is refused until a human releases it."""
+    """An open claim blocks re-adjudication until explicit human recovery."""
     exp_id, _ = _make_eligible(isolated_research)
     import quant_loop_trader.data as dm
     con = duckdb.connect(str(dm.DB_PATH))
@@ -210,7 +200,7 @@ def test_crash_after_holdout_is_read_fails_closed(isolated_research):
 
 
 def test_full_holdout_metrics_are_persisted(isolated_research):
-    """The engine already computes the whole evaluate() object; keep it."""
+    """The engine persists full holdout metrics and gates on liquidated economics."""
     exp_id, _ = _make_eligible(isolated_research)
     result = adjudicate_holdout(exp_id)
     if "adjudication_error" in str(result.get("reason", "")):
@@ -220,5 +210,5 @@ def test_full_holdout_metrics_are_persisted(isolated_research):
                 "calmar_ratio", "var_95", "expected_shortfall_95", "turnover",
                 "win_rate", "n_return_buckets"):
         assert key in m, key
-    assert m["cumulative_return_strategy"] == result["economic_gate"]["compounded_net_return"]
-    assert m["sharpe_strategy"] == result["economic_gate"]["sharpe_strategy"]
+    assert m["cumulative_return_strategy_liquidated"] == result["economic_gate"]["compounded_net_return"]
+    assert m["sharpe_strategy_liquidated"] == result["economic_gate"]["sharpe_strategy"]
