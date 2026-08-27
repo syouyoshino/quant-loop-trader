@@ -73,6 +73,24 @@ def _make_db(path: Path, experiments=(), models=()):
     con.close()
 
 
+def _register(root: Path, exp_id: str, *, authoritative: bool, status: str | None = None,
+              hypothesis: str = "H1: test hypothesis"):
+    """Insert the baseline + improved DB records a real run writes, and the
+    matching model_registry rows (which carry no authoritative column)."""
+    con = duckdb.connect(str(root / "data" / "research.duckdb"))
+    for variant, hyp in (("baseline", "baseline momentum"), ("improved", hypothesis)):
+        con.execute(
+            "INSERT INTO experiments VALUES (?,'DS_1','SPY',5,'v1',?,'','','sklearn-LogReg',"
+            "'v1',42,'{}','{}','KEEP',NULL,'{}',current_timestamp,?)",
+            [f"{exp_id}_{variant}", hyp, authoritative])
+        if status:
+            con.execute(
+                "INSERT INTO model_registry VALUES (?,NULL,'v1','v1','{}','{}','','',?,"
+                "'{}','v1',current_timestamp)", [f"{exp_id}_{variant}", status])
+    con.close()
+    q.clear_caches()
+
+
 def _seal_experiment(root: Path, exp_id: str, *, prices, preds, horizon=5,
                      decision="KEEP", ticker="SPY", validation=None, holdout=None,
                      sealed=True):
@@ -419,10 +437,9 @@ def test_pipeline_stages_reflect_recorded_evidence(lab):
 
 
 def test_champion_lifecycle_and_correlation_gate(lab):
-    _make_db(lab / "data" / "research.duckdb",
-             models=[("a_improved", "champion"), ("b_improved", "champion")])
     for eid in ("a", "b"):
         _seal_experiment(lab, eid, prices=_prices(60), preds=[1, 0] * 30)
+        _register(lab, eid, authoritative=True, status="champion")
     champs = svc.champions()
     assert {c["experiment_id"] for c in champs["champions"]} == {"a", "b"}
     corr = champs["correlation"]
@@ -441,3 +458,129 @@ def test_experiment_filters_and_404(lab):
         api.route("/api/experiments/does_not_exist", {})
     with pytest.raises(KeyError):
         api.route("/api/nope", {})
+
+
+# --- authoritative population (proof 14) ------------------------------------
+
+
+def _two_experiment_lab(lab):
+    prices = [100 + i for i in range(40)]
+    preds = [1, 0] * 20
+    _seal_experiment(lab, "E_OLD", prices=prices, preds=preds, decision="KEEP")
+    _seal_experiment(lab, "E_NEW", prices=prices, preds=preds, decision="KEEP")
+    _register(lab, "E_OLD", authoritative=False, status="champion",
+              hypothesis="H_OLD: quarantined idea")
+    _register(lab, "E_NEW", authoritative=True, status="candidate",
+              hypothesis="H_NEW: current idea")
+    return lab
+
+
+def test_quarantined_experiments_are_excluded_from_every_count(lab):
+    """A run marked non-authoritative still has a directory on disk. It must not
+    inflate experiment, hypothesis, funnel or rejection counts."""
+    _two_experiment_lab(lab)
+    assert [r["id"] for r in svc.authoritative()] == ["E_NEW"]
+    assert svc.population() == {
+        "basis": "AUTHORITATIVE", "on_disk": 2, "authoritative": 1, "quarantined": 1,
+        "unrecorded": 0,
+        "reason": "quarantined runs predate the current pipeline and are excluded",
+    }
+    f = svc.funnel()
+    assert f["experiments"] == 1
+    assert f["hypotheses"] == 1
+    assert [h["hypothesis"] for h in svc.hypotheses()] == ["H1: test hypothesis"]
+    assert svc.overview()["experiments_total"] == 1
+    assert svc.default_experiment() == "E_NEW"
+
+
+def test_lifecycle_counts_join_the_registry_to_authoritative_experiments(lab):
+    """model_registry has no authoritative column of its own, so a quarantined
+    experiment's champion row must not be counted as a champion."""
+    _two_experiment_lab(lab)
+    assert svc._registry_map()["E_OLD_improved"]["status"] == "champion"  # unfiltered
+    assert "E_OLD_improved" not in svc._registry_map(authoritative_only=True)
+    assert svc.champions()["counts"]["champion"] == 0
+    assert svc.champions()["counts"]["candidate"] == 1
+    assert svc.overview()["progress"]["champions"] == 0
+    assert svc.funnel()["champions"] == 0
+
+
+def test_baseline_records_never_reach_the_hypothesis_count(lab):
+    """Each run writes a `baseline momentum` record alongside the real one."""
+    _two_experiment_lab(lab)
+    rows = q.query("SELECT hypothesis FROM experiments WHERE authoritative")
+    assert sorted(r["hypothesis"] for r in rows) == ["H_NEW: current idea", "baseline momentum"]
+    assert svc.funnel()["hypotheses"] == 1  # counted from report.json, one per directory
+
+
+def test_population_is_unknown_not_empty_when_the_database_is_gone(lab):
+    """Losing the database must not silently empty the dashboard."""
+    _two_experiment_lab(lab)
+    (lab / "data" / "research.duckdb").unlink()
+    q.clear_caches()
+    assert q.authoritative_ids() is None
+    assert svc.population()["basis"] == "UNKNOWN"
+    assert svc.population()["authoritative"] is None
+    assert len(svc.authoritative()) == 2  # intact, flagged unknown
+    assert all(r["authoritative"] is None for r in svc.experiment_index())
+
+
+def test_experiments_endpoint_hides_quarantined_rows_by_default(lab):
+    _two_experiment_lab(lab)
+    default = api.route("/api/experiments", {})
+    assert [r["id"] for r in default["experiments"]] == ["E_NEW"]
+    assert default["population"]["quarantined"] == 1
+    both = api.route("/api/experiments", {"include_quarantined": ["1"]})
+    assert sorted(r["id"] for r in both["experiments"]) == ["E_NEW", "E_OLD"]
+
+
+def test_champion_holdout_metrics_come_only_from_the_holdout_report(lab):
+    """Research-window drawdown must never be presented as holdout drawdown."""
+    prices = [100 + i for i in range(40)]
+    _seal_experiment(lab, "E_H", prices=prices, preds=[1, 0] * 20, decision="KEEP",
+                     holdout={"promoted": True, "holdout_accuracy": 0.61, "base_rate": 0.55,
+                              "n_holdout": 145,
+                              "economic_gate": {"compounded_net_return": 0.11,
+                                                "sharpe_strategy": 1.5,
+                                                "sharpe_benchmark": 1.4}})
+    _register(lab, "E_H", authoritative=True, status="champion")
+    h = svc._holdout_economics("E_H")
+    assert h["status"] == "PASS"
+    assert h["net_return"] == 0.11
+    assert h["sharpe"] == 1.5
+    assert h["accuracy"] == 0.61 and h["n"] == 145
+    assert h["max_drawdown"] is None and h["annualized_volatility"] is None
+    champ = svc.champions()["champions"][0]
+    assert champ["metrics_basis"] == "research test window (sealed metrics.json)"
+    assert champ["holdout"]["net_return"] == 0.11
+    assert svc._holdout_economics("E_H")["n"] != champ["net_return"]
+
+
+def test_cycles_separate_scheduler_progress_from_authoritative_evidence(lab):
+    prices = [100 + i for i in range(40)]
+    _seal_experiment(lab, "E_C", prices=prices, preds=[1, 0] * 20)
+    _register(lab, "E_C", authoritative=False)
+    (lab / "data" / "logs" / "session.log").write_text(json.dumps({
+        "session_started": "2024-01-01T00:00:00+00:00",
+        "session_finished": "2024-01-01T00:05:00+00:00",
+        "budget": 1, "executed": 1, "grid_remaining": 4, "mode": "OBSERVATION",
+        "results": [{"experiment_id": "E_C", "decision": "KEEP",
+                     "validation_status": "REJECTED"}],
+    }, indent=1))
+    q.clear_caches()
+    cyc = svc.cycles()[0]
+    assert cyc["completed_experiments"] == 1        # the scheduler ran it
+    assert cyc["grid_remaining_basis"] == "scheduler"
+    assert cyc["authoritative_experiments"] == 0    # it is not current evidence
+
+
+def test_an_unsealed_run_with_no_database_record_stays_visible(lab):
+    """An in-flight experiment has no experiments row yet — it is unrecorded,
+    not quarantined, and the control room must still show it."""
+    _two_experiment_lab(lab)
+    _seal_experiment(lab, "E_RUNNING", prices=_prices(40), preds=[1, 0] * 20, sealed=False)
+    q.clear_caches()
+    rows = {r["id"]: r["authoritative"] for r in svc.experiment_index()}
+    assert rows == {"E_NEW": True, "E_OLD": False, "E_RUNNING": None}
+    assert sorted(r["id"] for r in svc.authoritative()) == ["E_NEW", "E_RUNNING"]
+    assert svc.population()["unrecorded"] == 1

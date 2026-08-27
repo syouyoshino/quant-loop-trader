@@ -78,6 +78,42 @@ immediately.
 | Market regime | `data/processed/SPY.parquet` (research snapshot, not a live feed) |
 | System | heartbeat, DuckDB, `deploy/*.plist` + `launchctl`, `git rev-parse` |
 
+### Which experiments count
+
+`experiments.authoritative` is the repository's own quarantine flag: runs that
+predate the current pipeline are marked non-authoritative but keep their
+directory on disk. Every count the dashboard shows — funnel, hypotheses,
+rejection analytics, lifecycle counts, research progress — is computed over the
+authoritative population only. Each experiment row carries one of three states:
+
+| `authoritative` | meaning | shown |
+|---|---|---|
+| `true` | current-pipeline evidence | yes |
+| `false` | quarantined | hidden (INCLUDE QUARANTINED reveals it) |
+| `null` | no database record yet (in-flight run, or database unreadable) | yes |
+
+Nothing is hidden silently: `population` (`on_disk` / `authoritative` /
+`quarantined` / `unrecorded`) rides along on `/api/overview`,
+`/api/experiments` and the funnel panel.
+
+`model_registry` has no `authoritative` column of its own, so candidate /
+eligible / champion counts join each `<experiment>_improved` model back onto its
+experiment record and drop the quarantined ones.
+
+Cycle rows report both numbers: `completed_experiments` and `grid_remaining`
+are **scheduler** progress ("did we ever run this config?"), while
+`authoritative_experiments` is research progress ("do we hold current evidence
+from it?"). They are not the same and the terminal shows both.
+
+### Champion performance
+
+Leaderboard columns marked ʳ are the sealed **research test window**
+(`metrics.json`). The hidden holdout is a separate row: Quant Loop's
+`holdout_report.json` persists only the promotion verdict, accuracy, base rate,
+sample size and the economic gate (compounded net return, strategy and
+benchmark Sharpe), so holdout drawdown, volatility, Sortino, Calmar, VaR, ES and
+turnover are reported N/A rather than back-filled from research-window numbers.
+
 ### Cycles
 
 Quant Loop has no explicit "cycle" object. The dashboard reads one from what the

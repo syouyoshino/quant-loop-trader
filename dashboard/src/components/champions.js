@@ -7,7 +7,7 @@ export function renderChampions(node, data, onSelect) {
     <div class="panel-head"><h2>${heading}</h2>
       <span class="dim">${Object.entries(data.counts).map(([k, v]) => `${k}:${v}`).join(' · ')}</span></div>
     ${rows.length ? `<div class="scroll-x"><table>
-      <thead><tr><th class="left">ID</th><th>STATE</th><th>NET</th><th>EXCESS</th><th>SHARPE</th>
+      <thead><tr><th class="left">ID</th><th>STATE</th><th>NET<sup>r</sup></th><th>EXCESS<sup>r</sup></th><th>SHARPE<sup>r</sup></th>
         <th>SORTINO</th><th>CALMAR</th><th>MAX DD</th><th>VOL</th><th>EDGE</th></tr></thead>
       <tbody>${rows.map((c) => `
         <tr data-id="${escape(c.experiment_id)}">
@@ -19,14 +19,30 @@ export function renderChampions(node, data, onSelect) {
           <td>${pill((c.edge || {}).status)}</td>
         </tr>
         <tr><td class="left dim" colspan="10">evidence: ${Object.entries(c.evidence || {})
-          .map(([k, v]) => `${k}=${v}`).join(' · ')}</td></tr>`).join('')}
+          .map(([k, v]) => `${k}=${v}`).join(' · ')}</td></tr>
+        <tr><td class="left dim" colspan="10">holdout: ${holdout(c.holdout)}</td></tr>`).join('')}
       </tbody></table></div>` : '<div class="empty" style="height:80px">NO CHAMPION OR ELIGIBLE MODEL</div>'}
+    <div class="note">ʳ research test window (sealed metrics.json) — not the hidden holdout</div>
     ${data.note ? `<div class="note">${escape(data.note)}</div>` : ''}
     <div class="rule"></div>
     <div class="dim">RETURN CORRELATION</div>
     ${correlation(data.correlation)}`;
   node.querySelectorAll('tbody tr[data-id]').forEach((tr) =>
     tr.addEventListener('click', () => onSelect(tr.dataset.id)));
+}
+
+// Row metrics are the sealed research-window evaluate() output; the hidden
+// holdout persists only its economic gate, so the rest stays N/A.
+function holdout(h) {
+  if (!h || !h.available) return 'NOT RUN';
+  return [
+    pill(h.status),
+    `net ${pct(h.net_return)}`,
+    `sharpe ${ratio(h.sharpe)} vs bench ${ratio(h.benchmark_sharpe)}`,
+    `acc ${pct(h.accuracy)} vs base ${pct(h.base_rate)}`,
+    `n=${text(h.n)}`,
+    `max dd ${NA} · vol ${NA} (not persisted)`,
+  ].join(' · ');
 }
 
 function correlation(c) {

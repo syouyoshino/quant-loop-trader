@@ -55,7 +55,8 @@ export function renderCycle(node, cycle, progress) {
       ${tally('VALIDATION FAILED', cycle.validation_failures, 'neg')}
       ${tally('FAILED RUNS', cycle.failed_experiments, 'neg')}
       ${tally('CHAMPIONS', progress.champions, 'pos')}
-      ${tally('GRID REMAINING', cycle.grid_remaining, 'info')}
+      ${tally('AUTHORITATIVE', cycle.authoritative_experiments, 'info')}
+      ${tally('GRID REMAINING (SCHEDULER)', cycle.grid_remaining, 'info')}
     </div>
     <div class="cycle-grid">
       ${col(left)}${col(mid)}${col(right)}

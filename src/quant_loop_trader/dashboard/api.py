@@ -51,8 +51,11 @@ def filter_experiments(rows: list[dict], params: dict) -> list[dict]:
     cycle, hypothesis = one("cycle"), one("hypothesis")
     start, end = one("from"), one("to")
     champion_only = (one("champion_only") or "").lower() in ("1", "true", "yes")
+    quarantined = (one("include_quarantined") or "").lower() in ("1", "true", "yes")
     out = []
     for r in rows:
+        if not quarantined and r["authoritative"] is False:
+            continue
         if market and r["market"] != market:
             continue
         if status and r["status"] != status:
@@ -103,6 +106,7 @@ def route(path: str, params: dict):
             return {
                 "experiments": rows[:limit],
                 "total": len(rows),
+                "population": svc.population(),
                 "filters": {
                     "markets": sorted({r["market"] for r in svc.experiment_index() if r["market"]}),
                     "statuses": sorted({r["status"] for r in svc.experiment_index() if r["status"]}),
@@ -118,7 +122,7 @@ def route(path: str, params: dict):
         case ["champions"]:
             return svc.champions()
         case ["validation"]:
-            rows = svc.experiment_index()
+            rows = svc.authoritative()
             return {
                 "experiments": [
                     {"id": r["id"], "cycle": r["cycle"], "status": r["status"],

@@ -125,6 +125,29 @@ def experiment_rows() -> list[dict]:
     )
 
 
+def stem(model_or_experiment_id: str) -> str:
+    """The experiment directory name behind a DB/registry id."""
+    for suffix in ("_improved", "_baseline"):
+        if model_or_experiment_id.endswith(suffix):
+            return model_or_experiment_id[: -len(suffix)]
+    return model_or_experiment_id
+
+
+@ttl_cache
+def authoritative_ids() -> tuple[set[str], set[str]] | None:
+    """(authoritative stems, quarantined stems) from the experiments table.
+
+    Returns None when the database cannot be read. A stem in neither set has no
+    database record at all — an in-flight run, not a quarantined one.
+    """
+    try:
+        rows = query("SELECT experiment_id, authoritative FROM experiments")
+    except DataUnavailable:
+        return None
+    good = {stem(r["experiment_id"]) for r in rows if r["authoritative"]}
+    return good, {stem(r["experiment_id"]) for r in rows} - good
+
+
 @ttl_cache
 def model_registry_rows() -> list[dict]:
     return query(

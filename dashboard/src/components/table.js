@@ -32,7 +32,8 @@ export function renderTable(node, payload, state, onSelect) {
   const rows = [...payload.experiments].sort(compare);
   node.innerHTML = `
     <div class="panel-head">
-      <h2>EXPERIMENTS <span class="dim">${payload.total} shown</span></h2>
+      <h2>EXPERIMENTS <span class="dim">${payload.total} shown${
+        (payload.population || {}).quarantined ? ` · ${payload.population.quarantined} quarantined` : ''}</span></h2>
       <div class="filters">
         ${select('market', 'MARKET', filters.markets, state.filters.market)}
         ${select('cycle', 'CYCLE', filters.cycles, state.filters.cycle)}
@@ -44,6 +45,9 @@ export function renderTable(node, payload, state, onSelect) {
         <input type="date" data-filter="to" value="${escape((state.filters.to || '').slice(0, 10))}">
         <label class="dim"><input type="checkbox" data-filter="champion_only"
           ${state.filters.champion_only ? 'checked' : ''}> CHAMPION ONLY</label>
+        <label class="dim" title="quarantined runs predate the current pipeline"><input type="checkbox"
+          data-filter="include_quarantined"
+          ${state.filters.include_quarantined ? 'checked' : ''}> INCLUDE QUARANTINED</label>
       </div>
     </div>
     <div class="scroll-y scroll-x"><table>

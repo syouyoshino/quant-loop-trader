@@ -16,6 +16,7 @@ from quant_loop_trader.dashboard import queries as q
 from quant_loop_trader.dashboard.schemas import (
     COST_PER_SIDE,
     FAIL,
+    NA,
     NOT_AVAILABLE,
     NOT_RUN,
     PASS,
@@ -522,11 +523,56 @@ def _registry_status(experiment_id: str, registry: dict[str, dict] | None = None
     return row["status"] if row else None
 
 
-def _registry_map() -> dict[str, dict]:
+def _registry_map(authoritative_only: bool = False) -> dict[str, dict]:
+    """model_registry rows. `model_registry` carries no authoritative column of
+    its own, so lifecycle counts join it back onto the authoritative experiments."""
     try:
-        return {r["model_id"]: r for r in q.model_registry_rows()}
+        rows = {r["model_id"]: r for r in q.model_registry_rows()}
     except q.DataUnavailable:
         return {}
+    if not authoritative_only:
+        return rows
+    flags = q.authoritative_ids()
+    if flags is None:
+        return rows
+    good, quarantined = flags
+    return {k: v for k, v in rows.items() if q.stem(k) not in quarantined}
+
+
+def _authoritative_flag(eid: str, flags) -> bool | None:
+    """True authoritative, False quarantined, None no database record yet."""
+    if flags is None:
+        return None
+    good, quarantined = flags
+    return True if eid in good else (False if eid in quarantined else None)
+
+
+def authoritative(rows: list[dict] | None = None) -> list[dict]:
+    """The rows that count as current research evidence.
+
+    Only rows explicitly quarantined in the database are dropped. A row with no
+    record yet (an in-flight run) or an unreadable database stays visible —
+    unknown provenance is surfaced through `population`, never silently emptied.
+    """
+    rows = rows if rows is not None else experiment_index()
+    return [r for r in rows if r["authoritative"] is not False]
+
+
+def population() -> dict:
+    """How much of what is on disk is authoritative — never hide the rest silently."""
+    rows = experiment_index()
+    if q.authoritative_ids() is None:
+        return {"basis": "UNKNOWN", "on_disk": len(rows), "authoritative": None,
+                "quarantined": None, "unrecorded": None,
+                "reason": "database unreadable — authoritative flags unavailable"}
+    return {
+        "basis": "AUTHORITATIVE",
+        "on_disk": len(rows),
+        "authoritative": sum(1 for r in rows if r["authoritative"] is True),
+        "quarantined": sum(1 for r in rows if r["authoritative"] is False),
+        "unrecorded": sum(1 for r in rows if r["authoritative"] is None),
+        "reason": "quarantined runs predate the current pipeline and are excluded",
+    }
 
 
 def stages(experiment_id: str, art: dict | None = None,
@@ -734,6 +780,7 @@ def experiment_index() -> list[dict]:
     """One dense row per experiment directory — the table's source."""
     registry = _registry_map()
     cycle_of = _experiment_cycle_map()
+    flags = q.authoritative_ids()
     out = []
     for eid in q.experiment_ids():
         art = q.artifacts(eid)
@@ -750,6 +797,7 @@ def experiment_index() -> list[dict]:
         bench = clean(m.get("cumulative_return_benchmark"))
         out.append({
             "id": eid,
+            "authoritative": _authoritative_flag(eid, flags),
             "cycle": cycle_of.get(eid),
             "market": cfg.get("ticker") or rep.get("config", {}).get("ticker"),
             "hypothesis": rep.get("hypothesis"),
@@ -849,6 +897,7 @@ def cycles() -> list[dict]:
     their summaries from data/logs/session.log and adds no state of its own.
     """
     sessions = q.session_records()
+    flags = q.authoritative_ids()
     out = []
     for i, s in enumerate(sessions, start=1):
         results = s.get("results") or []
@@ -876,7 +925,12 @@ def cycles() -> list[dict]:
             "rejects": sum(1 for d in decisions if d == "REJECT"),
             "validation_passes": sum(1 for v in validations if v == "APPROVED"),
             "validation_failures": sum(1 for v in validations if v == "REJECTED"),
+            # scheduler progress; `grid_remaining` counts a config as explored
+            # even when its run was later quarantined
             "grid_remaining": s.get("grid_remaining"),
+            "grid_remaining_basis": "scheduler",
+            "authoritative_experiments": (None if flags is None
+                                          else sum(1 for eid in ids if eid in flags[0])),
             "elapsed_s": _elapsed(started, finished),
             "source": "data/logs/session.log",
         })
@@ -982,19 +1036,22 @@ def _horizon_from_id(eid: str) -> int | None:
 
 
 def funnel() -> dict:
-    rows = experiment_index()
+    rows = authoritative()
     sealed = [r for r in rows if r["status"] != "RUNNING" and r["status"] != "UNSEALED"]
     hypotheses = {r["hypothesis"] for r in rows if r["hypothesis"]}
-    registry = _registry_map()
+    registry = _registry_map(authoritative_only=True)
     champions = sum(1 for r in registry.values() if r["status"] == "champion")
     return {
+        "population": population(),
         "hypotheses": len(hypotheses),
         "experiments": len(sealed),
         "research_pass": sum(1 for r in sealed if r["status"] in ("KEEP", "IMPROVE")),
         "validation_pass": sum(1 for r in sealed if r["validation"] == "APPROVED"),
         "holdout_pass": sum(1 for r in sealed if r["holdout"] == PASS),
         "champions": champions,
-        "source": "experiment artifacts + model_registry",
+        "validation_attempts": sum(1 for r in sealed if r["validation"] != NOT_RUN),
+        "holdout_attempts": sum(1 for r in sealed if r["holdout"] != NOT_RUN),
+        "source": "authoritative experiment artifacts + model_registry",
     }
 
 
@@ -1027,7 +1084,7 @@ def rejections() -> dict:
     experiments_with_issues = 0
     gate_counts = {"No accuracy lift (REJECT)": 0, "Accuracy lift, Sharpe degraded (IMPROVE)": 0}
     holdout_fail = 0
-    rows = q.experiment_ids()
+    rows = [r["id"] for r in authoritative()]
     for eid in rows:
         art = q.artifacts(eid)
         rep = art.get("report") or {}
@@ -1061,7 +1118,7 @@ def rejections() -> dict:
 
 def hypotheses() -> list[dict]:
     """Hypotheses actually researched, with their evidence trail."""
-    rows = experiment_index()
+    rows = authoritative()
     memory = []
     try:
         memory = q.research_memory_rows()
@@ -1106,7 +1163,7 @@ def hypotheses() -> list[dict]:
 
 def champions() -> dict:
     """Champion leaderboard from the model registry lifecycle, plus correlation."""
-    registry = _registry_map()
+    registry = _registry_map(authoritative_only=True)
     lifecycle = {"champion": [], "eligible": [], "candidate": [], "rejected": []}
     for model_id, row in registry.items():
         if not model_id.endswith("_improved"):
@@ -1130,6 +1187,8 @@ def champions() -> dict:
             "max_drawdown": perf.get("max_drawdown"),
             "annualized_volatility": perf.get("annualized_volatility"),
             "p_value": perf.get("p_value"),
+            "metrics_basis": "research test window (sealed metrics.json)",
+            "holdout": _holdout_economics(eid),
             "edge": roll.get("edge"),
             "evidence": {
                 s["key"]: s["status"] for s in stages(eid)
@@ -1148,6 +1207,36 @@ def champions() -> dict:
         "correlation": corr,
         "note": ("no model has passed validation + hidden holdout, so the registry "
                  "holds no champion" if not champs else None),
+    }
+
+
+def _holdout_economics(experiment_id: str) -> dict:
+    """Hidden-holdout economics, straight from holdout_report.json.
+
+    Quant Loop persists only the promotion verdict, accuracy, base rate, sample
+    size and the economic gate; holdout drawdown/volatility/Sortino are computed
+    during adjudication but never written, so they are reported unavailable
+    rather than back-filled from research-window metrics.
+    """
+    ho = q.artifacts(experiment_id).get("holdout_report")
+    if ho is None:
+        return {"status": NOT_RUN, "available": False}
+    gate = ho.get("economic_gate") or {}
+    return {
+        "status": PASS if ho.get("promoted") else FAIL,
+        "available": True,
+        "accuracy": clean(ho.get("holdout_accuracy")),
+        "base_rate": clean(ho.get("base_rate")),
+        "n": ho.get("n_holdout"),
+        "net_return": clean(gate.get("compounded_net_return")),
+        "sharpe": clean(gate.get("sharpe_strategy")),
+        "benchmark_sharpe": clean(gate.get("sharpe_benchmark")),
+        "max_drawdown": NA,
+        "annualized_volatility": NA,
+        "unavailable_fields": ["max_drawdown", "annualized_volatility", "sortino",
+                               "calmar", "var_95", "expected_shortfall", "turnover"],
+        "unavailable_reason": "holdout_report.json persists only the economic gate",
+        "reason": holdout_summary(ho),
     }
 
 
@@ -1250,7 +1339,7 @@ def system() -> dict:
         tasks = q.task_counts()
     except q.DataUnavailable:
         pass
-    rows = experiment_index()
+    rows = authoritative()
     sealed = [r for r in rows if r["sealed"]]
     last = max((r["sealed"] for r in sealed), default=None)
     hb_ts = hb.get("timestamp")
@@ -1318,6 +1407,8 @@ def system() -> dict:
         "heartbeat_status": hb.get("status") or ("ok" if hb.get("ok") else None),
         "last_experiment_completed": last,
         "experiments_total": len(sealed),
+        "population": population(),
+        "uptime_s": NA,          # no process start time is persisted anywhere
         "data": freshness,
         "database": db,
         "repository": q.git_commit(),
@@ -1407,12 +1498,13 @@ def activity(limit: int = 120) -> list[dict]:
 
 
 def overview() -> dict:
-    rows = experiment_index()
+    all_rows = experiment_index()
+    rows = authoritative(all_rows)
     cur = current_cycle()
     done = cycles()
     live = _in_flight()
     hb = q.heartbeat() or {}
-    registry = _registry_map()
+    registry = _registry_map(authoritative_only=True)
     sealed = [r for r in rows if r["status"] not in ("RUNNING", "UNSEALED")]
     hyps = hypotheses()
     default = default_experiment(rows)
@@ -1439,12 +1531,14 @@ def overview() -> dict:
         "system": system(),
         "default_experiment": default,
         "experiments_total": len(rows),
+        "population": population(),
+        "as_of_utc": datetime.now(timezone.utc).isoformat(),
     }
 
 
 def default_experiment(rows: list[dict] | None = None) -> str | None:
     """The experiment the terminal opens on: champion, else newest sealed."""
-    rows = rows if rows is not None else experiment_index()
+    rows = authoritative(rows if rows is not None else experiment_index())
     for r in rows:
         if r["registry_status"] == "champion":
             return r["id"]
