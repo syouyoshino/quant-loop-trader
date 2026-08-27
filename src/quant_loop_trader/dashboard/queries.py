@@ -10,6 +10,7 @@ dashboard must stay a light process that cannot touch research state.
 from __future__ import annotations
 
 import functools
+import hashlib
 import json
 import os
 import subprocess
@@ -19,8 +20,6 @@ from pathlib import Path
 
 import duckdb
 
-# Poll-friendly memoisation: one dashboard refresh hits the same artifacts from
-# several panels. Set to 0 to disable (tests do).
 CACHE_TTL = float(os.environ.get("QLT_DASHBOARD_CACHE_TTL", "5"))
 _CACHES: list[dict] = []
 
@@ -49,7 +48,8 @@ def clear_caches() -> None:
     for store in _CACHES:
         store.clear()
 
-_PKG_ROOT = Path(__file__).resolve().parents[3]  # …/quant-loop-trader (src/pkg/dashboard/…)
+
+_PKG_ROOT = Path(__file__).resolve().parents[3]
 
 
 def root() -> Path:
@@ -79,7 +79,6 @@ class DataUnavailable(RuntimeError):
     """Raised when a source cannot be read. Callers surface NOT AVAILABLE."""
 
 
-# --- DuckDB (read-only, always) --------------------------------------------
 def connect() -> duckdb.DuckDBPyConnection:
     """Open the research database read-only. Never migrates, never writes."""
     db = paths()["db"]
@@ -88,7 +87,7 @@ def connect() -> duckdb.DuckDBPyConnection:
     try:
         return duckdb.connect(str(db), read_only=True)
     except duckdb.IOException:
-        time.sleep(0.5)  # a writer session holds the lock — contention, not corruption
+        time.sleep(0.5)
         try:
             return duckdb.connect(str(db), read_only=True)
         except duckdb.IOException as exc:
@@ -111,7 +110,7 @@ def db_status() -> dict:
         return {"status": "OK", "experiment_rows": n}
     except DataUnavailable as exc:
         return {"status": "UNAVAILABLE", "detail": str(exc)}
-    except Exception as exc:  # corrupt / unmigrated database
+    except Exception as exc:
         return {"status": "ERROR", "detail": str(exc)[:120]}
 
 
@@ -135,11 +134,7 @@ def stem(model_or_experiment_id: str) -> str:
 
 @ttl_cache
 def authoritative_ids() -> tuple[set[str], set[str]] | None:
-    """(authoritative stems, quarantined stems) from the experiments table.
-
-    Returns None when the database cannot be read. A stem in neither set has no
-    database record at all — an in-flight run, not a quarantined one.
-    """
+    """(authoritative stems, quarantined stems) from the experiments table."""
     try:
         rows = query("SELECT experiment_id, authoritative FROM experiments")
     except DataUnavailable:
@@ -183,7 +178,7 @@ def parquet_rows(path: Path, columns: str = "*", order: str = "") -> list[dict]:
     """Read a parquet file through DuckDB (keeps polars out of the dashboard)."""
     if not Path(path).exists():
         raise DataUnavailable(f"parquet_missing:{path}")
-    con = duckdb.connect()  # in-memory scratch; touches nothing on disk
+    con = duckdb.connect()
     try:
         sql = f"SELECT {columns} FROM read_parquet(?)" + (f" ORDER BY {order}" if order else "")
         cur = con.execute(sql, [str(path)])
@@ -193,9 +188,10 @@ def parquet_rows(path: Path, columns: str = "*", order: str = "") -> list[dict]:
         con.close()
 
 
-# --- experiment artifacts ---------------------------------------------------
-ARTIFACTS = ("report.json", "metrics.json", "config.json", "validation.json",
-             "holdout_report.json", "predictions.lock")
+ARTIFACTS = (
+    "report.json", "metrics.json", "config.json", "validation.json",
+    "holdout_report.json", "holdout.lock", "predictions.lock",
+)
 
 
 @ttl_cache
@@ -215,6 +211,72 @@ def read_json(path: Path) -> dict | None:
         return None
 
 
+def _sha(path: Path) -> str | None:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+def _verified_holdout(experiment_id: str, d: Path, raw: dict | None) -> tuple[dict | None, dict]:
+    """Expose holdout evidence only when seal, research bundle, and DB agree."""
+    if raw is None:
+        return None, {"status": "NOT_RUN", "reason": None}
+    seal = read_json(d / "holdout.lock")
+    if seal is None:
+        return None, {"status": "FAIL", "reason": "missing_holdout_lock"}
+
+    issues = []
+    if seal.get("experiment_id") != experiment_id:
+        issues.append("experiment_binding_mismatch")
+    if seal.get("model_id") != f"{experiment_id}_improved":
+        issues.append("model_binding_mismatch")
+    if seal.get("holdout_report_sha256") != _sha(d / "holdout_report.json"):
+        issues.append("holdout_report_tampered")
+    if seal.get("research_lock_sha256") != _sha(d / "predictions.lock"):
+        issues.append("research_lock_mismatch")
+
+    cfg = read_json(d / "config.json") or {}
+    dataset_id = cfg.get("dataset_id")
+    dataset_path = paths()["datasets"] / f"{dataset_id}.parquet" if dataset_id else None
+    if dataset_path is None or seal.get("dataset_snapshot_sha256") != _sha(dataset_path):
+        issues.append("dataset_snapshot_mismatch")
+
+    try:
+        claims = query(
+            "SELECT state, promoted, result_json FROM holdout_claims WHERE experiment_id=?",
+            [experiment_id],
+        )
+        regs = query(
+            "SELECT status FROM model_registry WHERE model_id=?",
+            [f"{experiment_id}_improved"],
+        )
+    except Exception as exc:
+        return None, {"status": "FAIL", "reason": f"holdout_db_unavailable:{str(exc)[:100]}"}
+
+    claim = claims[0] if claims else None
+    reg = regs[0]["status"] if regs else None
+    if claim is None or claim["state"] not in ("COMPLETE", "FAILED"):
+        issues.append(f"holdout_claim_not_committed:{claim['state'] if claim else 'missing'}")
+    else:
+        try:
+            stored = json.loads(claim["result_json"]) if claim.get("result_json") else None
+        except json.JSONDecodeError:
+            stored = None
+        if stored != raw:
+            issues.append("holdout_db_result_mismatch")
+        if bool(claim.get("promoted")) != bool(raw.get("promoted")):
+            issues.append("holdout_db_promotion_mismatch")
+
+    if raw.get("promoted") and reg != "champion":
+        issues.append(f"promoted_without_champion_registry:{reg or 'missing'}")
+    if not raw.get("promoted") and reg == "champion":
+        issues.append("champion_registry_without_promoted_holdout")
+    if issues:
+        return None, {"status": "FAIL", "reason": ";".join(issues)}
+    return raw, {"status": "PASS", "reason": None, "sealed_at": seal.get("sealed_at")}
+
+
 @ttl_cache
 def artifacts(experiment_id: str) -> dict:
     """All sealed artifacts of one experiment, plus filesystem timing evidence."""
@@ -222,11 +284,15 @@ def artifacts(experiment_id: str) -> dict:
     out = {"experiment_id": experiment_id, "dir": d, "exists": d.is_dir()}
     for name in ARTIFACTS:
         out[name.split(".")[0]] = read_json(d / name)
+    raw_holdout = out.get("holdout_report")
+    verified, integrity = _verified_holdout(experiment_id, d, raw_holdout)
+    out["holdout_report"] = verified
+    out["holdout_integrity"] = integrity
     out["files"] = {name: (d / name).exists() for name in ARTIFACTS}
     out["started_at"] = _birthtime(d)
     out["sealed_at"] = _mtime(d / "report.json")
     out["validated_at"] = _mtime(d / "validation.json")
-    out["holdout_at"] = _mtime(d / "holdout_report.json")
+    out["holdout_at"] = _mtime(d / "holdout_report.json") if verified is not None else None
     return out
 
 
@@ -260,7 +326,6 @@ def price_history(ticker: str = "SPY") -> list[dict]:
     return parquet_rows(paths()["processed"] / f"{ticker}.parquet", order="event_time")
 
 
-# --- autonomy / system state ------------------------------------------------
 @ttl_cache
 def heartbeat() -> dict | None:
     return read_json(paths()["logs"] / "heartbeat.json")
