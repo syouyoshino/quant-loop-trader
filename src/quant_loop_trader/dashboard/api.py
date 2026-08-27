@@ -12,7 +12,6 @@ import argparse
 import re
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
 from quant_loop_trader.dashboard import queries as q

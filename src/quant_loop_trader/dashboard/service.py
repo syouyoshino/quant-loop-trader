@@ -20,7 +20,6 @@ from quant_loop_trader.dashboard.schemas import (
     NOT_AVAILABLE,
     NOT_RUN,
     PASS,
-    PIPELINE,
     Stage,
     calendar_days,
     clean,
