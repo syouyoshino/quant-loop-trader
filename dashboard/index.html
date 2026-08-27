@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en" data-theme="terminal">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>QUANT LOOP — RESEARCH TERMINAL</title>
+<link rel="stylesheet" href="/styles.css">
+<script src="/vendor/echarts.min.js"></script>
+</head>
+<body>
+<header id="topbar" class="topbar">
+  <div class="brand">QUANT&nbsp;LOOP</div>
+  <div id="topbar-fields" class="topbar-fields"><span class="dim">CONNECTING…</span></div>
+  <div class="topbar-right"><span id="clock" class="mono"></span></div>
+</header>
+
+<main class="grid">
+  <section id="cycle" class="panel span-12 cycle-panel"></section>
+
+  <section id="pipeline" class="panel span-4"></section>
+  <section id="system" class="panel span-4"></section>
+  <section id="funnel" class="panel span-4"></section>
+
+  <section id="equity-panel" class="panel span-8 chart-panel">
+    <div class="panel-head">
+      <h2>EQUITY CURVE <span id="equity-subject" class="dim"></span></h2>
+      <div class="controls">
+        <span id="variant-toggle" class="segmented" data-group="variant">
+          <button data-value="improved" class="on">IMPROVED</button><button data-value="baseline">BASELINE</button>
+        </span>
+        <span id="range-toggle" class="segmented" data-group="range">
+          <button data-value="ALL" class="on">ALL</button><button data-value="1Y">1Y</button><button data-value="6M">6M</button><button data-value="3M">3M</button><button data-value="1M">1M</button>
+        </span>
+      </div>
+    </div>
+    <div id="equity-chart" class="chart chart-lg"></div>
+    <div class="panel-sub">DRAWDOWN — equity / running max − 1</div>
+    <div id="drawdown-chart" class="chart chart-sm"></div>
+    <div id="equity-note" class="note"></div>
+  </section>
+
+  <section id="metrics" class="panel span-4"></section>
+
+  <section id="rolling-panel" class="panel span-8 chart-panel">
+    <div class="panel-head">
+      <h2>ROLLING PERFORMANCE / EDGE DECAY</h2>
+      <div class="controls">
+        <span id="rolling-toggle" class="segmented" data-group="rolling">
+          <button data-value="30D">30D</button><button data-value="90D" class="on">90D</button><button data-value="180D">180D</button>
+        </span>
+      </div>
+    </div>
+    <div id="rolling-chart" class="chart chart-md"></div>
+    <div id="edge" class="edge"></div>
+  </section>
+
+  <section id="risk" class="panel span-4"></section>
+
+  <section id="validation" class="panel span-6"></section>
+  <section id="rejections" class="panel span-6"></section>
+
+  <section id="experiments" class="panel span-12"></section>
+
+  <section id="detail" class="panel span-8"></section>
+  <section id="champions" class="panel span-4"></section>
+
+  <section id="market" class="panel span-5"></section>
+  <section id="activity" class="panel span-7"></section>
+</main>
+
+<footer class="footer">
+  <span id="footer-status" class="dim"></span>
+</footer>
+
+<script type="module" src="/src/pages/terminal.js"></script>
+</body>
+</html>

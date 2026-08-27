@@ -85,6 +85,23 @@ Single-command end-to-end loop — fetch → PIT snapshot → train baseline →
 | 10 — Automation | `automation/controller.py`, `queue.py` | task queue + controller, **inert** until `enabled=True` AND `QLT_AUTONOMOUS_ENABLED=true` |
 | 11 — Paper prep | `paper_trading.py` | Order/simulator/tracker offline; broker **disabled** until `allow=True` AND `QLT_PAPER_ENABLED=true` |
 
+## Research terminal (read-only dashboard)
+
+Bloomberg-style observability over the running lab — cycle progress, live
+pipeline, equity/drawdown/rolling charts, validation evidence, rejection
+analytics and system health. It only reads: DuckDB is opened `read_only`, no
+artifact is ever written, and anything Quant Loop has not produced renders as
+`N/A`.
+
+```bash
+PYTHONPATH=src .venv/bin/python -m quant_loop_trader.dashboard.api --port 8787
+# → http://127.0.0.1:8787
+```
+
+Backend in `src/quant_loop_trader/dashboard/` (queries / service / schemas /
+api), frontend in `dashboard/` (native ES modules + vendored ECharts, no build
+step). Full documentation: [docs/dashboard.md](docs/dashboard.md).
+
 ## Data connectors (`connectors/`)
 
 Every connector returns `(pl.DataFrame, source)` where the frame satisfies the PIT contract: `event_time` + `available_time` Date columns, `available_time >= event_time`. Any such frame filters through `replay.pit_filter(df, ts)` — the same availability rule as `ReplayEngine.get_snapshot`.
