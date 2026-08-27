@@ -1,5 +1,6 @@
 """Regression tests for the 2026-08-27 hostile audit fixes."""
 import json
+from pathlib import Path
 
 import duckdb
 import numpy as np
@@ -58,7 +59,9 @@ def test_final_holdout_is_sealed_and_db_committed(isolated_research):
     assert (registry == "champion") == bool(result["promoted"])
 
 
-def test_tampered_holdout_is_rejected_by_verifier_and_dashboard(isolated_research):
+def test_tampered_holdout_is_rejected_by_verifier_and_dashboard(
+    isolated_research, monkeypatch
+):
     exp_id = _make_eligible()
     adjudicate_holdout(exp_id)
 
@@ -74,6 +77,8 @@ def test_tampered_holdout_is_rejected_by_verifier_and_dashboard(isolated_researc
 
     from quant_loop_trader.dashboard import queries as q
 
+    root = Path(isolated_research).parent
+    monkeypatch.setenv("QLT_ROOT", str(root))
     q.clear_caches()
     art = q.artifacts(exp_id)
     assert art["holdout_report"] is None
