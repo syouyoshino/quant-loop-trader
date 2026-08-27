@@ -67,7 +67,8 @@ def test_tampered_holdout_is_rejected_by_verifier_and_dashboard(
 
     from quant_loop_trader.experiment import EXP_ROOT
 
-    p = EXP_ROOT / exp_id / "holdout_report.json"
+    exp_dir = EXP_ROOT / exp_id
+    p = exp_dir / "holdout_report.json"
     raw = json.loads(p.read_text())
     raw["promoted"] = not bool(raw.get("promoted"))
     p.write_text(json.dumps(raw, indent=2))
@@ -80,10 +81,10 @@ def test_tampered_holdout_is_rejected_by_verifier_and_dashboard(
     root = Path(isolated_research).parent
     monkeypatch.setenv("QLT_ROOT", str(root))
     q.clear_caches()
-    art = q.artifacts(exp_id)
-    assert art["holdout_report"] is None
-    assert art["holdout_integrity"]["status"] == "FAIL"
-    assert "holdout_report_tampered" in art["holdout_integrity"]["reason"]
+    verified, integrity = q._verified_holdout(exp_id, exp_dir, json.loads(p.read_text()))
+    assert verified is None
+    assert integrity["status"] == "FAIL"
+    assert "holdout_report_tampered" in integrity["reason"]
 
 
 def test_completed_holdout_claim_cannot_be_reopened(isolated_research):
