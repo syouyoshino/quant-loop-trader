@@ -37,6 +37,11 @@ def _sha(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _canonical_json(payload: dict) -> dict:
+    """Normalize tuples/numpy scalars to exactly what the evidence store persists."""
+    return json.loads(json.dumps(payload))
+
+
 def _atomic_json(path: Path, payload: dict) -> None:
     """Write JSON by atomic rename so readers never observe a partial artifact."""
     tmp = path.with_name(f".{path.name}.tmp")
@@ -63,11 +68,7 @@ def _seal_holdout_evidence(experiment_id: str, bundle, result: dict) -> None:
 
 
 def verify_holdout_evidence(experiment_id: str, exp_root: Path | None = None) -> dict:
-    """Return final holdout evidence only when file and DB commitments agree.
-
-    A report written before a crash is not authoritative until the holdout claim
-    and registry transition are committed. This closes the filesystem/DB seam.
-    """
+    """Return final holdout evidence only when file and DB commitments agree."""
     import duckdb
 
     from quant_loop_trader.data import DB_PATH
@@ -152,7 +153,6 @@ def adjudicate_holdout(experiment_id: str) -> dict:
     from quant_loop_trader.experiment import EXP_ROOT
     from quant_loop_trader.models.registry import build_model
 
-    exp_dir = EXP_ROOT / experiment_id
     try:
         bundle = ExperimentBundle.open_verified(experiment_id, EXP_ROOT)
     except BundleIntegrityError as exc:
@@ -212,12 +212,12 @@ def adjudicate_holdout(experiment_id: str) -> dict:
 
         logger = logging.getLogger(__name__)
         logger.error(f"adjudication failed: {exc}")
-        result = {
+        result = _canonical_json({
             "promoted": False,
             "reason": f"adjudication_error:{str(exc)[:150]}",
             "economic_gate": fin or None,
             "traceback_tail": traceback.format_exc()[-300:],
-        }
+        })
         try:
             _seal_holdout_evidence(experiment_id, bundle, result)
             _commit_holdout_outcome(experiment_id, "FAILED", result)
@@ -227,7 +227,7 @@ def adjudicate_holdout(experiment_id: str) -> dict:
 
     liq_return = fin.get("cumulative_return_strategy_liquidated", fin["cumulative_return_strategy"])
     liq_sharpe = fin.get("sharpe_strategy_liquidated", fin["sharpe_strategy"])
-    result = {
+    result = _canonical_json({
         "promoted": promoted,
         "holdout_accuracy": acc,
         "base_rate": base,
@@ -239,7 +239,7 @@ def adjudicate_holdout(experiment_id: str) -> dict:
             "liquidated_at_end": True,
         },
         "holdout_metrics": fin,
-    }
+    })
 
     from quant_loop_trader.core import LifecycleEvidence, final_state
 
@@ -253,10 +253,7 @@ def adjudicate_holdout(experiment_id: str) -> dict:
         _commit_holdout_outcome(experiment_id, "COMPLETE", result, new_status=new_status)
     except Exception as exc:
         logging.getLogger(__name__).error(f"holdout finalization failed: {exc}")
-        return {
-            "promoted": False,
-            "reason": f"holdout_commit_error:{str(exc)[:150]}",
-        }
+        return {"promoted": False, "reason": f"holdout_commit_error:{str(exc)[:150]}"}
 
     from quant_loop_trader.agents import _correct_success_memories_for
 
@@ -335,11 +332,7 @@ def _commit_holdout_outcome(experiment_id: str, state: str, result: dict,
 
 
 def release_holdout_claim(experiment_id: str) -> str:
-    """Explicit human recovery for an OPEN claim after a crash.
-
-    Completed or failed adjudications have already exposed the permanent holdout
-    and are never releasable through this recovery API.
-    """
+    """Explicit human recovery for an OPEN claim after a crash."""
     import duckdb
 
     from quant_loop_trader.data import DB_PATH, migrate_db
