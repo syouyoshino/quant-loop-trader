@@ -286,6 +286,7 @@ def test_cycle_progress_and_counts_come_from_session_state(lab):
     for i, eid in enumerate(["e1", "e2", "e3"]):
         _seal_experiment(lab, eid, prices=_prices(60), preds=[1] * 60,
                          decision="KEEP" if i == 0 else "REJECT")
+        _register(lab, eid, authoritative=True)
     _write_sessions(lab, [
         {"session_started": "2024-01-01T00:00:00+00:00",
          "session_finished": "2024-01-01T00:05:00+00:00", "mode": "OBSERVATION",
@@ -366,7 +367,7 @@ def test_autonomy_stopped_is_reported_as_stopped(lab, monkeypatch):
     _seal_experiment(lab, "e1", prices=_prices(60), preds=[1] * 60)
     sys = svc.system()
     assert sys["autonomy"] == "DISABLED"
-    assert sys["workers"] == 0
+    assert sys["active_runs"]["running"] == 0
 
     monkeypatch.setenv("QLT_AUTONOMOUS_ENABLED", "true")
     assert svc.system()["autonomy"] == "IDLE"      # enabled but nothing in flight
@@ -390,7 +391,7 @@ def test_running_experiment_is_visible_while_it_runs(lab, monkeypatch):
     assert cycle["active_market"] == "SPY" and cycle["active_horizon"] == 5
 
     sys = svc.system()
-    assert sys["autonomy"] == "RUNNING" and sys["workers"] == 1
+    assert sys["autonomy"] == "RUNNING" and sys["active_runs"]["running"] == 1
 
     row = [r for r in svc.experiment_index() if r["id"] == "20240102_SPY_5d_live"][0]
     assert row["status"] == "RUNNING" and row["stage"] == "EXECUTION"
@@ -419,6 +420,7 @@ def test_pipeline_stages_reflect_recorded_evidence(lab):
         },
         holdout={"promoted": False, "holdout_accuracy": 0.5, "base_rate": 0.6, "n_holdout": 40},
     )
+    _register(lab, "staged", authoritative=True)
     stages = {s["key"]: s["status"] for s in svc.stages("staged")}
     assert stages["research_gate"] == "PASS"
     assert stages["replication"] == "PASS"
@@ -523,7 +525,8 @@ def test_population_is_unknown_not_empty_when_the_database_is_gone(lab):
     assert q.authoritative_ids() is None
     assert svc.population()["basis"] == "UNKNOWN"
     assert svc.population()["authoritative"] is None
-    assert len(svc.authoritative()) == 2  # intact, flagged unknown
+    assert len(svc.visible()) == 2        # runs stay on screen...
+    assert svc.authoritative() == []      # ...but nothing can be vouched for
     assert all(r["authoritative"] is None for r in svc.experiment_index())
 
 
