@@ -12,10 +12,12 @@ export function renderFunnel(node, funnel, progress, hypotheses) {
   ];
   const max = Math.max(...steps.map(([, n]) => (typeof n === 'number' ? n : 0)), 1);
   const pop = funnel.population || {};
+  const unavailable = funnel.available === false;
   node.innerHTML = `<div class="panel-head"><h2>RESEARCH FUNNEL</h2>
       <span class="dim">${escape(funnel.source || '')}</span></div>
-    <div class="note">${pop.basis === 'AUTHORITATIVE'
-      ? `${int(pop.authoritative)} authoritative of ${int(pop.on_disk)} on disk · ${int(pop.quarantined)} quarantined and excluded`
+    <div class="note ${unavailable ? 'neg' : ''}">${pop.basis === 'AUTHORITATIVE'
+      ? `${int(pop.authoritative)} authoritative of ${int(pop.on_disk)} on disk · ${int(pop.quarantined)} quarantined${
+          pop.unrecorded ? ` · ${int(pop.unrecorded)} unrecorded (shown, not counted)` : ''}`
       : escape(pop.reason || 'population unknown')}</div>
     <div class="funnel">${steps.map(([label, n], i) => `
       <div class="step">

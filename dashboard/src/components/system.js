@@ -1,5 +1,14 @@
 import { ago, escape, int, kv, pill, stamp, text, NA } from './util.js';
 
+// An unsealed directory proves a process started, not that one is alive.
+function activeRuns(a) {
+  if (!a) return NA;
+  const parts = [`${int(a.running)} running`];
+  if (a.stale) parts.push(`<span class="warn">${a.stale} stale</span>`);
+  if (a.orphaned) parts.push(`<span class="neg">${a.orphaned} orphaned</span>`);
+  return parts.join(' · ');
+}
+
 export function renderSystem(node, sys) {
   const q = sys.queue || {};
   const data = sys.data || {};
@@ -13,12 +22,12 @@ export function renderSystem(node, sys) {
     ['PROGRESS', (sys.progress && sys.progress.completed !== null && sys.progress.completed !== undefined)
       ? `${sys.progress.completed} / ${sys.progress.planned === null || sys.progress.planned === undefined
         ? 'N/A' : sys.progress.planned}` : NA],
-    ['WORKERS', int(sys.workers)],
+    ['ACTIVE RUNS', activeRuns(sys.active_runs)],
     ['GRID REMAINING', q.grid_remaining === null || q.grid_remaining === undefined ? NA : int(q.grid_remaining)],
     ['TASK QUEUE', `${int(q.tasks_pending)} pending / ${int(q.tasks_failed)} failed`],
     ['LAST HEARTBEAT', sys.last_heartbeat ? `${ago(sys.last_heartbeat)} ago` : NA],
     ['LAST EXPERIMENT', sys.last_experiment_completed ? stamp(sys.last_experiment_completed) : NA],
-    ['EXPERIMENTS', int(sys.experiments_total)],
+    ['EXPERIMENTS (AUTHORITATIVE)', int(sys.experiments_total)],
     ['DATA', `${pill(data.status)} ${ds ? `${ds.ticker} → ${ds.last_event_time} (${ds.age_days}d)` : ''}`],
     ['DATABASE', pill((sys.database || {}).status)],
     ['REPO', (sys.repository || {}).commit

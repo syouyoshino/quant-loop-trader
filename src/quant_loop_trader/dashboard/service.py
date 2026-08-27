@@ -547,12 +547,29 @@ def _authoritative_flag(eid: str, flags) -> bool | None:
     return True if eid in good else (False if eid in quarantined else None)
 
 
-def authoritative(rows: list[dict] | None = None) -> list[dict]:
-    """The rows that count as current research evidence.
+def authority_available() -> bool:
+    """Whether the database can vouch for provenance at all."""
+    return q.authoritative_ids() is not None
 
-    Only rows explicitly quarantined in the database are dropped. A row with no
-    record yet (an in-flight run) or an unreadable database stays visible —
-    unknown provenance is surfaced through `population`, never silently emptied.
+
+def authoritative(rows: list[dict] | None = None) -> list[dict]:
+    """Rows that ARE current research evidence — `authoritative is True` only.
+
+    Every statistic (funnel, hypothesis tallies, pass rates, lifecycle counts,
+    research progress) is computed over this population. When the database is
+    unreadable this is empty by construction; callers must check
+    `authority_available()` and report N/A rather than a filesystem count.
+    """
+    rows = rows if rows is not None else experiment_index()
+    return [r for r in rows if r["authoritative"] is True]
+
+
+def visible(rows: list[dict] | None = None) -> list[dict]:
+    """Rows the control room shows — authoritative plus not-yet-recorded runs.
+
+    An in-flight experiment has no `experiments` row until it seals, so it is
+    unknown, not quarantined. It belongs on the screen; it does not belong in
+    any evidence statistic until the database says `authoritative`.
     """
     rows = rows if rows is not None else experiment_index()
     return [r for r in rows if r["authoritative"] is not False]
@@ -873,8 +890,21 @@ def experiment_detail(experiment_id: str) -> dict:
 # --- cycles -----------------------------------------------------------------
 
 
+RUN_FRESH_S = 1800        # a live run touches its directory well inside 30 min
+RUN_STALE_S = 24 * 3600   # older than a day with no seal is not coming back
+
+
 def _in_flight() -> list[dict]:
-    """Experiment directories with no sealed report — a run in progress or crashed."""
+    """Directories with no sealed report.
+
+    `run_experiment` creates the directory before it inserts any database row,
+    so an unsealed directory is evidence of a started process, never proof of a
+    live one. Age plus session freshness separates the three cases; none of them
+    is reported as a worker count.
+    """
+    hb = q.heartbeat() or {}
+    session_live = bool(hb.get("timestamp")) and (
+        _elapsed(hb["timestamp"], None) or 0) < RUN_FRESH_S
     out = []
     for eid in q.experiment_ids():
         art = q.artifacts(eid)
@@ -884,8 +914,13 @@ def _in_flight() -> list[dict]:
         age = None
         if started:
             age = (datetime.now(timezone.utc) - datetime.fromisoformat(started)).total_seconds()
-        out.append({"id": eid, "started_at": started, "age_s": age,
-                    "state": "RUNNING" if (age is not None and age < 1800) else "STALLED"})
+        if age is not None and age < RUN_FRESH_S:
+            state = "RUNNING"
+        elif age is None or age > RUN_STALE_S or not session_live:
+            state = "ORPHANED"
+        else:
+            state = "STALE"
+        out.append({"id": eid, "started_at": started, "age_s": age, "state": state})
     return out
 
 
@@ -1016,7 +1051,7 @@ def current_cycle() -> dict:
 def _sealed_since(iso: str | None) -> int:
     if not iso:
         return 0
-    return sum(1 for r in experiment_index()
+    return sum(1 for r in visible()
                if r["sealed"] and r["sealed"] > iso)
 
 
@@ -1036,13 +1071,23 @@ def _horizon_from_id(eid: str) -> int | None:
 
 
 def funnel() -> dict:
+    pop = population()
+    if pop["basis"] == "UNKNOWN":
+        return {
+            "population": pop, "available": False,
+            "hypotheses": NA, "experiments": NA, "research_pass": NA,
+            "validation_pass": NA, "holdout_pass": NA, "champions": NA,
+            "validation_attempts": NA, "holdout_attempts": NA,
+            "source": "unavailable — database cannot vouch for provenance",
+        }
     rows = authoritative()
     sealed = [r for r in rows if r["status"] != "RUNNING" and r["status"] != "UNSEALED"]
     hypotheses = {r["hypothesis"] for r in rows if r["hypothesis"]}
     registry = _registry_map(authoritative_only=True)
     champions = sum(1 for r in registry.values() if r["status"] == "champion")
     return {
-        "population": population(),
+        "population": pop,
+        "available": True,
         "hypotheses": len(hypotheses),
         "experiments": len(sealed),
         "research_pass": sum(1 for r in sealed if r["status"] in ("KEEP", "IMPROVE")),
@@ -1222,7 +1267,11 @@ def _holdout_economics(experiment_id: str) -> dict:
     if ho is None:
         return {"status": NOT_RUN, "available": False}
     gate = ho.get("economic_gate") or {}
-    return {
+    full = ho.get("holdout_metrics") or {}   # written since 006; absent on older reports
+    ppy = periods_per_year(_ticker_from_id(experiment_id) or "SPY",
+                           (_cfg(q.artifacts(experiment_id)) or {}).get("horizon") or 5)
+    vol = clean(full.get("volatility_strategy"))
+    out = {
         "status": PASS if ho.get("promoted") else FAIL,
         "available": True,
         "accuracy": clean(ho.get("holdout_accuracy")),
@@ -1231,13 +1280,24 @@ def _holdout_economics(experiment_id: str) -> dict:
         "net_return": clean(gate.get("compounded_net_return")),
         "sharpe": clean(gate.get("sharpe_strategy")),
         "benchmark_sharpe": clean(gate.get("sharpe_benchmark")),
-        "max_drawdown": NA,
-        "annualized_volatility": NA,
-        "unavailable_fields": ["max_drawdown", "annualized_volatility", "sortino",
-                               "calmar", "var_95", "expected_shortfall", "turnover"],
-        "unavailable_reason": "holdout_report.json persists only the economic gate",
+        "max_drawdown": clean(full.get("max_drawdown_strategy")),
+        "volatility_per_bucket": vol,
+        "annualized_volatility": (vol * math.sqrt(ppy)) if vol is not None else NA,
+        "sortino": clean(full.get("sortino_ratio")),
+        "calmar": clean(full.get("calmar_ratio")),
+        "var_95": clean(full.get("var_95")),
+        "expected_shortfall": clean(full.get("expected_shortfall_95")),
+        "turnover": clean(full.get("turnover")),
+        "win_rate": clean(full.get("win_rate")),
+        "metrics_source": ("holdout_report.holdout_metrics" if full
+                           else "holdout_report.economic_gate"),
         "reason": holdout_summary(ho),
     }
+    out["unavailable_fields"] = [k for k, v in out.items() if v is None
+                                 and k not in ("reason", "status")]
+    out["unavailable_reason"] = (None if full else
+                                 "this report predates holdout_metrics persistence")
+    return out
 
 
 def correlation_matrix(ids: list[str]) -> dict:
@@ -1329,6 +1389,29 @@ def market(ticker: str = "SPY") -> dict:
 HEARTBEAT_STALE_S = 48 * 3600
 
 
+@q.ttl_cache
+def _lifecycle_inconsistencies() -> list[dict]:
+    """Contradictions between the registry and the evidence on disk.
+
+    Neither side is corrected here — the dashboard is read-only — but a
+    half-committed promotion must be visible rather than rendered as a clean
+    champion.
+    """
+    out = []
+    for r in visible():
+        ho = q.artifacts(r["id"]).get("holdout_report")
+        status = r["registry_status"]
+        if status == "champion" and ho is None:
+            out.append({"experiment_id": r["id"], "kind": "CHAMPION_WITHOUT_HOLDOUT",
+                        "detail": f"{r['id']} is champion in the registry with no "
+                                  "holdout_report.json on disk"})
+        if ho is not None and ho.get("promoted") and status not in ("champion", None):
+            out.append({"experiment_id": r["id"], "kind": "PROMOTION_NOT_COMMITTED",
+                        "detail": f"{r['id']} holdout promoted but registry still "
+                                  f"'{status}' — adjudication did not finish"})
+    return out
+
+
 def system() -> dict:
     hb = q.heartbeat() or {}
     live = _in_flight()
@@ -1339,8 +1422,9 @@ def system() -> dict:
         tasks = q.task_counts()
     except q.DataUnavailable:
         pass
-    rows = authoritative()
-    sealed = [r for r in rows if r["sealed"]]
+    known = authority_available()
+    rows = visible()
+    sealed = [r for r in authoritative() if r["sealed"]]
     last = max((r["sealed"] for r in sealed), default=None)
     hb_ts = hb.get("timestamp")
     hb_age = _elapsed(hb_ts, None) if hb_ts else None
@@ -1363,8 +1447,8 @@ def system() -> dict:
     if hb.get("grid_remaining") == 0:
         warnings.append("research grid exhausted — hypothesis refresh required")
     for r in live:
-        if r["state"] == "STALLED":
-            errors.append(f"unsealed experiment directory: {r['id']}")
+        if r["state"] in ("STALE", "ORPHANED"):
+            errors.append(f"{r['state'].lower()} unsealed experiment directory: {r['id']}")
     if db["status"] != "OK":
         errors.append(f"database {db['status']}: {db.get('detail', '')}")
     for r in rows:
@@ -1374,6 +1458,9 @@ def system() -> dict:
             if "error" in reason:
                 errors.append(f"{r['id']} holdout adjudication error: {reason[:80]}")
 
+    inconsistencies = _lifecycle_inconsistencies()
+    for bad in inconsistencies:
+        errors.append(bad["detail"])
     freshness = data_freshness()
     eligible_without_artifact = [
         r["id"] for r in rows
@@ -1396,7 +1483,13 @@ def system() -> dict:
         "stage": cur.get("active_stage"),
         "progress": {"completed": cur.get("completed_experiments"),
                      "planned": cur.get("planned_experiments")},
-        "workers": sum(1 for r in live if r["state"] == "RUNNING"),
+        # an unsealed directory proves a process started, not that one is alive
+        "active_runs": {
+            "running": sum(1 for r in live if r["state"] == "RUNNING"),
+            "stale": sum(1 for r in live if r["state"] == "STALE"),
+            "orphaned": sum(1 for r in live if r["state"] == "ORPHANED"),
+            "detail": live,
+        },
         "queue": {
             "grid_remaining": hb.get("grid_remaining"),
             "tasks_pending": tasks.get("pending", 0),
@@ -1406,8 +1499,9 @@ def system() -> dict:
         "last_heartbeat_age_s": hb_age,
         "heartbeat_status": hb.get("status") or ("ok" if hb.get("ok") else None),
         "last_experiment_completed": last,
-        "experiments_total": len(sealed),
+        "experiments_total": len(sealed) if known else NA,
         "population": population(),
+        "lifecycle_inconsistencies": inconsistencies,
         "uptime_s": NA,          # no process start time is persisted anywhere
         "data": freshness,
         "database": db,
@@ -1455,7 +1549,7 @@ def activity(limit: int = 120) -> list[dict]:
                 "text": (f"Cycle {c['cycle_number']} completed · {c['completed_experiments']} "
                          f"experiments · {c['keeps']} KEEP / {c['rejects']} REJECT"),
             })
-    for r in experiment_index():
+    for r in visible():
         if r["started"]:
             events.append({"t": r["started"], "kind": "EXPERIMENT_STARTED", "level": "info",
                            "text": f"{r['id']} started", "experiment_id": r["id"]})
@@ -1500,11 +1594,13 @@ def activity(limit: int = 120) -> list[dict]:
 def overview() -> dict:
     all_rows = experiment_index()
     rows = authoritative(all_rows)
+    known = authority_available()
     cur = current_cycle()
     done = cycles()
     live = _in_flight()
     hb = q.heartbeat() or {}
     registry = _registry_map(authoritative_only=True)
+    evidence = (lambda n: n if known else NA)   # never a filesystem count
     sealed = [r for r in rows if r["status"] not in ("RUNNING", "UNSEALED")]
     hyps = hypotheses()
     default = default_experiment(rows)
@@ -1513,24 +1609,28 @@ def overview() -> dict:
         "cycle": cur,
         "cycles_completed": len(done),
         "progress": {
+            # operational: what the machine is doing right now
             "cycles_completed": len(done),
-            "experiments_completed": len(sealed),
             "experiments_active": sum(1 for r in live if r["state"] == "RUNNING"),
             "experiments_unsealed": len(live),
             "experiments_queued": hb.get("grid_remaining"),
-            "hypotheses_researched": len(hyps),
-            "hypotheses_rejected": sum(1 for h in hyps if h["status"] == "REJECTED"),
-            "candidates": sum(1 for m, r in registry.items()
-                              if m.endswith("_improved") and r["status"] == "candidate"),
-            "eligible": sum(1 for m, r in registry.items()
-                            if m.endswith("_improved") and r["status"] == "eligible"),
-            "champions": sum(1 for r in registry.values() if r["status"] == "champion"),
+            # evidence: what the research system can stand behind
+            "experiments_completed": evidence(len(sealed)),
+            "hypotheses_researched": evidence(len(hyps)),
+            "hypotheses_rejected": evidence(sum(1 for h in hyps if h["status"] == "REJECTED")),
+            "candidates": evidence(sum(1 for m, r in registry.items()
+                                       if m.endswith("_improved") and r["status"] == "candidate")),
+            "eligible": evidence(sum(1 for m, r in registry.items()
+                                     if m.endswith("_improved") and r["status"] == "eligible")),
+            "champions": evidence(sum(1 for r in registry.values()
+                                      if r["status"] == "champion")),
         },
         "funnel": funnel(),
         "rejections": rejections(),
         "system": system(),
         "default_experiment": default,
-        "experiments_total": len(rows),
+        "experiments_total": evidence(len(rows)),
+        "runs_visible": len(visible(all_rows)),
         "population": population(),
         "as_of_utc": datetime.now(timezone.utc).isoformat(),
     }
@@ -1538,7 +1638,7 @@ def overview() -> dict:
 
 def default_experiment(rows: list[dict] | None = None) -> str | None:
     """The experiment the terminal opens on: champion, else newest sealed."""
-    rows = authoritative(rows if rows is not None else experiment_index())
+    rows = visible(rows if rows is not None else experiment_index())
     for r in rows:
         if r["registry_status"] == "champion":
             return r["id"]

@@ -10,6 +10,8 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -582,5 +584,83 @@ def test_an_unsealed_run_with_no_database_record_stays_visible(lab):
     q.clear_caches()
     rows = {r["id"]: r["authoritative"] for r in svc.experiment_index()}
     assert rows == {"E_NEW": True, "E_OLD": False, "E_RUNNING": None}
-    assert sorted(r["id"] for r in svc.authoritative()) == ["E_NEW", "E_RUNNING"]
     assert svc.population()["unrecorded"] == 1
+    # visible on screen...
+    assert sorted(r["id"] for r in svc.visible()) == ["E_NEW", "E_RUNNING"]
+    assert "E_RUNNING" in [e.get("experiment_id") for e in svc.activity()]
+    assert svc.system()["active_runs"]["running"] + svc.system()["active_runs"]["orphaned"] == 1
+    # ...but not evidence
+    assert [r["id"] for r in svc.authoritative()] == ["E_NEW"]
+    f, prog = svc.funnel(), svc.overview()["progress"]
+    assert f["experiments"] == 1
+    assert prog["experiments_completed"] == 1
+    assert prog["experiments_unsealed"] == 1  # operational count still sees it
+
+
+def test_authoritative_metrics_go_unavailable_when_the_database_is_gone(lab):
+    """Losing authority must not silently fall back to filesystem counts."""
+    _two_experiment_lab(lab)
+    (lab / "data" / "research.duckdb").unlink()
+    q.clear_caches()
+    assert svc.authority_available() is False
+    assert len(svc.visible()) == 2          # runs stay on screen
+    assert svc.authoritative() == []        # nothing can be vouched for
+    f = svc.funnel()
+    assert f["available"] is False
+    assert f["experiments"] is None and f["hypotheses"] is None and f["champions"] is None
+    o = svc.overview()
+    assert o["runs_visible"] == 2
+    assert o["experiments_total"] is None
+    assert o["progress"]["experiments_completed"] is None
+    assert o["progress"]["champions"] is None
+    assert o["progress"]["cycles_completed"] == 0   # operational, not evidence
+
+
+def test_a_stale_unsealed_directory_is_not_a_live_worker(lab):
+    """`run_experiment` makes the directory before any DB row, so an abandoned
+    run leaves one behind forever."""
+    _seal_experiment(lab, "E_CRASHED", prices=_prices(40), preds=[1, 0] * 20, sealed=False)
+    old = time.time() - 5 * 24 * 3600
+    d = lab / "data" / "experiments" / "E_CRASHED"
+    for f in list(d.iterdir()) + [d]:
+        os.utime(f, (old, old))
+    q.clear_caches()
+    states = {r["id"]: r["state"] for r in svc._in_flight()}
+    assert states == {"E_CRASHED": "ORPHANED"}
+    runs = svc.system()["active_runs"]
+    assert runs["running"] == 0 and runs["orphaned"] == 1
+    assert any("orphaned" in e for e in svc.system()["errors"])
+
+
+def test_champion_without_holdout_evidence_is_flagged_inconsistent(lab):
+    _seal_experiment(lab, "E_C1", prices=_prices(60), preds=[1, 0] * 30)
+    _register(lab, "E_C1", authoritative=True, status="champion")
+    bad = svc._lifecycle_inconsistencies()
+    assert [b["kind"] for b in bad] == ["CHAMPION_WITHOUT_HOLDOUT"]
+    assert any("no holdout_report.json" in e for e in svc.system()["errors"])
+
+
+def test_promotion_written_but_not_committed_is_flagged(lab):
+    """Crash between writing holdout_report.json and updating the registry."""
+    _seal_experiment(lab, "E_C2", prices=_prices(60), preds=[1, 0] * 30,
+                     holdout={"promoted": True, "holdout_accuracy": 0.7, "base_rate": 0.5,
+                              "n_holdout": 100, "economic_gate": {}})
+    _register(lab, "E_C2", authoritative=True, status="eligible")
+    bad = svc._lifecycle_inconsistencies()
+    assert [b["kind"] for b in bad] == ["PROMOTION_NOT_COMMITTED"]
+    assert svc.champions()["counts"]["champion"] == 0
+    assert any("did not finish" in e for e in svc.system()["errors"])
+
+
+def test_every_path_resolves_from_one_root(lab):
+    """DB, experiments, logs and snapshots must never straddle two roots —
+    the failure mode behind the curve-reproduction scare."""
+    paths = q.paths()
+    assert paths["root"] == lab
+    for key in ("db", "experiments", "logs", "processed", "datasets", "data"):
+        assert str(paths[key]).startswith(str(lab)), key
+    _seal_experiment(lab, "E_ROOT", prices=_prices(60), preds=[1, 0] * 30)
+    _register(lab, "E_ROOT", authoritative=True)
+    assert [r["id"] for r in svc.authoritative()] == ["E_ROOT"]
+    assert svc.curve("E_ROOT")["available"] is True
+    assert q.paths()["db"].exists()

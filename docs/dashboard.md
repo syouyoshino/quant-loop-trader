@@ -96,6 +96,31 @@ Nothing is hidden silently: `population` (`on_disk` / `authoritative` /
 `quarantined` / `unrecorded`) rides along on `/api/overview`,
 `/api/experiments` and the funnel panel.
 
+There are two populations, and they are not interchangeable:
+
+| helper | rule | used for |
+|---|---|---|
+| `visible()` | `true` or `null` | the table, activity feed, current experiment, active runs |
+| `authoritative()` | `true` only | every statistic: funnel, hypothesis tallies, pass rates, lifecycle counts, research progress |
+
+An in-flight run therefore appears on screen immediately and enters no evidence
+count until its record lands. If the database cannot be read at all,
+`authority_available()` is false: runs stay visible, and every evidence figure
+becomes `null` (rendered N/A) rather than falling back to a filesystem count.
+
+### Active runs are not workers
+
+`run_experiment` creates the experiment directory before it writes any database
+row, so an unsealed directory proves a process *started*, never that one is
+alive. `system.active_runs` classifies them instead: `running` (< 30 min old),
+`stale` (older, but a session heartbeat is fresh) and `orphaned` (older than a
+day, or no live session). Stale and orphaned runs are reported as errors.
+
+`system.lifecycle_inconsistencies` surfaces contradictions rather than
+rendering them as clean state: a registry champion with no `holdout_report.json`
+(`CHAMPION_WITHOUT_HOLDOUT`), and a promoted holdout whose registry row never
+moved (`PROMOTION_NOT_COMMITTED` — adjudication died mid-commit).
+
 `model_registry` has no `authoritative` column of its own, so candidate /
 eligible / champion counts join each `<experiment>_improved` model back onto its
 experiment record and drop the quarantined ones.
@@ -108,11 +133,15 @@ from it?"). They are not the same and the terminal shows both.
 ### Champion performance
 
 Leaderboard columns marked ʳ are the sealed **research test window**
-(`metrics.json`). The hidden holdout is a separate row: Quant Loop's
-`holdout_report.json` persists only the promotion verdict, accuracy, base rate,
-sample size and the economic gate (compounded net return, strategy and
-benchmark Sharpe), so holdout drawdown, volatility, Sortino, Calmar, VaR, ES and
-turnover are reported N/A rather than back-filled from research-window numbers.
+(`metrics.json`). The hidden holdout is a separate row read only from
+`holdout_report.json`, never back-filled from research-window numbers.
+
+Reports written before migration 006 carry just the economic gate (compounded
+net return, strategy and benchmark Sharpe); everything else shows N/A and
+`metrics_source` says `holdout_report.economic_gate`. Since 006 the adjudicator
+persists the full `evaluate()` output as `holdout_metrics`, so drawdown,
+volatility, Sortino, Calmar, VaR, ES, turnover and win rate come straight from
+the holdout with `metrics_source` = `holdout_report.holdout_metrics`.
 
 ### Cycles
 
