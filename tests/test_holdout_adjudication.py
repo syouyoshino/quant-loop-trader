@@ -9,7 +9,11 @@ import polars as pl
 import pytest
 
 from quant_loop_trader.experiment import run_experiment
-from quant_loop_trader.validation.holdout import adjudicate_holdout, apply_holdout
+from quant_loop_trader.validation.holdout import (
+    adjudicate_holdout,
+    apply_holdout,
+    release_holdout_claim,
+)
 
 
 def _make_eligible(isolated_research):
@@ -165,3 +169,56 @@ def test_holdout_rejection_corrects_provisional_success_memory(isolated_research
     assert mine, "memory row vanished (audit trail destroyed)"
     assert mine[0]["memory_type"] == "failure"
     assert "CORRECTED" in mine[0]["lesson"] or "holdout" in mine[0]["lesson"].lower()
+
+
+# --- F. the hidden holdout is consumable exactly once ------------------------
+
+def test_holdout_cannot_be_adjudicated_twice(isolated_research):
+    """`Evaluate an eligible model exactly once` has to survive a second call."""
+    exp_id, _ = _make_eligible(isolated_research)
+    first = adjudicate_holdout(exp_id)
+    assert "holdout_already_consumed" not in str(first.get("reason", ""))
+
+    import quant_loop_trader.data as dm
+    con = duckdb.connect(str(dm.DB_PATH))
+    con.execute("UPDATE model_registry SET status='eligible' WHERE model_id=?",
+                [f"{exp_id}_improved"])
+    con.close()
+    second = adjudicate_holdout(exp_id)
+    assert second["promoted"] is False
+    assert second["reason"].startswith("holdout_already_consumed")
+
+
+def test_crash_after_holdout_is_read_fails_closed(isolated_research):
+    """Simulate dying between claiming the holdout and committing the verdict:
+    the claim stays open and re-adjudication is refused until a human releases it."""
+    exp_id, _ = _make_eligible(isolated_research)
+    import quant_loop_trader.data as dm
+    con = duckdb.connect(str(dm.DB_PATH))
+    con.execute("INSERT INTO holdout_claims (experiment_id, state) VALUES (?, 'CLAIMED')",
+                [exp_id])
+    con.close()
+
+    blocked = adjudicate_holdout(exp_id)
+    assert blocked["promoted"] is False
+    assert blocked["reason"] == "holdout_already_consumed:CLAIMED"
+
+    assert release_holdout_claim(exp_id) == "released:CLAIMED"
+    assert release_holdout_claim(exp_id) == "no_claim"
+    recovered = adjudicate_holdout(exp_id)
+    assert "holdout_already_consumed" not in str(recovered.get("reason", ""))
+
+
+def test_full_holdout_metrics_are_persisted(isolated_research):
+    """The engine already computes the whole evaluate() object; keep it."""
+    exp_id, _ = _make_eligible(isolated_research)
+    result = adjudicate_holdout(exp_id)
+    if "adjudication_error" in str(result.get("reason", "")):
+        pytest.skip(f"adjudication failed upstream: {result['reason']}")
+    m = result["holdout_metrics"]
+    for key in ("max_drawdown_strategy", "volatility_strategy", "sortino_ratio",
+                "calmar_ratio", "var_95", "expected_shortfall_95", "turnover",
+                "win_rate", "n_return_buckets"):
+        assert key in m, key
+    assert m["cumulative_return_strategy"] == result["economic_gate"]["compounded_net_return"]
+    assert m["sharpe_strategy"] == result["economic_gate"]["sharpe_strategy"]

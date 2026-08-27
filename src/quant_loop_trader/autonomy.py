@@ -52,7 +52,13 @@ def _config_key(ticker: str, horizon: int, start: str, end: str, seed: int) -> s
 
 
 def _already_run(ticker: str, horizon: int, start: str, end: str, seed: int) -> bool:
-    """Recognise both canonical and pre-refactor experiment identities."""
+    """Has this config been explored with evidence we still stand behind?
+
+    Recognises both canonical and pre-refactor experiment identities, but only
+    authoritative improved records count. Quarantined evidence is invalid by
+    definition, so it must not exhaust the research frontier — otherwise the
+    scheduler reports "explored" for a config the science says is unexplored.
+    """
     migrate_db()
     fingerprint = _spec_fingerprint(ticker, horizon, start, end, seed)
     new_key = f"%{fingerprint[:8]}%"
@@ -60,8 +66,9 @@ def _already_run(ticker: str, horizon: int, start: str, end: str, seed: int) -> 
     fingerprint_json = f"%{fingerprint}%"
     con = duckdb.connect(str(DB_PATH))
     n = con.execute(
-        "SELECT count(*) FROM experiments WHERE experiment_id LIKE ? "
-        "OR experiment_id LIKE ? OR config_json LIKE ?",
+        "SELECT count(*) FROM experiments WHERE authoritative "
+        "AND experiment_id NOT LIKE '%_baseline' "
+        "AND (experiment_id LIKE ? OR experiment_id LIKE ? OR config_json LIKE ?)",
         [new_key, legacy_key, fingerprint_json],
     ).fetchone()[0]
     con.close()

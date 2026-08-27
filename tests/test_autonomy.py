@@ -50,3 +50,48 @@ def test_session_budget_respected_and_validates():
         vpath = EXP_ROOT / r["experiment_id"] / "validation.json"
         assert vpath.exists()
     assert summary["mode"] == "OBSERVATION"
+
+
+def test_quarantined_history_does_not_block_a_rerun():
+    """Quarantined evidence is invalid, so it must not exhaust the frontier.
+
+    Before this, the scheduler said "explored" for a config whose only evidence
+    the science layer had already thrown away."""
+    import duckdb
+
+    from quant_loop_trader.data import DB_PATH, migrate_db
+    from quant_loop_trader.experiment import EXP_ROOT
+
+    s1 = run_session(max_experiments=1)
+    assert s1["executed"] == 1
+    key = s1["results"][0]["experiment_id"]
+    cfg = json.loads((EXP_ROOT / key / "config.json").read_text())
+    args = ("SPY", 5, cfg["start"], cfg["end"], cfg["seed"])
+    assert _already_run(*args) is True          # authoritative evidence exists
+
+    migrate_db()
+    con = duckdb.connect(str(DB_PATH))
+    con.execute("UPDATE experiments SET authoritative=FALSE WHERE experiment_id LIKE ?",
+                [f"{key}%"])
+    con.close()
+    assert _already_run(*args) is False         # quarantined: unexplored again
+    assert any(c["start"] == cfg["start"] and c["end"] == cfg["end"]
+               and c["seed"] == cfg["seed"] for c in select_candidates("SPY", 5, budget=50))
+
+
+def test_baseline_records_alone_do_not_mark_a_config_explored():
+    import duckdb
+
+    from quant_loop_trader.data import DB_PATH, migrate_db
+    from quant_loop_trader.experiment import EXP_ROOT
+
+    s1 = run_session(max_experiments=1)
+    key = s1["results"][0]["experiment_id"]
+    cfg = json.loads((EXP_ROOT / key / "config.json").read_text())
+    migrate_db()
+    con = duckdb.connect(str(DB_PATH))
+    con.execute("UPDATE experiments SET authoritative=FALSE "
+                "WHERE experiment_id LIKE ? AND experiment_id NOT LIKE '%_baseline'",
+                [f"{key}%"])
+    con.close()
+    assert _already_run("SPY", 5, cfg["start"], cfg["end"], cfg["seed"]) is False

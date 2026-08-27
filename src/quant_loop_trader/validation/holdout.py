@@ -57,6 +57,10 @@ def adjudicate_holdout(experiment_id: str) -> dict:
     if not row or row[0] != "eligible":
         return {"promoted": False, "reason": f"not_eligible:{row[0] if row else 'missing'}"}
 
+    claim = _claim_holdout(experiment_id)
+    if claim is not None:
+        return claim
+
     h = cfg["horizon"]
     pq = bundle.dataset_snapshot
     fin = {}
@@ -103,6 +107,7 @@ def adjudicate_holdout(experiment_id: str) -> dict:
             "traceback_tail": traceback.format_exc()[-300:],
         }
         (exp_dir / "holdout_report.json").write_text(json.dumps(result, indent=2))
+        _close_holdout_claim(experiment_id, "FAILED", result)
         return result
 
     result = {
@@ -115,6 +120,9 @@ def adjudicate_holdout(experiment_id: str) -> dict:
             "sharpe_strategy": fin["sharpe_strategy"],
             "sharpe_benchmark": fin["sharpe_benchmark"],
         },
+        # the full evaluate() output on the hidden holdout — drawdown, Sortino,
+        # VaR, turnover and the rest were already computed and then discarded
+        "holdout_metrics": fin,
     }
     (exp_dir / "holdout_report.json").write_text(json.dumps(result, indent=2))
 
@@ -133,6 +141,8 @@ def adjudicate_holdout(experiment_id: str) -> dict:
     )
     con.close()
 
+    _close_holdout_claim(experiment_id, "COMPLETE", result)
+
     from quant_loop_trader.agents import _correct_success_memories_for
 
     if promoted:
@@ -140,6 +150,75 @@ def adjudicate_holdout(experiment_id: str) -> dict:
     else:
         _correct_success_memories_for(experiment_id)
     return result
+
+
+def _claim_holdout(experiment_id: str) -> dict | None:
+    """Take the one-shot lock before the holdout is exposed.
+
+    Returns None when the claim is ours, or the refusal to return otherwise.
+    A CLAIMED row with no COMPLETE means a previous attempt died after the
+    holdout was read: fail closed and require `release_holdout_claim`.
+    """
+    import duckdb
+
+    from quant_loop_trader.data import DB_PATH, migrate_db
+
+    migrate_db()
+    con = duckdb.connect(str(DB_PATH))
+    try:
+        prior = con.execute(
+            "SELECT state FROM holdout_claims WHERE experiment_id=?", [experiment_id]
+        ).fetchone()
+        if prior:
+            return {"promoted": False, "reason": f"holdout_already_consumed:{prior[0]}"}
+        con.execute(
+            "INSERT INTO holdout_claims (experiment_id, state) VALUES (?, 'CLAIMED')",
+            [experiment_id],
+        )
+    except duckdb.ConstraintException:  # a concurrent adjudication won the race
+        return {"promoted": False, "reason": "holdout_already_consumed:CLAIMED"}
+    finally:
+        con.close()
+    return None
+
+
+def _close_holdout_claim(experiment_id: str, state: str, result: dict) -> None:
+    import json
+
+    import duckdb
+
+    from quant_loop_trader.data import DB_PATH
+
+    con = duckdb.connect(str(DB_PATH))
+    con.execute(
+        "UPDATE holdout_claims SET state=?, completed_at=current_timestamp, "
+        "promoted=?, result_json=? WHERE experiment_id=?",
+        [state, bool(result.get("promoted")), json.dumps(result), experiment_id],
+    )
+    con.close()
+
+
+def release_holdout_claim(experiment_id: str) -> str:
+    """Explicit human recovery after a crash mid-adjudication.
+
+    Deliberately not called by any automated path: re-running a holdout is a
+    scientific decision, not a retry.
+    """
+    import duckdb
+
+    from quant_loop_trader.data import DB_PATH, migrate_db
+
+    migrate_db()
+    con = duckdb.connect(str(DB_PATH))
+    row = con.execute(
+        "SELECT state FROM holdout_claims WHERE experiment_id=?", [experiment_id]
+    ).fetchone()
+    if not row:
+        con.close()
+        return "no_claim"
+    con.execute("DELETE FROM holdout_claims WHERE experiment_id=?", [experiment_id])
+    con.close()
+    return f"released:{row[0]}"
 
 
 def _confirm_success_memory(experiment_id: str) -> None:
