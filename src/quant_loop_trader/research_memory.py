@@ -17,17 +17,25 @@ def _con(db_path=None):
     return _duckdb.connect(str(Path(db_path or _data.DB_PATH)))
 
 
-def search_memory(query: str, memory_type: str | None = None) -> list[dict]:
-    """Search past research by keyword. Returns rows newest-first."""
+def search_memory(query: str, memory_type: str | None = None,
+                  ticker: str | None = None, horizon: int | None = None) -> list[dict]:
+    """Search past research by keyword, optionally scoped to one evidence family."""
     con = _con()
     sql = "SELECT * FROM research_memory WHERE authoritative AND (hypothesis ILIKE ? OR lesson ILIKE ?)"
     params = [f"%{query}%", f"%{query}%"]
     if memory_type:
         sql += " AND memory_type = ?"
         params.append(memory_type)
+    if ticker:
+        sql += " AND upper(json_extract_string(provenance_json, '$.ticker')) = ?"
+        params.append(ticker.upper())
+    if horizon is not None:
+        sql += " AND CAST(json_extract(provenance_json, '$.horizon') AS INTEGER) = ?"
+        params.append(int(horizon))
     sql += " ORDER BY created_at DESC"
-    cols = [d[0] for d in con.execute(sql, params).description]
-    rows = con.execute(sql, params).fetchall()
+    cur = con.execute(sql, params)
+    cols = [d[0] for d in cur.description]
+    rows = cur.fetchall()
     con.close()
     return [dict(zip(cols, r)) for r in rows]
 
@@ -37,6 +45,9 @@ def record_outcome(report: dict) -> list[str]:
     decision = report["decision"]
     exp_id = report["experiment_id"]
     hypothesis = report["hypothesis"]
+    cfg = report.get("config") or {}
+    ticker = cfg.get("ticker")
+    horizon = cfg.get("horizon")
 
     if decision == "KEEP":
         # Keep the legacy memory_type for correction/confirmation machinery, but
@@ -46,22 +57,31 @@ def record_outcome(report: dict) -> list[str]:
             f"Provisional KEEP: {hypothesis} Passed the research split and "
             "predeclared screen; pending independent validation and hidden holdout."
         )
-        confidence = prior_confidence(hypothesis)
+        confidence = prior_confidence(hypothesis, ticker=ticker, horizon=horizon)
     elif decision == "IMPROVE":
         memory_type = "partial"
         lesson = "Partial: accuracy improved but Sharpe degraded. Refine risk control before retest."
-        confidence = prior_confidence(hypothesis)
+        confidence = prior_confidence(hypothesis, ticker=ticker, horizon=horizon)
     else:
         memory_type = "failure"
         lesson = (
             f"Rejected: {report['failure_condition']} Vol-interaction features "
             "did not change predictions materially."
         )
-        confidence = max(0.05, prior_confidence(hypothesis) - 0.2)
+        confidence = max(
+            0.05,
+            prior_confidence(hypothesis, ticker=ticker, horizon=horizon) - 0.2,
+        )
 
     autopsy = report.get("error_analysis", {})
     conditions = json.dumps({k: v for k, v in autopsy.items() if k.startswith("regime")})
     memory_id = f"mem_{exp_id}_{memory_type}"
+    provenance = json.dumps({
+        "branch": report.get("research_branch"),
+        "creator": report.get("creator_agent"),
+        "ticker": ticker,
+        "horizon": horizon,
+    })
     con = _con()
     con.execute(
         "INSERT OR REPLACE INTO research_memory VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'v1', current_timestamp, TRUE)",
@@ -79,10 +99,7 @@ def record_outcome(report: dict) -> list[str]:
                 "delta_acc": report.get("improvement_delta_accuracy"),
             }),
             confidence,
-            json.dumps({
-                "branch": report.get("research_branch"),
-                "creator": report.get("creator_agent"),
-            }),
+            provenance,
         ],
     )
 
@@ -93,7 +110,7 @@ def record_outcome(report: dict) -> list[str]:
             knowledge_id,
             exp_id,
             "model_knowledge",
-            f"Baseline regime performance for {report['config']['ticker']} {report['config']['horizon']}d",
+            f"Baseline regime performance for {ticker} {horizon}d",
             None,
             decision,
             (
@@ -103,7 +120,7 @@ def record_outcome(report: dict) -> list[str]:
             conditions,
             json.dumps(autopsy),
             0.6,
-            "{}",
+            provenance,
         ],
     )
     con.close()
@@ -111,21 +128,27 @@ def record_outcome(report: dict) -> list[str]:
         "event": "memory_recorded",
         "memory_id": memory_id,
         "confidence": confidence,
+        "ticker": ticker,
+        "horizon": horizon,
     }))
     return [memory_id, knowledge_id]
 
 
-def prior_confidence(hypothesis: str) -> float:
-    """Current belief in a hypothesis from accumulated evidence."""
-    rows = search_memory(hypothesis[:60])
+def prior_confidence(hypothesis: str, ticker: str | None = None,
+                     horizon: int | None = None) -> float:
+    """Current belief in a hypothesis from accumulated comparable evidence."""
+    rows = search_memory(hypothesis[:60], ticker=ticker, horizon=horizon)
     if not rows:
         return 0.5
     return float(rows[0]["confidence"])
 
 
-def duplicate_risk(hypothesis: str, max_rejects: int = 3) -> dict:
-    """Flag if similar hypothesis already failed repeatedly."""
-    fails = [r for r in search_memory(hypothesis[:60], memory_type="failure")]
+def duplicate_risk(hypothesis: str, max_rejects: int = 3,
+                   ticker: str | None = None, horizon: int | None = None) -> dict:
+    """Flag repeated failures only inside the same market/horizon evidence family."""
+    fails = search_memory(
+        hypothesis[:60], memory_type="failure", ticker=ticker, horizon=horizon
+    )
     return {"similar_failures": len(fails), "should_warn": len(fails) >= max_rejects}
 
 
@@ -139,7 +162,7 @@ def register_features(feature_defs: list[dict]) -> None:
                 f["feature_id"],
                 f["formula"],
                 f.get("creator", "feature_engineer_v0"),
-                f.get("data_dependencies", "SPY daily close"),
+                f.get("data_dependencies", "daily OHLCV"),
                 f.get("available_time_logic", "shift(1): uses data up to t-1"),
                 f.get("validation_status", "validated"),
                 "{}",
