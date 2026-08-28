@@ -15,6 +15,7 @@ import polars as pl
 
 from quant_loop_trader.experiment import EXP_ROOT
 from quant_loop_trader.features import add_improved_features, improved_feature_columns
+from quant_loop_trader.market import periods_per_year
 
 logger = logging.getLogger(__name__)
 
@@ -239,7 +240,12 @@ def independent_replication(experiment_id: str, tolerance: float = 1e-9) -> dict
 
     from quant_loop_trader.evaluation import evaluate as _evaluate
     rep_metrics = _evaluate(
-        yte, ypred, prob, test["close"].to_numpy(), horizon=cfg["horizon"]
+        yte,
+        ypred,
+        prob,
+        test["close"].to_numpy(),
+        horizon=cfg["horizon"],
+        ticker=cfg["ticker"],
     )
 
     claimed = report["improved_metrics"]
@@ -250,11 +256,15 @@ def independent_replication(experiment_id: str, tolerance: float = 1e-9) -> dict
         )
     for key in (
         "sharpe_strategy",
+        "sharpe_strategy_liquidated",
         "cumulative_return_strategy",
         "transaction_cost_adj_return",
+        "transaction_cost_adj_return_compounded",
         "max_drawdown_strategy",
         "brier_score",
     ):
+        if key not in claimed:
+            continue
         got_v, claim_v = rep_metrics[key], claimed[key]
         if abs(got_v - claim_v) > max(tolerance * 1000, 1e-9):
             issues.append(
@@ -338,20 +348,24 @@ def validate_experiment(experiment_id: str) -> dict:
 
         from quant_loop_trader.validation.multiple_testing import deflated_sharpe_ratio
         m_improved = bundle.metrics["improved"]
-        ppy = 252 / horizon
+        ppy = periods_per_year(ticker, horizon)
         n_buckets = int(m_improved.get("n_return_buckets", test.height))
         trial_sharpes_periodic = [
             s / np.sqrt(ppy)
             for s in _authoritative_trial_sharpes(ticker=ticker, horizon=horizon)
         ]
+        current_sharpe = m_improved.get(
+            "sharpe_strategy_liquidated", m_improved["sharpe_strategy"]
+        )
         dsr = deflated_sharpe_ratio(
-            m_improved["sharpe_strategy"] / np.sqrt(ppy),
+            current_sharpe / np.sqrt(ppy),
             n_obs=n_buckets,
             n_trials=trial_sharpes_periodic,
         )
         hardening["multiple_testing"] = {
             "n_trials": len(trial_sharpes_periodic),
             "n_return_buckets": n_buckets,
+            "periods_per_year": ppy,
             **dsr,
         }
         if dsr["verdict"] == "PROBABLY_LUCK":
@@ -457,7 +471,8 @@ def _authoritative_trial_sharpes(ticker: str | None = None,
     out = []
     for (mj,) in rows:
         try:
-            s_val = json.loads(mj).get("sharpe_strategy")
+            metrics = json.loads(mj)
+            s_val = metrics.get("sharpe_strategy_liquidated", metrics.get("sharpe_strategy"))
             if isinstance(s_val, (int, float)) and math.isfinite(s_val):
                 out.append(float(s_val))
         except Exception:
@@ -502,19 +517,25 @@ def _correct_success_memory(memory_id: str) -> None:
     migrate_db()
     con = duckdb.connect(str(DB_PATH))
     row = con.execute(
-        "SELECT confidence FROM research_memory WHERE memory_id=?", [memory_id]
+        "SELECT confidence, provenance_json FROM research_memory WHERE memory_id=?",
+        [memory_id],
     ).fetchone()
     if row is None:
         con.close()
         return
     new_conf = max(0.05, float(row[0]) - 0.2)
+    try:
+        provenance = json.loads(row[1]) if row[1] else {}
+    except (json.JSONDecodeError, TypeError):
+        provenance = {}
+    provenance["corrected_by"] = "validate_experiment"
     con.execute(
         "UPDATE research_memory SET memory_type='failure', lesson=?, confidence=?, "
         "provenance_json=? WHERE memory_id=?",
         [
             "CORRECTED: validation gate rejected this KEEP after promotion-time optimism.",
             new_conf,
-            json.dumps({"corrected_by": "validate_experiment"}),
+            json.dumps(provenance),
             memory_id,
         ],
     )
