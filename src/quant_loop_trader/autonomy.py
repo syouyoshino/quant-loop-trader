@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 import duckdb
 
 from quant_loop_trader.agents import validate_experiment
+from quant_loop_trader.core import PIPELINE_VERSION
 from quant_loop_trader.data import DB_PATH, migrate_db
 from quant_loop_trader.experiment import run_experiment
 from quant_loop_trader.research_memory import search_memory
@@ -37,7 +38,7 @@ def _spec_fingerprint(ticker: str, horizon: int, start: str, end: str, seed: int
         end=end,
         horizon=horizon,
         seed=seed,
-        pipeline_version=2,
+        pipeline_version=PIPELINE_VERSION,
     ).fingerprint()
 
 
@@ -83,13 +84,15 @@ def _frontier_remaining(ticker: str = "SPY", horizon: int = 5) -> int:
     )
 
 
-def review_memory() -> dict:
-    fails = search_memory("volatility regime")
+def review_memory(ticker: str = "SPY", horizon: int = 5) -> dict:
+    rows = search_memory("volatility regime", ticker=ticker, horizon=horizon)
     return {
-        "total_memory_rows": len(fails),
+        "ticker": ticker,
+        "horizon": horizon,
+        "total_memory_rows": len(rows),
         "recent_beliefs": [
             {"type": r["memory_type"], "confidence": r["confidence"]}
-            for r in fails[:3]
+            for r in rows[:3]
         ],
     }
 
@@ -157,7 +160,7 @@ def run_session(ticker: str = "SPY", horizon: int = 5,
 def _run_session_body(ticker: str, horizon: int, max_experiments: int,
                       validate: bool, root) -> dict:
     started = datetime.now(timezone.utc).isoformat()
-    memory_review = review_memory()
+    memory_review = review_memory(ticker, horizon)
     candidates = select_candidates(ticker, horizon, max_experiments)
 
     results = []

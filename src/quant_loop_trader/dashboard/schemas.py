@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
 
+from quant_loop_trader import market as _market
+
 NA = None  # JSON null == NOT AVAILABLE at the UI layer
 
 PASS = "PASS"
@@ -53,13 +55,18 @@ VALIDATION_TESTS = [
     ("paper_trading", "Paper trading"),
 ]
 
-# Market calendars. BTC would annualize on 365; SPY on the trading calendar.
-CRYPTO_SYMBOLS = {"BTC", "ETH", "BTCUSD", "ETHUSD", "BTC-USD", "ETH-USD", "BTCUSDT"}
-TRADING_DAYS = 252
-CRYPTO_DAYS = 365
-
-# 5 bps per position change — the same cost model evaluation.evaluate applies.
+# 5 bps per position change — the default cost model evaluation.evaluate applies.
 COST_PER_SIDE = 0.0005
+
+
+def calendar_days(ticker: str) -> int:
+    """Canonical market calendar, re-exported for dashboard callers."""
+    return _market.calendar_days(ticker)
+
+
+def periods_per_year(ticker: str, horizon: int) -> float:
+    """Canonical annualisation frequency, re-exported for dashboard callers."""
+    return _market.periods_per_year(ticker, horizon)
 
 
 @dataclass(frozen=True)
@@ -72,14 +79,6 @@ class Stage:
     def to_dict(self) -> dict:
         return {"key": self.key, "label": self.label,
                 "status": self.status, "detail": self.detail}
-
-
-def calendar_days(ticker: str) -> int:
-    return CRYPTO_DAYS if (ticker or "").upper() in CRYPTO_SYMBOLS else TRADING_DAYS
-
-
-def periods_per_year(ticker: str, horizon: int) -> float:
-    return calendar_days(ticker) / max(1, int(horizon))
 
 
 def clean(value):

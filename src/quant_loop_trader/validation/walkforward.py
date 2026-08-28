@@ -24,6 +24,23 @@ def make_folds(event_dates: list, n_folds: int = 4, min_train_frac: float = 0.5)
     return folds
 
 
+def _market_hint(event_dates: list, explicit_ticker: str | None) -> str:
+    """Preserve old callers while avoiding a silent 252-day assumption for 24/7 data.
+
+    Authoritative callers should pass the ticker. Legacy callers did not, so a
+    sufficiently long series containing weekend observations is treated as a
+    365-day market. This is intentionally conservative and only affects the
+    annualisation calendar; features, labels and fold boundaries are unchanged.
+    """
+    if explicit_ticker:
+        return explicit_ticker
+    if len(event_dates) >= 30:
+        weekend = sum(1 for d in event_dates if getattr(d, "weekday", lambda: -1)() >= 5)
+        if weekend / len(event_dates) >= 0.10:
+            return "BTCUSD"
+    return "SPY"
+
+
 class WalkForwardValidator:
     """Rolling validation over any PIT-clean frame with event_time/label/features."""
 
@@ -31,12 +48,14 @@ class WalkForwardValidator:
         self.model_builder = model_builder
         self.n_folds = n_folds
 
-    def run(self, df: pl.DataFrame, feature_cols: list[str], horizon: int = 1) -> dict:
+    def run(self, df: pl.DataFrame, feature_cols: list[str], horizon: int = 1,
+            ticker: str | None = None) -> dict:
         from quant_loop_trader.evaluation import evaluate
         import numpy as np
 
         df = df.sort("event_time")
         dates = df["event_time"].to_list()
+        market_ticker = _market_hint(dates, ticker)
         folds_spec = make_folds(dates, self.n_folds)
         results = []
         all_accs, all_bases = [], []
@@ -56,7 +75,9 @@ class WalkForwardValidator:
             except Exception:
                 prob = ypred.astype(float)
             prices = test["close"].to_numpy() if "close" in test.columns else np.array([])
-            metrics = evaluate(yte, ypred, prob, prices, horizon=horizon)  # real label horizon (audit QA2)
+            metrics = evaluate(
+                yte, ypred, prob, prices, horizon=horizon, ticker=market_ticker
+            )  # real label horizon + market calendar
             acc = metrics["accuracy"]
             # per-fold majority-class baseline (audit M2: 0.5 is not the bar)
             base_i = float(max(np.mean(yte), 1 - np.mean(yte)))
@@ -72,6 +93,7 @@ class WalkForwardValidator:
                 "fold_base_rate": base_i,
                 "beats_fold_baseline": bool(acc > base_i),
                 "n_validation": test.height,
+                "calendar_days": metrics["calendar_days"],
             }
             results.append(rec)
             all_accs.append(acc)
@@ -86,4 +108,5 @@ class WalkForwardValidator:
             "accuracy_dispersion": round(float(np.std(all_accs)), 4),
             "stable_across_time": bool(stable and all(b < a for a, b in zip(all_accs, all_bases))),
             "folds_beat_baseline": int(sum(1 for a, b in zip(all_accs, all_bases) if a > b)),
+            "market_ticker": market_ticker,
         }

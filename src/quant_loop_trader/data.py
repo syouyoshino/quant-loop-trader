@@ -12,6 +12,8 @@ import polars as pl
 import requests
 from dotenv import load_dotenv
 
+from quant_loop_trader.market import is_crypto
+
 load_dotenv()
 
 logger = logging.getLogger(__name__)
@@ -24,6 +26,7 @@ DB_PATH = ROOT / "data" / "research.duckdb"
 FIXTURE_PATH = ROOT / "tests" / "fixtures" / "SPY.csv"
 
 TIINGO_URL = "https://api.tiingo.com/tiingo/daily/{ticker}/prices"
+TIINGO_CRYPTO_URL = "https://api.tiingo.com/tiingo/crypto/prices"
 
 
 def _checksum_df(df: pl.DataFrame) -> str:
@@ -75,9 +78,7 @@ def migrate_db(db_path: Path | None = None) -> None:
     _MIGRATED.add(str(db_path))
 
 
-def _tiingo_fetch(ticker: str, start: str, end: str, api_key: str) -> list[dict]:
-    url = TIINGO_URL.format(ticker=ticker)
-    params = {"startDate": start, "endDate": end, "format": "json", "resampleFreq": "daily"}
+def _request_json(url: str, params: dict, api_key: str) -> list[dict]:
     headers = {"Authorization": f"Token {api_key}", "Content-Type": "application/json"}
     last_exc = None
     for attempt in range(3):
@@ -92,7 +93,10 @@ def _tiingo_fetch(ticker: str, start: str, end: str, api_key: str) -> list[dict]
                 time.sleep(wait)
                 continue
             r.raise_for_status()
-            return r.json()
+            payload = r.json()
+            if not isinstance(payload, list):
+                raise ValueError("Tiingo response was not a list")
+            return payload
         except Exception as e:
             last_exc = e
             if attempt < 2:
@@ -100,17 +104,35 @@ def _tiingo_fetch(ticker: str, start: str, end: str, api_key: str) -> list[dict]
     raise RuntimeError(f"Tiingo failed after retries: {last_exc}")
 
 
+def _tiingo_fetch(ticker: str, start: str, end: str, api_key: str) -> list[dict]:
+    if is_crypto(ticker):
+        params = {
+            "tickers": ticker.lower().replace("-", ""),
+            "startDate": start,
+            "endDate": end,
+            "resampleFreq": "1day",
+        }
+        return _request_json(TIINGO_CRYPTO_URL, params, api_key)
+    url = TIINGO_URL.format(ticker=ticker)
+    params = {"startDate": start, "endDate": end, "format": "json", "resampleFreq": "daily"}
+    return _request_json(url, params, api_key)
+
+
+def _empty_ohlcv(volume_dtype=pl.Float64) -> pl.DataFrame:
+    return pl.DataFrame(schema={
+        "event_time": pl.Date,
+        "available_time": pl.Date,
+        "open": pl.Float64,
+        "high": pl.Float64,
+        "low": pl.Float64,
+        "close": pl.Float64,
+        "volume": volume_dtype,
+    })
+
+
 def _parse_tiingo(rows: list[dict]) -> pl.DataFrame:
     if not rows:
-        return pl.DataFrame(schema={
-            "event_time": pl.Date,
-            "available_time": pl.Date,
-            "open": pl.Float64,
-            "high": pl.Float64,
-            "low": pl.Float64,
-            "close": pl.Float64,
-            "volume": pl.Int64,
-        })
+        return _empty_ohlcv(pl.Int64)
     df = pl.DataFrame(rows)
     has_adj = "adjClose" in df.columns
     prefix = "adj" if has_adj else ""
@@ -131,6 +153,30 @@ def _parse_tiingo(rows: list[dict]) -> pl.DataFrame:
     return df.sort("event_time")
 
 
+def _parse_tiingo_crypto(rows: list[dict], ticker: str) -> pl.DataFrame:
+    """Flatten Tiingo crypto pair metadata + nested priceData into PIT daily OHLCV."""
+    if not rows:
+        return _empty_ohlcv()
+    wanted = ticker.lower().replace("-", "")
+    pair = next((r for r in rows if str(r.get("ticker", "")).lower() == wanted), rows[0])
+    price_data = pair.get("priceData") or []
+    if not isinstance(price_data, list) or not price_data:
+        return _empty_ohlcv()
+    df = pl.DataFrame(price_data).select(
+        pl.col("date").str.strptime(pl.Datetime, "%Y-%m-%dT%H:%M:%S%.fZ", strict=False).alias("event_time"),
+        pl.col("open").cast(pl.Float64),
+        pl.col("high").cast(pl.Float64),
+        pl.col("low").cast(pl.Float64),
+        pl.col("close").cast(pl.Float64),
+        pl.col("volume").cast(pl.Float64),
+    )
+    df = df.with_columns(
+        pl.col("event_time").dt.date().alias("event_time"),
+        pl.col("event_time").dt.date().alias("available_time"),
+    )
+    return df.unique(subset=["event_time"], keep="last").sort("event_time")
+
+
 def _load_fixture() -> pl.DataFrame | None:
     if FIXTURE_PATH.exists():
         df = pl.read_csv(str(FIXTURE_PATH), try_parse_dates=True)
@@ -147,6 +193,7 @@ def fetch_ohlcv(ticker: str = "SPY", start: str = "2018-01-01", end: str = "2024
                 use_cache: bool = True) -> tuple[pl.DataFrame, str]:
     """Fetch OHLCV with PIT columns. Returns (df, actual_source)."""
     PROC_DIR.mkdir(parents=True, exist_ok=True)
+    ticker = ticker.upper()
     parquet_path = PROC_DIR / f"{ticker}.parquet"
 
     if use_cache and parquet_path.exists():
@@ -163,28 +210,31 @@ def fetch_ohlcv(ticker: str = "SPY", start: str = "2018-01-01", end: str = "2024
                         (pl.col("event_time") >= pl.lit(s))
                         & (pl.col("event_time") <= pl.lit(e))
                     )
+                    gap_check(df, ticker=ticker)
                     logger.info(json.dumps({"event": "cache_hit_parquet", "ticker": ticker, "rows": df.height}))
                     return df, "cache"
         except Exception:
-            pass
+            if is_crypto(ticker):
+                raise
 
     api_key = os.getenv("TIINGO_API_KEY", "").strip()
     if api_key:
         try:
             rows = _tiingo_fetch(ticker, start, end, api_key)
-            df = _parse_tiingo(rows)
+            df = _parse_tiingo_crypto(rows, ticker) if is_crypto(ticker) else _parse_tiingo(rows)
             if df.height == 0:
                 raise ValueError("Tiingo returned 0 rows")
-            gap_check(df)
+            gap_check(df, ticker=ticker)
             save_parquet(df, parquet_path)
-            logger.info(json.dumps({"event": "tiingo_fetch_ok", "ticker": ticker, "rows": df.height}))
-            return df, "tiingo"
+            source = "tiingo_crypto" if is_crypto(ticker) else "tiingo_eod"
+            logger.info(json.dumps({"event": "tiingo_fetch_ok", "ticker": ticker, "rows": df.height, "source": source}))
+            return df, source
         except Exception as e:
             logger.warning(json.dumps({"event": "tiingo_failed_fallback_fixture", "error": str(e)[:200]}))
 
     if api_key:
         raise RuntimeError("Tiingo failed and fixture fallback is forbidden while TIINGO_API_KEY is set")
-    if ticker.upper() != "SPY":
+    if ticker != "SPY":
         raise ValueError(f"fixture fallback only covers SPY; no data source available for {ticker}")
     fixture = _load_fixture()
     if fixture is not None:
@@ -199,13 +249,17 @@ def fetch_ohlcv(ticker: str = "SPY", start: str = "2018-01-01", end: str = "2024
     raise FileNotFoundError("No Tiingo key and no fixture at tests/fixtures/SPY.csv — cannot fetch data")
 
 
-def gap_check(df: pl.DataFrame) -> None:
+def gap_check(df: pl.DataFrame, ticker: str = "SPY") -> None:
     if df.height < 2:
         return
     diffs = df.select((pl.col("event_time").diff().dt.total_days()).alias("gap")).drop_nulls()
     max_gap = diffs["gap"].max()
-    if max_gap is not None and max_gap > 7:
-        logger.warning(json.dumps({"event": "large_gap_detected", "max_gap_days": int(max_gap)}))
+    if max_gap is None:
+        return
+    if is_crypto(ticker) and max_gap > 1:
+        raise ValueError(f"crypto_calendar_gap:{ticker}:max_gap_days={int(max_gap)}")
+    if not is_crypto(ticker) and max_gap > 7:
+        logger.warning(json.dumps({"event": "large_gap_detected", "ticker": ticker, "max_gap_days": int(max_gap)}))
 
 
 def save_parquet(df: pl.DataFrame, path: Path) -> str:

@@ -14,6 +14,7 @@ import duckdb
 import numpy as np
 import polars as pl
 
+from quant_loop_trader.core import PIPELINE_VERSION
 from quant_loop_trader.data import (
     DB_PATH,
     PROC_DIR,
@@ -29,6 +30,7 @@ from quant_loop_trader.features import (
     feature_columns,
     improved_feature_columns,
 )
+from quant_loop_trader.market import calendar_days, campaign_holdout_start
 from quant_loop_trader.replay import ReplayEngine
 from quant_loop_trader.research_memory import (
     duplicate_risk,
@@ -74,7 +76,7 @@ def build_train_test(ticker: str, start: str, end: str, horizon: int, feature_fn
     df = ReplayEngine(pq, ticker=ticker).get_snapshot(ticker, end)
     df = df.filter(pl.col("event_time") >= pl.lit(start).str.strptime(pl.Date, "%Y-%m-%d"))
     from quant_loop_trader.validation.holdout import apply_holdout
-    df = apply_holdout(df, start, end, use_holdout=False)
+    df = apply_holdout(df, start, end, use_holdout=False, ticker=ticker)
     df = make_labels(df, horizon)
     df_clean = feature_fn(df).drop_nulls(subset=feat_cols + ["label"])
     if df_clean.height < 100:
@@ -84,7 +86,7 @@ def build_train_test(ticker: str, start: str, end: str, horizon: int, feature_fn
 
 
 def train_evaluate_from(train: pl.DataFrame, test: pl.DataFrame, feat_cols: list[str],
-                        horizon: int, seed: int) -> dict:
+                        horizon: int, seed: int, ticker: str = "SPY") -> dict:
     """Train on prebuilt frames and evaluate the hidden research test split."""
     from quant_loop_trader.models.registry import build_model
 
@@ -107,7 +109,7 @@ def train_evaluate_from(train: pl.DataFrame, test: pl.DataFrame, feat_cols: list
     except Exception:
         y_prob = y_pred.astype(float)
 
-    metrics = evaluate(y_test, y_pred, y_prob, prices_test, horizon)
+    metrics = evaluate(y_test, y_pred, y_prob, prices_test, horizon, ticker=ticker)
     # ONE significance implementation. This p-value is also the candidate-family
     # FDR input, so it must use the same non-overlapping one-sided test everywhere.
     from quant_loop_trader.core import significance
@@ -134,11 +136,8 @@ def train_evaluate_from(train: pl.DataFrame, test: pl.DataFrame, feat_cols: list
     }
 
 
-_PIPELINE_REVISION = 2
-
-
 def _pipeline_version() -> int:
-    return _PIPELINE_REVISION
+    return PIPELINE_VERSION
 
 
 def _code_version() -> str:
@@ -166,6 +165,7 @@ def run_experiment(ticker: str = "SPY", horizon: int = 5,
     """
     from quant_loop_trader.core import ExperimentSpec
 
+    ticker = ticker.upper()
     spec = ExperimentSpec(
         ticker=ticker,
         start=start,
@@ -213,13 +213,15 @@ def run_experiment(ticker: str = "SPY", horizon: int = 5,
     train_b, test_b = build_train_test(
         ticker, start, end, horizon, add_features, feature_columns(), snap_path
     )
-    baseline = train_evaluate_from(train_b, test_b, feature_columns(), horizon, seed)
+    baseline = train_evaluate_from(
+        train_b, test_b, feature_columns(), horizon, seed, ticker=ticker
+    )
     train_i, test_i = build_train_test(
         ticker, start, end, horizon, add_improved_features,
         improved_feature_columns(), snap_path
     )
     improved = train_evaluate_from(
-        train_i, test_i, improved_feature_columns(), horizon, seed
+        train_i, test_i, improved_feature_columns(), horizon, seed, ticker=ticker
     )
 
     periods = {
@@ -231,8 +233,8 @@ def run_experiment(ticker: str = "SPY", horizon: int = 5,
 
     b_acc = baseline["metrics"]["accuracy"]
     i_acc = improved["metrics"]["accuracy"]
-    b_sharpe = baseline["metrics"]["sharpe_strategy"]
-    i_sharpe = improved["metrics"]["sharpe_strategy"]
+    b_sharpe = baseline["metrics"].get("sharpe_strategy_liquidated", baseline["metrics"]["sharpe_strategy"])
+    i_sharpe = improved["metrics"].get("sharpe_strategy_liquidated", improved["metrics"]["sharpe_strategy"])
     improvement = i_acc - b_acc
     if i_acc > b_acc and i_sharpe >= b_sharpe:
         decision = "KEEP"
@@ -254,12 +256,14 @@ def run_experiment(ticker: str = "SPY", horizon: int = 5,
         f"Does volatility regime filtering improve {horizon}-day directional "
         f"prediction for {ticker}?"
     )
-    dup = duplicate_risk(hypothesis)
+    dup = duplicate_risk(hypothesis, ticker=ticker, horizon=horizon)
     if dup["should_warn"]:
         logger.warning(json.dumps({
             "event": "duplicate_risk",
             "similar_failures": dup["similar_failures"],
             "hypothesis": hypothesis[:60],
+            "ticker": ticker,
+            "horizon": horizon,
         }))
 
     config = {
@@ -270,6 +274,8 @@ def run_experiment(ticker: str = "SPY", horizon: int = 5,
         "start": start,
         "end": end,
         "seed": seed,
+        "calendar_days": calendar_days(ticker),
+        "campaign_holdout_start": campaign_holdout_start(ticker),
         "dataset_id": meta["dataset_id"],
         "feature_version_baseline": "v1-ret1-ret5-ma10-vol10-rsi14",
         "feature_version_improved": "v1+vol_regime_ret5_x_vol10",
@@ -290,9 +296,9 @@ def run_experiment(ticker: str = "SPY", horizon: int = 5,
             f"time-split 70/30, LogisticRegression, features baseline "
             f"{feature_columns()} vs improved {improved_feature_columns()}"
         ),
-        "expected_outcome": "improved accuracy +0.02 and Sharpe non-degrading",
-        "success_criteria": "improved accuracy > baseline and Sharpe >= baseline",
-        "failure_condition": "no accuracy lift or Sharpe degrades",
+        "expected_outcome": "improved accuracy +0.02 and liquidated Sharpe non-degrading",
+        "success_criteria": "improved accuracy > baseline and liquidated Sharpe >= baseline",
+        "failure_condition": "no accuracy lift or liquidated Sharpe degrades",
         "dataset_version": meta["version"],
         "dataset_id": meta["dataset_id"],
         "snapshot_definition": meta["snapshot_definition"],
@@ -318,7 +324,8 @@ def run_experiment(ticker: str = "SPY", horizon: int = 5,
             "benchmark": improved["metrics"]["volatility_benchmark"],
         },
         "drawdown": {"strategy": improved["metrics"]["max_drawdown_strategy"]},
-        "transaction_cost_adjusted_result": improved["metrics"]["transaction_cost_adj_return"],
+        "transaction_cost_adjusted_result": improved["metrics"]["transaction_cost_adj_return_compounded"],
+        "cost_sensitivity_compounded": improved["metrics"]["cost_sensitivity_compounded"],
         "error_analysis": baseline["error_analysis"],
         "improved_error_analysis": improved["error_analysis"],
         "root_cause_analysis": (

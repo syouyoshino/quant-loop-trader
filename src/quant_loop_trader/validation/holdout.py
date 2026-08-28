@@ -9,6 +9,7 @@ from pathlib import Path
 import numpy as np
 
 from quant_loop_trader.features import improved_feature_columns
+from quant_loop_trader.market import campaign_holdout_start
 
 HOLDOUT_FRACTION = 0.15
 
@@ -17,17 +18,22 @@ class HoldoutIntegrityError(RuntimeError):
     """Raised when final holdout evidence is missing, inconsistent, or tampered."""
 
 
-def holdout_boundary(start: str, end: str) -> str:
+def holdout_boundary(start: str, end: str, ticker: str | None = None) -> str:
+    """Return the immutable campaign boundary when configured, else legacy 15%."""
+    fixed = campaign_holdout_start(ticker)
+    if fixed:
+        return fixed
     s = datetime.fromisoformat(start)
     e = datetime.fromisoformat(end)
     days = int((e - s).days * HOLDOUT_FRACTION)
     return (e - __import__("datetime").timedelta(days=days)).date().isoformat()
 
 
-def apply_holdout(df, start: str, end: str, use_holdout: bool):
+def apply_holdout(df, start: str, end: str, use_holdout: bool,
+                  ticker: str | None = None):
     import polars as pl
 
-    b = pl.lit(holdout_boundary(start, end)).str.strptime(pl.Date, "%Y-%m-%d")
+    b = pl.lit(holdout_boundary(start, end, ticker=ticker)).str.strptime(pl.Date, "%Y-%m-%d")
     if use_holdout:
         return df.filter(pl.col("event_time") >= b)
     return df.filter(pl.col("event_time") < b)
@@ -62,6 +68,9 @@ def _seal_holdout_evidence(experiment_id: str, bundle, result: dict) -> None:
         "holdout_report_sha256": _sha(report_path),
         "research_lock_sha256": _sha(research_lock_path),
         "dataset_snapshot_sha256": _sha(bundle.dataset_snapshot),
+        "holdout_boundary": holdout_boundary(
+            bundle.config["start"], bundle.config["end"], ticker=bundle.config.get("ticker")
+        ),
         "sealed_at": datetime.now(timezone.utc).isoformat(),
     }
     _atomic_json(exp_dir / "holdout.lock", seal)
@@ -103,6 +112,11 @@ def verify_holdout_evidence(experiment_id: str, exp_root: Path | None = None) ->
         bundle = ExperimentBundle.open_verified(experiment_id, root)
         if seal.get("dataset_snapshot_sha256") != _sha(bundle.dataset_snapshot):
             issues.append("dataset_snapshot_mismatch")
+        expected_boundary = holdout_boundary(
+            bundle.config["start"], bundle.config["end"], ticker=bundle.config.get("ticker")
+        )
+        if seal.get("holdout_boundary") not in {None, expected_boundary}:
+            issues.append("holdout_boundary_mismatch")
     except BundleIntegrityError as exc:
         issues.append(f"research_bundle_invalid:{str(exc)[:120]}")
 
@@ -137,9 +151,24 @@ def verify_holdout_evidence(experiment_id: str, exp_root: Path | None = None) ->
         issues.append(f"promoted_without_champion_registry:{status or 'missing'}")
     if not result.get("promoted") and status == "champion":
         issues.append("champion_registry_without_promoted_holdout")
+    if claim and claim[0] == "FAILED" and status not in {"rejected", None}:
+        issues.append(f"failed_holdout_not_fail_closed:{status}")
     if issues:
         raise HoldoutIntegrityError(";".join(issues))
     return result
+
+
+def _holdout_window_ready(cfg: dict) -> tuple[bool, str]:
+    boundary = datetime.fromisoformat(
+        holdout_boundary(cfg["start"], cfg["end"], ticker=cfg.get("ticker"))
+    )
+    end = datetime.fromisoformat(cfg["end"])
+    min_days = max(30, int(cfg["horizon"]) * 10)
+    if end <= boundary:
+        return False, "holdout_not_in_experiment_window"
+    if (end - boundary).days < min_days:
+        return False, f"holdout_window_too_short:{(end - boundary).days}d<{min_days}d"
+    return True, "ready"
 
 
 def adjudicate_holdout(experiment_id: str) -> dict:
@@ -168,6 +197,16 @@ def adjudicate_holdout(experiment_id: str) -> dict:
     if not row or row[0] != "eligible":
         return {"promoted": False, "reason": f"not_eligible:{row[0] if row else 'missing'}"}
 
+    ready, reason = _holdout_window_ready(cfg)
+    if not ready:
+        return {
+            "promoted": False,
+            "reason": reason,
+            "holdout_boundary": holdout_boundary(
+                cfg["start"], cfg["end"], ticker=cfg.get("ticker")
+            ),
+        }
+
     claim = _claim_holdout(experiment_id)
     if claim is not None:
         return claim
@@ -179,6 +218,8 @@ def adjudicate_holdout(experiment_id: str) -> dict:
         df = _load_holdout_frame(pq, cfg)
         cols = improved_feature_columns()
         feats = df.select(cols + ["label", "close"])
+        if feats.height < max(20, h * 10):
+            raise ValueError(f"holdout_sample_too_small:{feats.height}")
         Xte = feats.select(cols).to_numpy()
         yte = feats["label"].to_numpy()
         Xtr, ytr = _train_all_nonholdout(pq, cfg)
@@ -195,11 +236,15 @@ def adjudicate_holdout(experiment_id: str) -> dict:
             prob = model.predict_proba(Xte)
         except Exception:
             prob = ypred.astype(float)
-        fin = evaluate(yte, ypred, prob, prices_h, horizon=h)
+        fin = evaluate(
+            yte, ypred, prob, prices_h, horizon=h, ticker=cfg.get("ticker", "SPY")
+        )
+        stress_25 = float(fin.get("cost_sensitivity_compounded", {}).get("25", -1.0))
         economic_gate = (
             fin.get("cumulative_return_strategy_liquidated", fin["cumulative_return_strategy"]) > 0
             and fin.get("sharpe_strategy_liquidated", fin["sharpe_strategy"])
             >= fin["sharpe_benchmark"]
+            and stress_25 > 0
         )
 
         from quant_loop_trader.core import significance
@@ -215,20 +260,29 @@ def adjudicate_holdout(experiment_id: str) -> dict:
         result = _canonical_json({
             "promoted": False,
             "reason": f"adjudication_error:{str(exc)[:150]}",
+            "holdout_boundary": holdout_boundary(
+                cfg["start"], cfg["end"], ticker=cfg.get("ticker")
+            ),
             "economic_gate": fin or None,
             "traceback_tail": traceback.format_exc()[-300:],
         })
         try:
             _seal_holdout_evidence(experiment_id, bundle, result)
-            _commit_holdout_outcome(experiment_id, "FAILED", result)
+            _commit_holdout_outcome(
+                experiment_id, "FAILED", result, new_status="rejected"
+            )
         except Exception as commit_exc:
             logger.error(f"failed to commit holdout failure evidence: {commit_exc}")
         return result
 
     liq_return = fin.get("cumulative_return_strategy_liquidated", fin["cumulative_return_strategy"])
     liq_sharpe = fin.get("sharpe_strategy_liquidated", fin["sharpe_strategy"])
+    stress_25 = float(fin.get("cost_sensitivity_compounded", {}).get("25", -1.0))
     result = _canonical_json({
         "promoted": promoted,
+        "holdout_boundary": holdout_boundary(
+            cfg["start"], cfg["end"], ticker=cfg.get("ticker")
+        ),
         "holdout_accuracy": acc,
         "base_rate": base,
         "n_holdout": int(len(yte)),
@@ -236,6 +290,8 @@ def adjudicate_holdout(experiment_id: str) -> dict:
             "compounded_net_return": liq_return,
             "sharpe_strategy": liq_sharpe,
             "sharpe_benchmark": fin["sharpe_benchmark"],
+            "cost_25bps_compounded_return": stress_25,
+            "cost_stress_pass": stress_25 > 0,
             "liquidated_at_end": True,
         },
         "holdout_metrics": fin,
@@ -360,15 +416,26 @@ def _confirm_success_memory(experiment_id: str) -> None:
 
     migrate_db()
     con = duckdb.connect(str(DB_PATH))
-    con.execute(
-        "UPDATE research_memory SET lesson=?, confidence=LEAST(confidence + 0.15, 0.95), "
-        "provenance_json=? WHERE experiment_id=? AND memory_type='success'",
-        [
-            "CONFIRMED by final hidden-holdout adjudication.",
-            json.dumps({"confirmed_by": "adjudicate_holdout"}),
-            experiment_id,
-        ],
-    )
+    rows = con.execute(
+        "SELECT memory_id, provenance_json FROM research_memory "
+        "WHERE experiment_id=? AND memory_type='success'",
+        [experiment_id],
+    ).fetchall()
+    for memory_id, raw_provenance in rows:
+        try:
+            provenance = json.loads(raw_provenance) if raw_provenance else {}
+        except (json.JSONDecodeError, TypeError):
+            provenance = {}
+        provenance["confirmed_by"] = "adjudicate_holdout"
+        con.execute(
+            "UPDATE research_memory SET lesson=?, confidence=LEAST(confidence + 0.15, 0.95), "
+            "provenance_json=? WHERE memory_id=?",
+            [
+                "CONFIRMED by final hidden-holdout adjudication.",
+                json.dumps(provenance),
+                memory_id,
+            ],
+        )
     con.close()
 
 
@@ -385,7 +452,9 @@ def _load_holdout_frame(pq, cfg):
         pl.col("event_time") >= pl.lit(cfg["start"]).str.strptime(pl.Date, "%Y-%m-%d")
     )
     featured = add_improved_features(make_labels(df, cfg["horizon"]))
-    hold = apply_holdout(featured, cfg["start"], cfg["end"], use_holdout=True)
+    hold = apply_holdout(
+        featured, cfg["start"], cfg["end"], use_holdout=True, ticker=cfg["ticker"]
+    )
     return hold.drop_nulls(subset=improved_feature_columns() + ["label"])
 
 
@@ -401,7 +470,9 @@ def _train_all_nonholdout(pq, cfg):
         pl.col("event_time") >= pl.lit(cfg["start"]).str.strptime(pl.Date, "%Y-%m-%d")
     )
     featured = add_improved_features(make_labels(df, cfg["horizon"]))
-    clean = apply_holdout(featured, cfg["start"], cfg["end"], use_holdout=False)
+    clean = apply_holdout(
+        featured, cfg["start"], cfg["end"], use_holdout=False, ticker=cfg["ticker"]
+    )
     clean = clean.sort("event_time").slice(0, max(0, clean.height - cfg["horizon"]))
     clean = clean.drop_nulls(subset=improved_feature_columns() + ["label"])
     return clean.select(improved_feature_columns()).to_numpy(), clean["label"].to_numpy()
