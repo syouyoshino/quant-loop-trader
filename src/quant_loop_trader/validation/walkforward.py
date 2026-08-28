@@ -31,7 +31,8 @@ class WalkForwardValidator:
         self.model_builder = model_builder
         self.n_folds = n_folds
 
-    def run(self, df: pl.DataFrame, feature_cols: list[str], horizon: int = 1) -> dict:
+    def run(self, df: pl.DataFrame, feature_cols: list[str], horizon: int = 1,
+            ticker: str = "SPY") -> dict:
         from quant_loop_trader.evaluation import evaluate
         import numpy as np
 
@@ -56,7 +57,9 @@ class WalkForwardValidator:
             except Exception:
                 prob = ypred.astype(float)
             prices = test["close"].to_numpy() if "close" in test.columns else np.array([])
-            metrics = evaluate(yte, ypred, prob, prices, horizon=horizon)  # real label horizon (audit QA2)
+            metrics = evaluate(
+                yte, ypred, prob, prices, horizon=horizon, ticker=ticker
+            )  # real label horizon + market calendar
             acc = metrics["accuracy"]
             # per-fold majority-class baseline (audit M2: 0.5 is not the bar)
             base_i = float(max(np.mean(yte), 1 - np.mean(yte)))
@@ -72,6 +75,7 @@ class WalkForwardValidator:
                 "fold_base_rate": base_i,
                 "beats_fold_baseline": bool(acc > base_i),
                 "n_validation": test.height,
+                "calendar_days": metrics["calendar_days"],
             }
             results.append(rec)
             all_accs.append(acc)
