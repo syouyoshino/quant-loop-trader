@@ -84,7 +84,7 @@ def _frontier_remaining(ticker: str = "SPY", horizon: int = 5) -> int:
     )
 
 
-def review_memory(ticker: str, horizon: int) -> dict:
+def review_memory(ticker: str = "SPY", horizon: int = 5) -> dict:
     rows = search_memory("volatility regime", ticker=ticker, horizon=horizon)
     return {
         "ticker": ticker,
