@@ -11,13 +11,7 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
 
-from quant_loop_trader.market import (
-    CRYPTO_DAYS,
-    CRYPTO_SYMBOLS,
-    TRADING_DAYS,
-    calendar_days,
-    periods_per_year,
-)
+from quant_loop_trader import market as _market
 
 NA = None  # JSON null == NOT AVAILABLE at the UI layer
 
@@ -63,6 +57,16 @@ VALIDATION_TESTS = [
 
 # 5 bps per position change — the default cost model evaluation.evaluate applies.
 COST_PER_SIDE = 0.0005
+
+
+def calendar_days(ticker: str) -> int:
+    """Canonical market calendar, re-exported for dashboard callers."""
+    return _market.calendar_days(ticker)
+
+
+def periods_per_year(ticker: str, horizon: int) -> float:
+    """Canonical annualisation frequency, re-exported for dashboard callers."""
+    return _market.periods_per_year(ticker, horizon)
 
 
 @dataclass(frozen=True)
