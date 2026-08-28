@@ -30,6 +30,7 @@ const state = {
   filters: {},
   perf: null,
   risk: null,
+  marketTicker: null,
 };
 
 const RATE = {
@@ -73,7 +74,8 @@ async function boot() {
   poll('activity', () => api.activity(120), RATE.activity, (d) => renderActivity(el('activity'), d.events));
   poll('champions', () => api.champions(), RATE.champions,
     (d) => renderChampions(el('champions'), d, select));
-  poll('market', () => api.market('SPY'), RATE.market, (m) => renderMarket(el('market'), m));
+  poll('market', () => api.market(state.marketTicker || 'SPY'), RATE.market,
+    (m) => renderMarket(el('market'), m));
   startSelectionStreams();
   wireControls();
 }
@@ -108,6 +110,11 @@ function startSelectionStreams() {
   }
   poll('performance', () => api.performance(id, state.variant), RATE.performance, (d) => {
     state.perf = d;
+    const ticker = d.metrics && d.metrics.ticker;
+    if (ticker && ticker !== state.marketTicker) {
+      state.marketTicker = ticker;
+      api.market(ticker).then((m) => renderMarket(el('market'), m)).catch(() => {});
+    }
     paintCharts();
     renderTrades('trades-chart', d.curve.available ? d.curve.points : null);
     renderMetrics(el('metrics'), d.metrics, d.baseline_metrics);
