@@ -1,3 +1,4 @@
+from datetime import date, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -13,6 +14,7 @@ from quant_loop_trader.validation.holdout import (
     _holdout_window_ready,
     holdout_boundary,
 )
+from quant_loop_trader.validation.walkforward import _market_hint
 
 
 def test_tiingo_crypto_routes_to_crypto_endpoint(monkeypatch):
@@ -90,6 +92,12 @@ def test_crypto_calendar_is_canonical_365():
     assert calendar_days("BTCUSD") == 365
     assert periods_per_year("BTCUSD", 5) == 73
     assert calendar_days("SPY") == 252
+
+
+def test_walkforward_legacy_caller_detects_24_7_calendar():
+    dates = [date(2024, 1, 1) + timedelta(days=i) for i in range(45)]
+    assert _market_hint(dates, None) == "BTCUSD"
+    assert _market_hint(dates, "SPY") == "SPY"
 
 
 def test_evaluation_uses_crypto_calendar_and_cost_stress():
