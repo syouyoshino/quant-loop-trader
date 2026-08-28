@@ -10,7 +10,12 @@ import math
 import numpy as np
 from sklearn.metrics import accuracy_score, precision_score, recall_score, brier_score_loss
 
+from quant_loop_trader.market import calendar_days, periods_per_year
+
 logger = logging.getLogger(__name__)
+
+DEFAULT_COST_PER_SIDE = 0.0005
+COST_SENSITIVITY_BPS = (5, 10, 25, 50)
 
 
 def time_split(df: pl.DataFrame, train_ratio: float = 0.7, purge: int = 0) -> tuple[pl.DataFrame, pl.DataFrame]:
@@ -72,12 +77,40 @@ def _trade_quality(strat_rets: np.ndarray) -> dict:
     }
 
 
-def evaluate(y_true: np.ndarray, y_pred: np.ndarray, y_prob: np.ndarray, prices: np.ndarray, horizon: int = 1) -> dict:
-    """Return prediction and financial metrics.
+def _apply_costs(strat_rets: np.ndarray, pos: np.ndarray, cost: float,
+                 liquidate: bool = False) -> np.ndarray:
+    out = strat_rets.copy()
+    if not len(out):
+        return out
+    changes = np.abs(np.diff(pos)) if len(pos) > 1 else np.array([])
+    if len(changes):
+        out[1:] -= changes * cost
+    if len(pos) and pos[0] > 0:
+        out[0] -= cost
+    if liquidate and len(pos) and pos[-1] > 0:
+        out[-1] -= cost
+    return out
+
+
+def _cost_sensitivity(strat_rets: np.ndarray, pos: np.ndarray) -> dict[str, float]:
+    out = {}
+    for bps in COST_SENSITIVITY_BPS:
+        net = _apply_costs(strat_rets, pos, bps / 10_000.0, liquidate=True)
+        compounded = np.cumprod(1 + net) if len(net) else np.array([1.0])
+        out[str(bps)] = float(compounded[-1] - 1)
+    return out
+
+
+def evaluate(y_true: np.ndarray, y_pred: np.ndarray, y_prob: np.ndarray, prices: np.ndarray,
+             horizon: int = 1, ticker: str = "SPY",
+             transaction_cost: float = DEFAULT_COST_PER_SIDE) -> dict:
+    """Return prediction and financial metrics using the market's real calendar.
 
     Existing research-window metrics preserve the historical chart convention.
     Canonical promotion economics use the additional ``*_liquidated`` fields,
-    which include the terminal exit cost for an open final position.
+    which include the terminal exit cost for an open final position. Cost
+    sensitivity is reported separately so a crypto result is not dependent on a
+    single optimistic fee assumption.
     """
     acc = float(accuracy_score(y_true, y_pred)) if len(y_true) else 0.0
     prec = float(precision_score(y_true, y_pred, zero_division=0)) if len(y_true) else 0.0
@@ -100,22 +133,16 @@ def evaluate(y_true: np.ndarray, y_pred: np.ndarray, y_prob: np.ndarray, prices:
 
     changes = np.abs(np.diff(pos)) if n_buckets > 1 else np.array([])
     turnover = float(changes.mean()) if len(changes) else 0.0
-    strat_rets_net = strat_rets.copy()
-    if len(strat_rets_net):
-        strat_rets_net[1:] -= changes * 0.0005
-        if len(pos) and pos[0] > 0:
-            strat_rets_net[0] -= 0.0005
+    strat_rets_net = _apply_costs(strat_rets, pos, transaction_cost, liquidate=False)
 
     # A completed historical backtest must liquidate an open terminal position.
     # Keep the historical research-window convention above for backward-compatible
     # chart reconciliation, but expose and use this fully liquidated series for
     # promotion economics and explicit cost-adjusted reporting.
-    strat_rets_liquidated = strat_rets_net.copy()
+    strat_rets_liquidated = _apply_costs(strat_rets, pos, transaction_cost, liquidate=True)
     exit_cost_applied = bool(len(strat_rets_liquidated) and len(pos) and pos[-1] > 0)
-    if exit_cost_applied:
-        strat_rets_liquidated[-1] -= 0.0005
 
-    ppy = 252 / h
+    ppy = periods_per_year(ticker, h)
     cum_strat = np.cumprod(1 + strat_rets_net) if len(strat_rets_net) else np.array([1.0])
     cum_strat_liq = (
         np.cumprod(1 + strat_rets_liquidated)
@@ -130,8 +157,8 @@ def evaluate(y_true: np.ndarray, y_pred: np.ndarray, y_prob: np.ndarray, prices:
     tail = strat_rets_net[strat_rets_net <= var_95] if len(strat_rets_net) else np.array([])
     es_95 = float(tail.mean()) if len(tail) else 0.0
     mdd = _max_drawdown(cum_strat)
-    n_buckets = max(len(cum_strat), 1)
-    cagr = (float(cum_strat[-1]) ** (ppy / n_buckets) - 1) if len(cum_strat) and cum_strat[-1] > 0 else -1.0
+    n_periods = max(len(cum_strat), 1)
+    cagr = (float(cum_strat[-1]) ** (ppy / n_periods) - 1) if len(cum_strat) and cum_strat[-1] > 0 else -1.0
     calmar = cagr / abs(mdd) if mdd < 0 else 0.0
 
     metrics = {
@@ -139,6 +166,10 @@ def evaluate(y_true: np.ndarray, y_pred: np.ndarray, y_prob: np.ndarray, prices:
         "precision": prec,
         "recall": rec,
         "brier_score": brier,
+        "ticker": ticker,
+        "calendar_days": calendar_days(ticker),
+        "periods_per_year": ppy,
+        "transaction_cost_per_side": float(transaction_cost),
         "sharpe_strategy": _sharpe(strat_rets_net, periods_per_year=ppy),
         "sharpe_strategy_liquidated": _sharpe(strat_rets_liquidated, periods_per_year=ppy),
         "sharpe_benchmark": _sharpe(bench_rets, periods_per_year=ppy),
@@ -160,6 +191,7 @@ def evaluate(y_true: np.ndarray, y_pred: np.ndarray, y_prob: np.ndarray, prices:
         "transaction_cost_adj_return_compounded": (
             float(cum_strat_liq[-1] - 1) if len(cum_strat_liq) else 0.0
         ),
+        "cost_sensitivity_compounded": _cost_sensitivity(strat_rets, pos),
         "exit_cost_applied": exit_cost_applied,
         "gross_return": float(strat_rets.sum()) if len(strat_rets) else 0.0,
         "sortino_ratio": sortino,
