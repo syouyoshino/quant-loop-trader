@@ -75,6 +75,19 @@ def test_tiingo_crypto_parser_flattens_nested_price_data():
     assert abs(df["volume"][0] - 123.456) < 1e-12
 
 
+def _crypto_frame(start: date, days: int) -> pl.DataFrame:
+    dates = [start + timedelta(days=i) for i in range(days)]
+    return pl.DataFrame({
+        "event_time": dates,
+        "available_time": dates,
+        "open": [100.0 + i for i in range(days)],
+        "high": [101.0 + i for i in range(days)],
+        "low": [99.0 + i for i in range(days)],
+        "close": [100.5 + i for i in range(days)],
+        "volume": [10.0 + i for i in range(days)],
+    })
+
+
 def test_crypto_gap_check_is_fail_closed():
     df = pl.DataFrame({
         "event_time": ["2024-01-01", "2024-01-03"],
@@ -86,6 +99,49 @@ def test_crypto_gap_check_is_fail_closed():
     )
     with pytest.raises(ValueError, match="crypto_calendar_gap"):
         dm.gap_check(df, ticker="BTCUSD")
+
+
+def test_crypto_coverage_check_requires_exact_requested_window():
+    full = _crypto_frame(date(2024, 1, 1), 5)
+    dm.coverage_check(full, "BTCUSD", "2024-01-01", "2024-01-05")
+
+    with pytest.raises(ValueError, match="crypto_coverage_start"):
+        dm.coverage_check(full.slice(1), "BTCUSD", "2024-01-01", "2024-01-05")
+    with pytest.raises(ValueError, match="crypto_coverage_end"):
+        dm.coverage_check(full.slice(0, 4), "BTCUSD", "2024-01-01", "2024-01-05")
+
+
+def test_fetch_crypto_rejects_contiguous_but_truncated_tiingo_response(tmp_path, monkeypatch):
+    monkeypatch.setattr(dm, "PROC_DIR", tmp_path)
+    monkeypatch.setenv("TIINGO_API_KEY", "secret")
+
+    truncated = _crypto_frame(date(2024, 1, 2), 4)
+    payload = [{
+        "ticker": "btcusd",
+        "priceData": [
+            {
+                "date": f"{d.isoformat()}T00:00:00.000Z",
+                "open": o,
+                "high": h,
+                "low": l,
+                "close": c,
+                "volume": v,
+            }
+            for d, o, h, l, c, v in zip(
+                truncated["event_time"].to_list(),
+                truncated["open"].to_list(),
+                truncated["high"].to_list(),
+                truncated["low"].to_list(),
+                truncated["close"].to_list(),
+                truncated["volume"].to_list(),
+            )
+        ],
+    }]
+    monkeypatch.setattr(dm, "_tiingo_fetch", lambda *args, **kwargs: payload)
+
+    with pytest.raises(RuntimeError, match="Tiingo failed"):
+        dm.fetch_ohlcv("BTCUSD", "2024-01-01", "2024-01-05", use_cache=False)
+    assert not (tmp_path / "BTCUSD.parquet").exists()
 
 
 def test_crypto_calendar_is_canonical_365():
