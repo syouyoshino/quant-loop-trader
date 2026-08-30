@@ -12,7 +12,7 @@ from dataclasses import asdict, dataclass, field
 
 import numpy as np
 
-PIPELINE_VERSION = 2
+PIPELINE_VERSION = 3
 
 
 @dataclass(frozen=True)
@@ -25,11 +25,23 @@ class ExperimentSpec:
     hypothesis_id: str = "baseline_vol_regime"
     hypothesis: str = ""
     economic_reasoning: str = ""
+    campaign_id: str = "default"
+    holdout_start: str | None = None
     pipeline_version: int = PIPELINE_VERSION
 
     def fingerprint(self) -> str:
-        """Deterministic identity of the requested experiment, not a run."""
-        payload = json.dumps(asdict(self), sort_keys=True)
+        """Deterministic identity of the requested scientific experiment.
+
+        Campaign identity and holdout boundary are resolved centrally rather than
+        trusting every caller to remember them. Moving a crypto holdout therefore
+        necessarily creates a different experiment identity.
+        """
+        from quant_loop_trader.market import campaign_holdout_start, campaign_id
+
+        payload_dict = asdict(self)
+        payload_dict["campaign_id"] = campaign_id(self.ticker)
+        payload_dict["holdout_start"] = campaign_holdout_start(self.ticker)
+        payload = json.dumps(payload_dict, sort_keys=True)
         return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 

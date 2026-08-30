@@ -7,7 +7,7 @@ import itertools
 import json
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 import duckdb
 
@@ -15,6 +15,12 @@ from quant_loop_trader.agents import validate_experiment
 from quant_loop_trader.core import PIPELINE_VERSION
 from quant_loop_trader.data import DB_PATH, migrate_db
 from quant_loop_trader.experiment import run_experiment
+from quant_loop_trader.market import (
+    DEFAULT_CRYPTO_CAMPAIGN_ID,
+    campaign_holdout_start,
+    campaign_id,
+    is_crypto,
+)
 from quant_loop_trader.research_memory import search_memory
 
 logger = logging.getLogger(__name__)
@@ -27,6 +33,59 @@ GRID = [
         [42, 123, 777],
     )
 ]
+
+
+def _csv_dates(name: str, default: list[str]) -> list[str]:
+    raw = os.getenv(name, "").strip()
+    values = [v.strip() for v in raw.split(",") if v.strip()] if raw else list(default)
+    if not values:
+        raise ValueError(f"{name.lower()}_empty")
+    for value in values:
+        date.fromisoformat(value)
+    return values
+
+
+def _candidate_grid(ticker: str) -> list[dict]:
+    """Return the configured search grid without silently moving crypto science.
+
+    The original BTC campaign remains frozen by default. To research newer data,
+    operators must explicitly name a new campaign, choose a new holdout boundary,
+    and provide the dataset end dates for that campaign. This turns an otherwise
+    dangerous environment tweak into a distinct experiment population.
+    """
+    if not is_crypto(ticker):
+        return GRID
+
+    raw_ends = os.getenv("QLT_CRYPTO_CAMPAIGN_ENDS", "").strip()
+    if not raw_ends:
+        return GRID
+
+    cid = campaign_id(ticker)
+    if cid == DEFAULT_CRYPTO_CAMPAIGN_ID:
+        raise ValueError(
+            "custom_crypto_campaign_ends_requires_new_campaign_id:"
+            "set QLT_CRYPTO_CAMPAIGN_ID"
+        )
+
+    starts = _csv_dates(
+        "QLT_CRYPTO_CAMPAIGN_STARTS",
+        ["2018-01-01", "2020-01-01", "2022-01-01"],
+    )
+    ends = _csv_dates("QLT_CRYPTO_CAMPAIGN_ENDS", [])
+    boundary = campaign_holdout_start(ticker)
+    if boundary is None:
+        raise ValueError("crypto_campaign_requires_holdout_start")
+    if not any(end > boundary for end in ends):
+        raise ValueError(
+            "crypto_campaign_ends_must_include_post_holdout_data:"
+            f"holdout={boundary}"
+        )
+
+    return [
+        {"start": a, "end": b, "seed": s}
+        for a, b, s in itertools.product(starts, ends, [42, 123, 777])
+        if a < b
+    ]
 
 
 def _spec_fingerprint(ticker: str, horizon: int, start: str, end: str, seed: int) -> str:
@@ -79,7 +138,7 @@ def _already_run(ticker: str, horizon: int, start: str, end: str, seed: int) -> 
 def _frontier_remaining(ticker: str = "SPY", horizon: int = 5) -> int:
     return sum(
         1
-        for c in GRID
+        for c in _candidate_grid(ticker)
         if not _already_run(ticker, horizon, c["start"], c["end"], c["seed"])
     )
 
@@ -99,7 +158,7 @@ def review_memory(ticker: str = "SPY", horizon: int = 5) -> dict:
 
 def select_candidates(ticker: str, horizon: int, budget: int) -> list[dict]:
     out = []
-    for cand in GRID:
+    for cand in _candidate_grid(ticker):
         if len(out) >= budget:
             break
         if _already_run(ticker, horizon, cand["start"], cand["end"], cand["seed"]):
@@ -232,6 +291,8 @@ def _run_session_body(ticker: str, horizon: int, max_experiments: int,
         "session_started": started,
         "session_finished": datetime.now(timezone.utc).isoformat(),
         "mode": "OBSERVATION",
+        "campaign_id": campaign_id(ticker),
+        "campaign_holdout_start": campaign_holdout_start(ticker),
         "memory_review": memory_review,
         "budget": max_experiments,
         "executed": len(results),

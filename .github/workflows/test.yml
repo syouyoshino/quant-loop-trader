@@ -4,6 +4,7 @@ on:
   push:
     branches: ["**"]
   pull_request:
+  workflow_dispatch:
 
 jobs:
   test:
@@ -45,3 +46,30 @@ jobs:
           ALPACA_API_KEY: ""
           ALPACA_SECRET_KEY: ""
         run: pytest -q -m "not integration"
+
+  tiingo-btc-live:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    env:
+      TIINGO_API_KEY: ${{ secrets.TIINGO_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Require Tiingo secret
+        run: |
+          if [ -z "$TIINGO_API_KEY" ]; then
+            echo "Repository secret TIINGO_API_KEY is required for the BTC live smoke test."
+            exit 1
+          fi
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Live BTCUSD Tiingo coverage smoke test
+        run: pytest -q -m integration tests/test_connectors_integration.py -k tiingo_live_btcusd

@@ -101,16 +101,74 @@ def _cost_sensitivity(strat_rets: np.ndarray, pos: np.ndarray) -> dict[str, floa
     return out
 
 
+def _phase_cost_sensitivity(prices: np.ndarray, y_pred: np.ndarray,
+                            horizon: int) -> dict[str, dict[str, float]]:
+    """Evaluate every non-overlapping h-day entry phase, not only phase zero.
+
+    For a 5-day model there are five legitimate daily schedules: enter on test
+    index 0, 1, 2, 3, or 4 and then every five days. The legacy strategy series
+    uses phase zero for chart continuity; this diagnostic exposes whether its
+    economics depend on that arbitrary starting day.
+    """
+    h = max(1, int(horizon))
+    out: dict[str, dict[str, float]] = {}
+    last_start = min(len(y_pred), max(0, len(prices) - h))
+    for phase in range(h):
+        starts = np.arange(phase, last_start, h, dtype=int)
+        if len(starts) == 0:
+            continue
+        phase_rets = prices[starts + h] / prices[starts] - 1
+        phase_pos = np.asarray(y_pred)[starts]
+        strat_rets = phase_rets * phase_pos
+        out[str(phase)] = _cost_sensitivity(strat_rets, phase_pos)
+    return out
+
+
+def _worst_phase_cost_sensitivity(
+    phase_costs: dict[str, dict[str, float]],
+) -> dict[str, float]:
+    """Conservative canonical stress: the worst legitimate entry phase per fee."""
+    out: dict[str, float] = {}
+    for bps in COST_SENSITIVITY_BPS:
+        values = [
+            float(row[str(bps)])
+            for row in phase_costs.values()
+            if str(bps) in row
+        ]
+        out[str(bps)] = min(values) if values else 0.0
+    return out
+
+
+def _phase_robustness(phase_costs: dict[str, dict[str, float]], bps: int = 25) -> dict:
+    values = [float(row[str(bps)]) for row in phase_costs.values() if str(bps) in row]
+    if not values:
+        return {
+            "bps_per_side": bps,
+            "n_phases": 0,
+            "min_compounded_return": 0.0,
+            "median_compounded_return": 0.0,
+            "max_compounded_return": 0.0,
+            "all_positive": False,
+        }
+    return {
+        "bps_per_side": bps,
+        "n_phases": len(values),
+        "min_compounded_return": float(np.min(values)),
+        "median_compounded_return": float(np.median(values)),
+        "max_compounded_return": float(np.max(values)),
+        "all_positive": bool(all(v > 0 for v in values)),
+    }
+
+
 def evaluate(y_true: np.ndarray, y_pred: np.ndarray, y_prob: np.ndarray, prices: np.ndarray,
              horizon: int = 1, ticker: str = "SPY",
              transaction_cost: float = DEFAULT_COST_PER_SIDE) -> dict:
     """Return prediction and financial metrics using the market's real calendar.
 
-    Existing research-window metrics preserve the historical chart convention.
-    Canonical promotion economics use the additional ``*_liquidated`` fields,
-    which include the terminal exit cost for an open final position. Cost
-    sensitivity is reported separately so a crypto result is not dependent on a
-    single optimistic fee assumption.
+    Existing research-window metrics preserve the historical phase-zero chart
+    convention. Canonical promotion economics use the additional fully-liquidated
+    fields and worst-phase cost stress, so an h-day result is not promoted merely
+    because the test window happened to begin on a favorable entry day.
     """
     acc = float(accuracy_score(y_true, y_pred)) if len(y_true) else 0.0
     prec = float(precision_score(y_true, y_pred, zero_division=0)) if len(y_true) else 0.0
@@ -142,6 +200,11 @@ def evaluate(y_true: np.ndarray, y_pred: np.ndarray, y_prob: np.ndarray, prices:
     strat_rets_liquidated = _apply_costs(strat_rets, pos, transaction_cost, liquidate=True)
     exit_cost_applied = bool(len(strat_rets_liquidated) and len(pos) and pos[-1] > 0)
 
+    primary_phase_costs = _cost_sensitivity(strat_rets, pos)
+    phase_costs = _phase_cost_sensitivity(prices, y_pred, h)
+    canonical_costs = _worst_phase_cost_sensitivity(phase_costs)
+    phase_25 = _phase_robustness(phase_costs, bps=25)
+
     ppy = periods_per_year(ticker, h)
     cum_strat = np.cumprod(1 + strat_rets_net) if len(strat_rets_net) else np.array([1.0])
     cum_strat_liq = (
@@ -170,6 +233,8 @@ def evaluate(y_true: np.ndarray, y_pred: np.ndarray, y_prob: np.ndarray, prices:
         "calendar_days": calendar_days(ticker),
         "periods_per_year": ppy,
         "transaction_cost_per_side": float(transaction_cost),
+        "execution_policy": "non_overlapping_h_day_blocks_phase0",
+        "primary_phase_offset": 0,
         "sharpe_strategy": _sharpe(strat_rets_net, periods_per_year=ppy),
         "sharpe_strategy_liquidated": _sharpe(strat_rets_liquidated, periods_per_year=ppy),
         "sharpe_benchmark": _sharpe(bench_rets, periods_per_year=ppy),
@@ -191,7 +256,12 @@ def evaluate(y_true: np.ndarray, y_pred: np.ndarray, y_prob: np.ndarray, prices:
         "transaction_cost_adj_return_compounded": (
             float(cum_strat_liq[-1] - 1) if len(cum_strat_liq) else 0.0
         ),
-        "cost_sensitivity_compounded": _cost_sensitivity(strat_rets, pos),
+        # Canonical cost stress is conservative across every possible h-day phase.
+        # Keep phase zero separately so old charts and reports remain reconcilable.
+        "cost_sensitivity_compounded": canonical_costs,
+        "phase0_cost_sensitivity_compounded": primary_phase_costs,
+        "phase_cost_sensitivity_compounded": phase_costs,
+        "phase_robustness_25bps": phase_25,
         "exit_cost_applied": exit_cost_applied,
         "gross_return": float(strat_rets.sum()) if len(strat_rets) else 0.0,
         "sortino_ratio": sortino,

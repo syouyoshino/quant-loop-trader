@@ -8,6 +8,7 @@ from quant_loop_trader.data import PROC_DIR
 from quant_loop_trader.features import add_features, feature_columns
 from quant_loop_trader.experiment import make_labels
 
+
 def test_time_split_hidden_future():
     df = pl.read_parquet(str(PROC_DIR / "SPY.parquet"))
     df = make_labels(df, 5)
@@ -16,6 +17,7 @@ def test_time_split_hidden_future():
     assert train["event_time"].max() < test["event_time"].min()
     # evaluation should not leak
     assert train.height + test.height == df.height
+
 
 def test_evaluate_metrics():
     y_true = np.array([0,1,1,0,1])
@@ -26,6 +28,23 @@ def test_evaluate_metrics():
     for k in ["accuracy","precision","recall","sharpe_strategy","cumulative_return_strategy","turnover","transaction_cost_adj_return"]:
         assert k in m
     assert 0 <= m["accuracy"] <= 1
+
+
+def test_horizon_cost_stress_uses_worst_entry_phase():
+    """A 2-day model must not be promoted because only phase zero is profitable."""
+    prices = np.array([100.0, 100.0, 110.0, 90.0, 121.0, 81.0, 133.1])
+    y_true = np.ones(6, dtype=int)
+    y_pred = np.ones(6, dtype=int)
+    y_prob = np.full(6, 0.9)
+
+    m = evaluate(y_true, y_pred, y_prob, prices, horizon=2, ticker="BTCUSD")
+    phases = m["phase_cost_sensitivity_compounded"]
+    assert set(phases) == {"0", "1"}
+    assert phases["0"]["25"] > 0
+    assert phases["1"]["25"] < 0
+    assert m["cost_sensitivity_compounded"]["25"] == pytest.approx(phases["1"]["25"])
+    assert m["phase_robustness_25bps"]["all_positive"] is False
+    assert m["phase_robustness_25bps"]["n_phases"] == 2
 
 
 def test_bootstrap_ci_contains_point_estimate():

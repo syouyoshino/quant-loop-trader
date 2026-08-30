@@ -10,6 +10,26 @@ load_dotenv()
 
 
 @pytest.mark.integration
+@pytest.mark.skipif(not os.getenv("TIINGO_API_KEY", "").strip(), reason="no TIINGO key")
+def test_tiingo_live_btcusd_daily_coverage(tmp_path, monkeypatch):
+    """Prove the real Tiingo crypto contract matches the BTC research parser."""
+    import quant_loop_trader.data as dm
+
+    monkeypatch.setattr(dm, "PROC_DIR", tmp_path)
+    df, source = dm.fetch_ohlcv(
+        "BTCUSD", "2024-01-01", "2024-01-07", use_cache=False
+    )
+    assert source == "tiingo_crypto"
+    assert df.height == 7
+    assert str(df["event_time"].min()) == "2024-01-01"
+    assert str(df["event_time"].max()) == "2024-01-07"
+    assert df["event_time"].n_unique() == 7
+    assert (df["available_time"] == df["event_time"]).all()
+    dm.gap_check(df, ticker="BTCUSD")
+    dm.coverage_check(df, "BTCUSD", "2024-01-01", "2024-01-07")
+
+
+@pytest.mark.integration
 @pytest.mark.skipif(not os.getenv("ALPACA_API_KEY", "").strip(), reason="no ALPACA key")
 def test_alpaca_live_bars():
     from quant_loop_trader.connectors import alpaca
