@@ -189,6 +189,59 @@ def _load_fixture() -> pl.DataFrame | None:
     return None
 
 
+def _slice_requested_window(df: pl.DataFrame, start: str, end: str) -> pl.DataFrame:
+    """Return only observations the caller requested before validation/sealing."""
+    import datetime as _dt
+
+    s = _dt.date.fromisoformat(start)
+    e = _dt.date.fromisoformat(end)
+    if e < s:
+        raise ValueError(f"invalid_date_range:{start}>{end}")
+    return df.filter(
+        (pl.col("event_time") >= pl.lit(s))
+        & (pl.col("event_time") <= pl.lit(e))
+    ).sort("event_time")
+
+
+def coverage_check(df: pl.DataFrame, ticker: str, start: str, end: str) -> None:
+    """Fail closed when a crypto response does not cover every requested UTC day.
+
+    Internal gap detection alone cannot catch a response that is contiguous but
+    truncated at the beginning or end. Crypto has a 24/7 calendar, so requested
+    daily coverage is exact and can be verified deterministically.
+    """
+    if not is_crypto(ticker):
+        return
+
+    import datetime as _dt
+
+    s = _dt.date.fromisoformat(start)
+    e = _dt.date.fromisoformat(end)
+    if e < s:
+        raise ValueError(f"invalid_date_range:{start}>{end}")
+    if df.height == 0:
+        raise ValueError(f"crypto_coverage_empty:{ticker}:{start}:{end}")
+
+    min_d = df["event_time"].min()
+    max_d = df["event_time"].max()
+    if min_d != s:
+        raise ValueError(
+            f"crypto_coverage_start:{ticker}:requested={s}:actual={min_d}"
+        )
+    if max_d != e:
+        raise ValueError(
+            f"crypto_coverage_end:{ticker}:requested={e}:actual={max_d}"
+        )
+
+    expected = (e - s).days + 1
+    unique_days = df.select(pl.col("event_time").n_unique()).item()
+    if unique_days != expected or df.height != expected:
+        raise ValueError(
+            f"crypto_coverage_count:{ticker}:expected={expected}:"
+            f"rows={df.height}:unique_days={unique_days}"
+        )
+
+
 def fetch_ohlcv(ticker: str = "SPY", start: str = "2018-01-01", end: str = "2024-12-31",
                 use_cache: bool = True) -> tuple[pl.DataFrame, str]:
     """Fetch OHLCV with PIT columns. Returns (df, actual_source)."""
@@ -206,11 +259,9 @@ def fetch_ohlcv(ticker: str = "SPY", start: str = "2018-01-01", end: str = "2024
                 e = _dt.date.fromisoformat(end)
                 min_d, max_d = df["event_time"].min(), df["event_time"].max()
                 if min_d <= s + _dt.timedelta(days=7) and max_d >= e:
-                    df = df.filter(
-                        (pl.col("event_time") >= pl.lit(s))
-                        & (pl.col("event_time") <= pl.lit(e))
-                    )
+                    df = _slice_requested_window(df, start, end)
                     gap_check(df, ticker=ticker)
+                    coverage_check(df, ticker=ticker, start=start, end=end)
                     logger.info(json.dumps({"event": "cache_hit_parquet", "ticker": ticker, "rows": df.height}))
                     return df, "cache"
         except Exception:
@@ -222,9 +273,11 @@ def fetch_ohlcv(ticker: str = "SPY", start: str = "2018-01-01", end: str = "2024
         try:
             rows = _tiingo_fetch(ticker, start, end, api_key)
             df = _parse_tiingo_crypto(rows, ticker) if is_crypto(ticker) else _parse_tiingo(rows)
+            df = _slice_requested_window(df, start, end)
             if df.height == 0:
-                raise ValueError("Tiingo returned 0 rows")
+                raise ValueError("Tiingo returned 0 rows in requested window")
             gap_check(df, ticker=ticker)
+            coverage_check(df, ticker=ticker, start=start, end=end)
             save_parquet(df, parquet_path)
             source = "tiingo_crypto" if is_crypto(ticker) else "tiingo_eod"
             logger.info(json.dumps({"event": "tiingo_fetch_ok", "ticker": ticker, "rows": df.height, "source": source}))
@@ -239,10 +292,7 @@ def fetch_ohlcv(ticker: str = "SPY", start: str = "2018-01-01", end: str = "2024
     fixture = _load_fixture()
     if fixture is not None:
         logger.info(json.dumps({"event": "fixture_used", "ticker": ticker, "rows": fixture.height}))
-        fixture = fixture.filter(
-            (pl.col("event_time") >= pl.lit(start).str.strptime(pl.Date, "%Y-%m-%d"))
-            & (pl.col("event_time") <= pl.lit(end).str.strptime(pl.Date, "%Y-%m-%d"))
-        )
+        fixture = _slice_requested_window(fixture, start, end)
         save_parquet(fixture, parquet_path)
         return fixture, "fixture"
 
