@@ -12,7 +12,7 @@ from dataclasses import asdict, dataclass, field
 
 import numpy as np
 
-PIPELINE_VERSION = 2
+PIPELINE_VERSION = 3
 
 
 @dataclass(frozen=True)
@@ -25,10 +25,12 @@ class ExperimentSpec:
     hypothesis_id: str = "baseline_vol_regime"
     hypothesis: str = ""
     economic_reasoning: str = ""
+    campaign_id: str = "default"
+    holdout_start: str | None = None
     pipeline_version: int = PIPELINE_VERSION
 
     def fingerprint(self) -> str:
-        """Deterministic identity of the requested experiment, not a run."""
+        """Deterministic identity of the requested scientific experiment."""
         payload = json.dumps(asdict(self), sort_keys=True)
         return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
