@@ -9,8 +9,12 @@
         <string>/Users/syouyoshino/Desktop/projects_1/quant-loop-trader/.venv/bin/python</string>
         <string>-m</string>
         <string>quant_loop_trader.autonomy</string>
+        <string>--ticker</string>
+        <string>BTCUSD</string>
+        <string>--horizon</string>
+        <string>5</string>
         <string>--max-experiments</string>
-        <string>4</string>
+        <string>1</string>
     </array>
     <key>EnvironmentVariables</key>
     <dict>
