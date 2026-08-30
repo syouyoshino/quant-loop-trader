@@ -124,6 +124,21 @@ def _phase_cost_sensitivity(prices: np.ndarray, y_pred: np.ndarray,
     return out
 
 
+def _worst_phase_cost_sensitivity(
+    phase_costs: dict[str, dict[str, float]],
+) -> dict[str, float]:
+    """Conservative canonical stress: the worst legitimate entry phase per fee."""
+    out: dict[str, float] = {}
+    for bps in COST_SENSITIVITY_BPS:
+        values = [
+            float(row[str(bps)])
+            for row in phase_costs.values()
+            if str(bps) in row
+        ]
+        out[str(bps)] = min(values) if values else 0.0
+    return out
+
+
 def _phase_robustness(phase_costs: dict[str, dict[str, float]], bps: int = 25) -> dict:
     values = [float(row[str(bps)]) for row in phase_costs.values() if str(bps) in row]
     if not values:
@@ -152,7 +167,7 @@ def evaluate(y_true: np.ndarray, y_pred: np.ndarray, y_prob: np.ndarray, prices:
 
     Existing research-window metrics preserve the historical phase-zero chart
     convention. Canonical promotion economics use the additional fully-liquidated
-    fields and all-phase cost robustness, so an h-day result is not promoted merely
+    fields and worst-phase cost stress, so an h-day result is not promoted merely
     because the test window happened to begin on a favorable entry day.
     """
     acc = float(accuracy_score(y_true, y_pred)) if len(y_true) else 0.0
@@ -185,7 +200,9 @@ def evaluate(y_true: np.ndarray, y_pred: np.ndarray, y_prob: np.ndarray, prices:
     strat_rets_liquidated = _apply_costs(strat_rets, pos, transaction_cost, liquidate=True)
     exit_cost_applied = bool(len(strat_rets_liquidated) and len(pos) and pos[-1] > 0)
 
+    primary_phase_costs = _cost_sensitivity(strat_rets, pos)
     phase_costs = _phase_cost_sensitivity(prices, y_pred, h)
+    canonical_costs = _worst_phase_cost_sensitivity(phase_costs)
     phase_25 = _phase_robustness(phase_costs, bps=25)
 
     ppy = periods_per_year(ticker, h)
@@ -239,7 +256,10 @@ def evaluate(y_true: np.ndarray, y_pred: np.ndarray, y_prob: np.ndarray, prices:
         "transaction_cost_adj_return_compounded": (
             float(cum_strat_liq[-1] - 1) if len(cum_strat_liq) else 0.0
         ),
-        "cost_sensitivity_compounded": _cost_sensitivity(strat_rets, pos),
+        # Canonical cost stress is conservative across every possible h-day phase.
+        # Keep phase zero separately so old charts and reports remain reconcilable.
+        "cost_sensitivity_compounded": canonical_costs,
+        "phase0_cost_sensitivity_compounded": primary_phase_costs,
         "phase_cost_sensitivity_compounded": phase_costs,
         "phase_robustness_25bps": phase_25,
         "exit_cost_applied": exit_cost_applied,
