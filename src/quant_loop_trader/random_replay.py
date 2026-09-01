@@ -53,6 +53,8 @@ class CandidateReplaySpec:
     model_version: str | None
     feature_version: str | None
     dataset_snapshot_sha256: str | None
+    research_start: str
+    research_end: str
 
 
 def _as_date(value: str | date) -> date:
@@ -120,6 +122,8 @@ def _load_candidate_spec(experiment_id: str, root: Path) -> CandidateReplaySpec:
         model_version=cfg.get("model_version"),
         feature_version=cfg.get("feature_version_improved"),
         dataset_snapshot_sha256=bundle.lock.get("dataset_snapshot_sha256"),
+        research_start=str(cfg.get("start", "2018-01-01")),
+        research_end=str(cfg["end"]),
     )
 
 
@@ -492,14 +496,13 @@ def run_random_replay(
         model_params = candidate.model_params
         feat_cols = list(candidate.feature_columns)
         source_snapshot = candidate.dataset_snapshot
-        resolved_data_start = _as_date(data_start or str(candidate.dataset_snapshot and candidate.dataset_snapshot)) if False else _as_date(data_start or "2018-01-01")
-        # Existing bundles record their requested research start. Prefer that over
-        # the generic default when candidate mode is used.
-        from quant_loop_trader.bundle import ExperimentBundle
-        candidate_cfg = ExperimentBundle.open_verified(
-            candidate.experiment_id, root_path / "data" / "experiments"
-        ).config
-        resolved_data_start = _as_date(data_start or candidate_cfg.get("start", "2018-01-01"))
+        candidate_start = _as_date(candidate.research_start)
+        candidate_end = _as_date(candidate.research_end)
+        resolved_data_start = _as_date(data_start or candidate.research_start)
+        if resolved_data_start < candidate_start:
+            raise ValueError("candidate_data_start_before_snapshot")
+        if resolved_data_start > candidate_end:
+            raise ValueError("candidate_data_start_after_snapshot")
         sampling_seed = int(seed if seed is not None else 42)
     else:
         ticker = (ticker or "BTCUSD").upper()
@@ -512,6 +515,11 @@ def run_random_replay(
         sampling_seed = int(seed if seed is not None else 42)
 
     resolved_data_end, holdout = _resolve_data_end(ticker, data_end)
+    if candidate:
+        if data_end is not None and resolved_data_end > candidate_end:
+            raise ValueError("candidate_data_end_after_snapshot")
+        if resolved_data_end > candidate_end:
+            resolved_data_end = candidate_end
     if resolved_data_end <= resolved_data_start:
         raise ValueError("data_end_must_follow_data_start")
     resolved_sample_start = _as_date(sample_start or resolved_data_start)
@@ -599,6 +607,8 @@ def run_random_replay(
         ),
         "candidate_model_version": candidate.model_version if candidate else None,
         "candidate_feature_version": candidate.feature_version if candidate else None,
+        "candidate_research_start": candidate.research_start if candidate else None,
+        "candidate_research_end": candidate.research_end if candidate else None,
         "ticker": ticker,
         "horizon": h,
         "runs": int(runs),
