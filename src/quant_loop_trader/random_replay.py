@@ -1,12 +1,10 @@
 """Leakage-safe random-start replay robustness testing.
 
-This module repeatedly drops the current candidate strategy into randomly sampled
-historical start dates. Each replay trains on information available strictly before
-the sampled start, purges the prediction horizon at the boundary, and evaluates a
-fixed forward trading window. The campaign holdout is never sampled or loaded.
-
-Random replay is a robustness diagnostic, not a replacement for the final untouched
-holdout and not a claim that overlapping replay windows are statistically independent.
+Random replay can operate as a standalone BTC diagnostic or replay one verified
+experiment candidate. Candidate mode reconstructs the candidate's model type,
+feature columns, model parameters, horizon, seed, and sealed dataset snapshot.
+Unsupported feature sets fail closed rather than silently replaying a different
+strategy. Campaign holdout observations are never loaded or sampled.
 """
 from __future__ import annotations
 
@@ -16,48 +14,156 @@ import json
 import os
 import random
 from collections import Counter
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import numpy as np
 import polars as pl
 
-from quant_loop_trader.data import (
-    coverage_check,
-    dataset_metadata,
-    fetch_ohlcv,
-    gap_check,
-)
-from quant_loop_trader.experiment import make_labels, train_evaluate_from
+from quant_loop_trader.core import significance
+from quant_loop_trader.data import coverage_check, dataset_metadata, fetch_ohlcv, gap_check
+from quant_loop_trader.evaluation import autopsy, evaluate
+from quant_loop_trader.experiment import make_labels
 from quant_loop_trader.features import add_improved_features, improved_feature_columns
 from quant_loop_trader.market import campaign_holdout_start, campaign_id
+from quant_loop_trader.models.registry import build_model
 
 DEFAULT_RUNS = 100
 DEFAULT_TRADE_DAYS = 180
 DEFAULT_MIN_TRAINING_DAYS = 730
+_REQUIRED_OHLCV = (
+    "event_time", "available_time", "open", "high", "low", "close", "volume",
+)
+
+
+@dataclass(frozen=True)
+class CandidateReplaySpec:
+    experiment_id: str
+    ticker: str
+    horizon: int
+    model_seed: int
+    model_type: str
+    model_params: dict
+    feature_columns: tuple[str, ...]
+    dataset_snapshot: Path
+    dataset_id: str | None
+    dataset_checksum: str | None
+    spec_fingerprint: str | None
+    model_version: str | None
+    feature_version: str | None
+    dataset_snapshot_sha256: str | None
+    research_start: str
+    research_end: str
 
 
 def _as_date(value: str | date) -> date:
     return value if isinstance(value, date) else date.fromisoformat(value)
 
 
+def _sha_file(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _safe_experiment_id(experiment_id: str) -> str:
+    if not experiment_id or Path(experiment_id).name != experiment_id:
+        raise ValueError("invalid_candidate_experiment_id")
+    return experiment_id
+
+
+def _load_candidate_spec(experiment_id: str, root: Path) -> CandidateReplaySpec:
+    """Open one verified candidate bundle and derive its replayable strategy spec."""
+    from quant_loop_trader.bundle import ExperimentBundle
+
+    experiment_id = _safe_experiment_id(experiment_id)
+    bundle = ExperimentBundle.open_verified(experiment_id, root / "data" / "experiments")
+    cfg = bundle.config
+    report = bundle.report
+    ticker = str(cfg["ticker"]).upper()
+
+    candidate_boundary = cfg.get("campaign_holdout_start")
+    active_boundary = campaign_holdout_start(ticker)
+    if candidate_boundary != active_boundary:
+        raise ValueError(
+            "candidate_campaign_holdout_mismatch:"
+            f"candidate={candidate_boundary}:active={active_boundary}"
+        )
+
+    feature_cols = cfg.get("feature_columns")
+    if not feature_cols:
+        feature_cols = report.get("parameters", {}).get("feature_columns")
+    if not feature_cols:
+        # Backward compatibility for current sealed bundles, whose improved
+        # feature identity is versioned but whose column list predates this field.
+        feature_cols = improved_feature_columns()
+
+    model_type = (
+        cfg.get("model_type")
+        or report.get("parameters", {}).get("model_type")
+        or "logistic"
+    )
+    model_params = cfg.get("model_params") or report.get("parameters", {}).get("model_params") or {}
+    snapshot = Path(cfg.get("dataset_snapshot") or bundle.dataset_snapshot)
+    if not snapshot.exists():
+        raise FileNotFoundError(f"candidate_dataset_snapshot_missing:{snapshot}")
+
+    return CandidateReplaySpec(
+        experiment_id=experiment_id,
+        ticker=ticker,
+        horizon=int(cfg["horizon"]),
+        model_seed=int(cfg["seed"]),
+        model_type=str(model_type),
+        model_params=dict(model_params),
+        feature_columns=tuple(str(c) for c in feature_cols),
+        dataset_snapshot=snapshot,
+        dataset_id=cfg.get("dataset_id"),
+        dataset_checksum=cfg.get("dataset_checksum"),
+        spec_fingerprint=cfg.get("spec_fingerprint"),
+        model_version=cfg.get("model_version"),
+        feature_version=cfg.get("feature_version_improved"),
+        dataset_snapshot_sha256=bundle.lock.get("dataset_snapshot_sha256"),
+        research_start=str(cfg.get("start", "2018-01-01")),
+        research_end=str(cfg["end"]),
+    )
+
+
 def _resolve_data_end(ticker: str, data_end: str | None) -> tuple[date, date | None]:
     """Resolve the last bar random replay may load, always before fixed holdout."""
     holdout_raw = campaign_holdout_start(ticker)
     holdout = _as_date(holdout_raw) if holdout_raw else None
-
     if data_end is None:
         if holdout is None:
             raise ValueError("data_end_required_without_fixed_holdout")
         resolved = holdout - timedelta(days=1)
     else:
         resolved = _as_date(data_end)
-
     if holdout is not None and resolved >= holdout:
         raise ValueError(
             f"random_replay_data_end_reaches_holdout:data_end={resolved}:holdout={holdout}"
         )
     return resolved, holdout
+
+
+def _validate_source_frame(df: pl.DataFrame) -> pl.DataFrame:
+    """Require the complete PIT OHLCV contract before a replay snapshot is sealed."""
+    missing = [c for c in _REQUIRED_OHLCV if c not in df.columns]
+    if missing:
+        raise ValueError(f"source_snapshot_missing_columns:{','.join(missing)}")
+    try:
+        df = df.with_columns(
+            pl.col("event_time").cast(pl.Date),
+            pl.col("available_time").cast(pl.Date),
+            *[pl.col(c).cast(pl.Float64) for c in ("open", "high", "low", "close", "volume")],
+        ).sort("event_time")
+    except Exception as exc:
+        raise ValueError(f"source_snapshot_schema_invalid:{str(exc)[:120]}") from exc
+    if any(df[c].null_count() for c in _REQUIRED_OHLCV):
+        raise ValueError("source_snapshot_required_column_nulls")
+    if df.filter(pl.col("available_time") < pl.col("event_time")).height:
+        raise ValueError("source_snapshot_pit_violation")
+    if df["event_time"].n_unique() != df.height:
+        raise ValueError("source_snapshot_duplicate_event_time")
+    return df
 
 
 def _load_research_snapshot(
@@ -67,7 +173,7 @@ def _load_research_snapshot(
     root: Path,
     source_snapshot: str | Path | None = None,
 ) -> tuple[pl.DataFrame, dict, Path]:
-    """Acquire once, seal once, then reuse the same immutable frame for all replays."""
+    """Acquire once, validate once, seal once, then reuse one immutable frame."""
     ticker = ticker.upper()
     if source_snapshot is None:
         df, source = fetch_ohlcv(ticker, data_start.isoformat(), data_end.isoformat())
@@ -76,24 +182,15 @@ def _load_research_snapshot(
         if not source_path.exists():
             raise FileNotFoundError(f"source snapshot not found: {source_path}")
         df = pl.read_parquet(str(source_path))
-        if "event_time" not in df.columns:
-            raise ValueError("source_snapshot_missing_event_time")
-        df = df.with_columns(pl.col("event_time").cast(pl.Date))
-        if "available_time" in df.columns:
-            df = df.with_columns(pl.col("available_time").cast(pl.Date))
-        df = df.filter(
-            (pl.col("event_time") >= pl.lit(data_start))
-            & (pl.col("event_time") <= pl.lit(data_end))
-        ).sort("event_time")
         source = "snapshot_random_replay"
-        gap_check(df, ticker=ticker)
-        coverage_check(
-            df,
-            ticker=ticker,
-            start=data_start.isoformat(),
-            end=data_end.isoformat(),
-        )
 
+    df = _validate_source_frame(df)
+    df = df.filter(
+        (pl.col("event_time") >= pl.lit(data_start))
+        & (pl.col("event_time") <= pl.lit(data_end))
+    ).sort("event_time")
+    gap_check(df, ticker=ticker)
+    coverage_check(df, ticker=ticker, start=data_start.isoformat(), end=data_end.isoformat())
     if df.height == 0:
         raise ValueError("random_replay_empty_dataset")
 
@@ -115,12 +212,20 @@ def _load_research_snapshot(
     return df, meta, snap_path
 
 
-def prepare_replay_frame(df: pl.DataFrame, horizon: int) -> pl.DataFrame:
+def prepare_replay_frame(
+    df: pl.DataFrame,
+    horizon: int,
+    feature_cols: list[str] | tuple[str, ...] | None = None,
+) -> pl.DataFrame:
     """Create PIT features and labels once from the sealed research snapshot."""
     h = max(1, int(horizon))
-    feat_cols = improved_feature_columns()
+    cols = list(feature_cols or improved_feature_columns())
+    supported = set(improved_feature_columns())
+    unsupported = [c for c in cols if c not in supported]
+    if unsupported:
+        raise ValueError(f"unsupported_candidate_features:{','.join(unsupported)}")
     frame = add_improved_features(make_labels(df.sort("event_time"), h))
-    frame = frame.drop_nulls(subset=feat_cols + ["label"]).sort("event_time")
+    frame = frame.drop_nulls(subset=cols + ["label"]).sort("event_time")
     if frame.height == 0:
         raise ValueError("random_replay_no_usable_rows")
     return frame
@@ -145,16 +250,13 @@ def eligible_start_indices(
         raise ValueError("min_training_days_too_small")
     if sample_end < sample_start:
         raise ValueError("sample_end_before_sample_start")
-
     dates = frame["event_time"].to_list()
     first_idx = min_training_days + h
     last_idx = frame.height - trade_days
     if last_idx < first_idx:
         return []
-
     return [
-        idx
-        for idx in range(first_idx, last_idx + 1)
+        idx for idx in range(first_idx, last_idx + 1)
         if sample_start <= dates[idx] <= sample_end
     ]
 
@@ -167,30 +269,22 @@ def select_balanced_starts(
     seed: int,
     min_start_gap_days: int = 0,
 ) -> list[int]:
-    """Sample unique start dates roughly evenly across calendar years.
-
-    The round-robin sampler avoids accidentally filling most replays from one BTC
-    regime/year. Optional spacing can reduce near-duplicate starts, but overlapping
-    forward windows are still allowed and are explicitly reported as correlated.
-    """
+    """Sample unique starts roughly evenly across calendar years."""
     runs = int(runs)
     min_start_gap_days = max(0, int(min_start_gap_days))
     if runs <= 0:
         raise ValueError("runs_must_be_positive")
     if not candidates:
         raise ValueError("no_eligible_random_replay_starts")
-
     dates = frame["event_time"].to_list()
     by_year: dict[int, list[int]] = {}
     for idx in candidates:
         by_year.setdefault(dates[idx].year, []).append(idx)
-
     rng = random.Random(int(seed))
     years = sorted(by_year)
     rng.shuffle(years)
     for bucket in by_year.values():
         rng.shuffle(bucket)
-
     selected: list[int] = []
     selected_dates: list[date] = []
 
@@ -216,7 +310,6 @@ def select_balanced_starts(
                 break
         if not progress:
             break
-
     if len(selected) < runs:
         raise ValueError(
             "not_enough_distinct_replay_starts:"
@@ -234,17 +327,11 @@ def build_replay_window(
     trade_days: int,
     min_training_days: int,
 ) -> tuple[pl.DataFrame, pl.DataFrame]:
-    """Build one expanding-history train window and one fixed forward test window.
-
-    The last ``horizon`` observations before the replay start are removed from
-    training. Their labels depend on prices at/after the replay start and would
-    otherwise leak the simulated future into model fitting.
-    """
+    """Build one expanding-history train window and one fixed forward test window."""
     h = max(1, int(horizon))
     train_end = int(start_idx) - h
     if train_end < int(min_training_days):
         raise ValueError("insufficient_purged_training_history")
-
     train = frame.slice(0, train_end)
     test = frame.slice(int(start_idx), int(trade_days))
     if test.height != int(trade_days):
@@ -254,6 +341,39 @@ def build_replay_window(
     if train["event_time"].max() >= test["event_time"].min():
         raise AssertionError("random_replay_time_leakage")
     return train, test
+
+
+def _train_evaluate_candidate(
+    train: pl.DataFrame,
+    test: pl.DataFrame,
+    feat_cols: list[str],
+    horizon: int,
+    *,
+    model_type: str,
+    model_seed: int,
+    model_params: dict,
+    ticker: str,
+) -> dict:
+    """Train exactly the requested registry model on one replay window."""
+    X_train = train.select(feat_cols).to_numpy()
+    y_train = train["label"].to_numpy()
+    X_test = test.select(feat_cols).to_numpy()
+    y_test = test["label"].to_numpy()
+    prices_test = test["close"].to_numpy()
+    model = build_model(model_type, seed=int(model_seed), **dict(model_params))
+    model.fit(
+        X_train,
+        y_train,
+        train_period=(str(train["event_time"].min()), str(train["event_time"].max())),
+    )
+    y_pred = model.predict(X_test)
+    try:
+        y_prob = model.predict_proba(X_test)
+    except Exception:
+        y_prob = y_pred.astype(float)
+    metrics = evaluate(y_test, y_pred, y_prob, prices_test, horizon, ticker=ticker)
+    metrics["stat_pvalue"] = significance(y_test, y_pred, horizon=horizon).pvalue
+    return {"metrics": metrics, "error_analysis": autopsy(test, y_test, y_pred), "model": model}
 
 
 def _overlap_diagnostics(rows: list[dict]) -> dict:
@@ -267,7 +387,6 @@ def _overlap_diagnostics(rows: list[dict]) -> dict:
             "overlapping_window_fraction": 0.0,
             "statistical_independence": "not_assumed",
         }
-
     gaps = [(windows[i][0] - windows[i - 1][0]).days for i in range(1, len(windows))]
     overlaps = 0
     furthest_end = windows[0][1]
@@ -286,14 +405,12 @@ def _overlap_diagnostics(rows: list[dict]) -> dict:
 def summarize_replays(rows: list[dict]) -> dict:
     if not rows:
         raise ValueError("cannot_summarize_empty_replays")
-
     strategy = np.asarray([row["strategy_return"] for row in rows], dtype=float)
     benchmark = np.asarray([row["benchmark_return"] for row in rows], dtype=float)
     sharpe = np.asarray([row["sharpe"] for row in rows], dtype=float)
     drawdown = np.asarray([row["max_drawdown"] for row in rows], dtype=float)
     cost_25 = np.asarray([row["return_25bps_worst_phase"] for row in rows], dtype=float)
     year_counts = Counter(str(_as_date(row["start_date"]).year) for row in rows)
-
     out = {
         "runs": len(rows),
         "unique_start_dates": len({row["start_date"] for row in rows}),
@@ -314,38 +431,104 @@ def summarize_replays(rows: list[dict]) -> dict:
     return out
 
 
+def _candidate_evidence_file(root: Path, experiment_id: str, replay_id: str) -> Path:
+    experiment_id = _safe_experiment_id(experiment_id)
+    d = root / "data" / "random_replays" / "by_experiment" / experiment_id
+    d.mkdir(parents=True, exist_ok=True)
+    return d / f"{replay_id}.json"
+
+
+def latest_replay_for_experiment(experiment_id: str, root: str | Path | None = None) -> dict | None:
+    """Return the latest externally-bound replay diagnostic for one experiment."""
+    root_path = Path(root) if root is not None else Path(os.environ.get("QLT_ROOT", Path.cwd()))
+    experiment_id = _safe_experiment_id(experiment_id)
+    d = root_path / "data" / "random_replays" / "by_experiment" / experiment_id
+    if not d.exists():
+        return None
+    rows = []
+    for p in d.glob("*.json"):
+        try:
+            row = json.loads(p.read_text())
+            summary_path = Path(row["summary_json"])
+            if not summary_path.is_absolute():
+                summary_path = root_path / summary_path
+            expected = row.get("summary_sha256")
+            if expected and (not summary_path.exists() or _sha_file(summary_path) != expected):
+                continue
+            rows.append(row)
+        except (OSError, KeyError, json.JSONDecodeError):
+            continue
+    return max(rows, key=lambda r: r.get("created_at", "")) if rows else None
+
+
 def run_random_replay(
     *,
-    ticker: str = "BTCUSD",
-    horizon: int = 5,
+    experiment_id: str | None = None,
+    ticker: str | None = None,
+    horizon: int | None = None,
     runs: int = DEFAULT_RUNS,
     trade_days: int = DEFAULT_TRADE_DAYS,
     min_training_days: int = DEFAULT_MIN_TRAINING_DAYS,
-    data_start: str = "2018-01-01",
+    data_start: str | None = None,
     data_end: str | None = None,
     sample_start: str | None = None,
     sample_end: str | None = None,
-    seed: int = 42,
+    seed: int | None = None,
     min_start_gap_days: int = 0,
     source_snapshot: str | Path | None = None,
     root: str | Path | None = None,
 ) -> dict:
-    """Run repeated random-start historical replays and persist a compact report."""
-    ticker = ticker.upper()
-    h = max(1, int(horizon))
-    resolved_data_start = _as_date(data_start)
+    """Run repeated random-start historical replays and persist compact evidence."""
+    root_path = Path(root) if root is not None else Path(os.environ.get("QLT_ROOT", Path.cwd()))
+    candidate = _load_candidate_spec(experiment_id, root_path) if experiment_id else None
+
+    if candidate:
+        if ticker is not None and ticker.upper() != candidate.ticker:
+            raise ValueError("candidate_ticker_override_forbidden")
+        if horizon is not None and int(horizon) != candidate.horizon:
+            raise ValueError("candidate_horizon_override_forbidden")
+        if source_snapshot is not None:
+            raise ValueError("candidate_source_snapshot_override_forbidden")
+        ticker = candidate.ticker
+        h = candidate.horizon
+        model_seed = candidate.model_seed
+        model_type = candidate.model_type
+        model_params = candidate.model_params
+        feat_cols = list(candidate.feature_columns)
+        source_snapshot = candidate.dataset_snapshot
+        candidate_start = _as_date(candidate.research_start)
+        candidate_end = _as_date(candidate.research_end)
+        resolved_data_start = _as_date(data_start or candidate.research_start)
+        if resolved_data_start < candidate_start:
+            raise ValueError("candidate_data_start_before_snapshot")
+        if resolved_data_start > candidate_end:
+            raise ValueError("candidate_data_start_after_snapshot")
+        sampling_seed = int(seed if seed is not None else 42)
+    else:
+        ticker = (ticker or "BTCUSD").upper()
+        h = max(1, int(horizon if horizon is not None else 5))
+        model_seed = int(seed if seed is not None else 42)
+        model_type = "logistic"
+        model_params = {}
+        feat_cols = improved_feature_columns()
+        resolved_data_start = _as_date(data_start or "2018-01-01")
+        sampling_seed = int(seed if seed is not None else 42)
+
     resolved_data_end, holdout = _resolve_data_end(ticker, data_end)
+    if candidate:
+        if data_end is not None and resolved_data_end > candidate_end:
+            raise ValueError("candidate_data_end_after_snapshot")
+        if resolved_data_end > candidate_end:
+            resolved_data_end = candidate_end
     if resolved_data_end <= resolved_data_start:
         raise ValueError("data_end_must_follow_data_start")
-
-    resolved_sample_start = _as_date(sample_start or data_start)
+    resolved_sample_start = _as_date(sample_start or resolved_data_start)
     resolved_sample_end = _as_date(sample_end) if sample_end else resolved_data_end
     if resolved_sample_start < resolved_data_start:
         raise ValueError("sample_start_before_data_start")
     if resolved_sample_end > resolved_data_end:
         raise ValueError("sample_end_after_data_end")
 
-    root_path = Path(root) if root is not None else Path(os.environ.get("QLT_ROOT", Path.cwd()))
     df, meta, snap_path = _load_research_snapshot(
         ticker,
         resolved_data_start,
@@ -353,7 +536,7 @@ def run_random_replay(
         root_path,
         source_snapshot=source_snapshot,
     )
-    frame = prepare_replay_frame(df, h)
+    frame = prepare_replay_frame(df, h, feat_cols)
     candidates = eligible_start_indices(
         frame,
         horizon=h,
@@ -366,11 +549,10 @@ def run_random_replay(
         frame,
         candidates,
         runs=runs,
-        seed=seed,
+        seed=sampling_seed,
         min_start_gap_days=min_start_gap_days,
     )
 
-    feat_cols = improved_feature_columns()
     rows: list[dict] = []
     for replay_no, start_idx in enumerate(starts, start=1):
         train, test = build_replay_window(
@@ -380,18 +562,20 @@ def run_random_replay(
             trade_days=trade_days,
             min_training_days=min_training_days,
         )
-        result = train_evaluate_from(
+        result = _train_evaluate_candidate(
             train,
             test,
             feat_cols,
             h,
-            seed=int(seed),
+            model_type=model_type,
+            model_seed=model_seed,
+            model_params=model_params,
             ticker=ticker,
         )
         metrics = result["metrics"]
         strategy_return = float(metrics["cumulative_return_strategy_liquidated"])
         benchmark_return = float(metrics["cumulative_return_benchmark"])
-        row = {
+        rows.append({
             "replay": replay_no,
             "start_date": str(test["event_time"].min()),
             "trade_end": str(test["event_time"].max()),
@@ -402,9 +586,7 @@ def run_random_replay(
             "strategy_return": strategy_return,
             "benchmark_return": benchmark_return,
             "excess_return": strategy_return - benchmark_return,
-            "sharpe": float(
-                metrics.get("sharpe_strategy_liquidated", metrics["sharpe_strategy"])
-            ),
+            "sharpe": float(metrics.get("sharpe_strategy_liquidated", metrics["sharpe_strategy"])),
             "max_drawdown": float(metrics["max_drawdown_strategy"]),
             "accuracy": float(metrics["accuracy"]),
             "return_25bps_worst_phase": float(
@@ -412,11 +594,21 @@ def run_random_replay(
             ),
             "profitable": strategy_return > 0,
             "beat_benchmark": strategy_return > benchmark_return,
-        }
-        rows.append(row)
+        })
 
     summary = summarize_replays(rows)
     config = {
+        "candidate_experiment_id": candidate.experiment_id if candidate else None,
+        "candidate_spec_fingerprint": candidate.spec_fingerprint if candidate else None,
+        "candidate_dataset_id": candidate.dataset_id if candidate else None,
+        "candidate_dataset_checksum": candidate.dataset_checksum if candidate else None,
+        "candidate_dataset_snapshot_sha256": (
+            candidate.dataset_snapshot_sha256 if candidate else None
+        ),
+        "candidate_model_version": candidate.model_version if candidate else None,
+        "candidate_feature_version": candidate.feature_version if candidate else None,
+        "candidate_research_start": candidate.research_start if candidate else None,
+        "candidate_research_end": candidate.research_end if candidate else None,
         "ticker": ticker,
         "horizon": h,
         "runs": int(runs),
@@ -426,7 +618,10 @@ def run_random_replay(
         "data_end": resolved_data_end.isoformat(),
         "sample_start": resolved_sample_start.isoformat(),
         "sample_end": resolved_sample_end.isoformat(),
-        "seed": int(seed),
+        "sampling_seed": sampling_seed,
+        "model_seed": model_seed,
+        "model_type": model_type,
+        "model_params": model_params,
         "min_start_gap_days": int(min_start_gap_days),
         "campaign_id": campaign_id(ticker),
         "campaign_holdout_start": holdout.isoformat() if holdout else None,
@@ -438,7 +633,6 @@ def run_random_replay(
         "training_policy": "expanding_history_with_horizon_purge",
         "independence_policy": "overlap_reported_not_assumed_independent",
     }
-
     fingerprint = hashlib.sha256(
         json.dumps(config, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()[:10]
@@ -453,6 +647,10 @@ def run_random_replay(
         replay_dir = replay_root / f"{replay_id}_r{suffix}"
     replay_dir.mkdir(parents=True, exist_ok=False)
 
+    evidence_path = (
+        _candidate_evidence_file(root_path, candidate.experiment_id, replay_dir.name)
+        if candidate else None
+    )
     report = {
         "random_replay_id": replay_dir.name,
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -462,11 +660,22 @@ def run_random_replay(
             "runs_csv": str(replay_dir / "runs.csv"),
             "summary_json": str(replay_dir / "summary.json"),
             "config_json": str(replay_dir / "config.json"),
+            "candidate_evidence_json": str(evidence_path) if evidence_path else None,
         },
     }
     pl.DataFrame(rows).write_csv(str(replay_dir / "runs.csv"))
     (replay_dir / "config.json").write_text(json.dumps(config, indent=2, sort_keys=True))
-    (replay_dir / "summary.json").write_text(json.dumps(report, indent=2, sort_keys=True))
+    summary_path = replay_dir / "summary.json"
+    summary_path.write_text(json.dumps(report, indent=2, sort_keys=True))
+    if evidence_path is not None:
+        evidence_path.write_text(json.dumps({
+            "candidate_experiment_id": candidate.experiment_id,
+            "random_replay_id": replay_dir.name,
+            "created_at": report["created_at"],
+            "summary": summary,
+            "summary_json": str(summary_path),
+            "summary_sha256": _sha_file(summary_path),
+        }, indent=2, sort_keys=True))
     return report
 
 
@@ -474,21 +683,22 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Leakage-safe random-start robustness replay for Quant Loop Trader"
     )
-    parser.add_argument("--ticker", default="BTCUSD")
-    parser.add_argument("--horizon", type=int, default=5)
+    parser.add_argument("--experiment", default=None, help="verified candidate experiment id")
+    parser.add_argument("--ticker", default=None)
+    parser.add_argument("--horizon", type=int, default=None)
     parser.add_argument("--runs", type=int, default=DEFAULT_RUNS)
     parser.add_argument("--trade-days", type=int, default=DEFAULT_TRADE_DAYS)
     parser.add_argument("--min-training-days", type=int, default=DEFAULT_MIN_TRAINING_DAYS)
-    parser.add_argument("--data-start", default="2018-01-01")
+    parser.add_argument("--data-start", default=None)
     parser.add_argument("--data-end", default=None)
     parser.add_argument("--sample-start", default=None)
     parser.add_argument("--sample-end", default=None)
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--seed", type=int, default=None, help="sampling seed; standalone model seed too")
     parser.add_argument("--min-start-gap-days", type=int, default=0)
     parser.add_argument("--source-snapshot", default=None)
     args = parser.parse_args()
-
     report = run_random_replay(
+        experiment_id=args.experiment,
         ticker=args.ticker,
         horizon=args.horizon,
         runs=args.runs,

@@ -244,7 +244,12 @@ def coverage_check(df: pl.DataFrame, ticker: str, start: str, end: str) -> None:
 
 def fetch_ohlcv(ticker: str = "SPY", start: str = "2018-01-01", end: str = "2024-12-31",
                 use_cache: bool = True) -> tuple[pl.DataFrame, str]:
-    """Fetch OHLCV with PIT columns. Returns (df, actual_source)."""
+    """Fetch OHLCV with PIT columns. Returns (df, actual_source).
+
+    A malformed or incomplete crypto cache is never accepted. When a Tiingo key is
+    available, cache validation failures fall through to a fresh network fetch
+    instead of aborting the research session on stale local state.
+    """
     PROC_DIR.mkdir(parents=True, exist_ok=True)
     ticker = ticker.upper()
     parquet_path = PROC_DIR / f"{ticker}.parquet"
@@ -264,9 +269,12 @@ def fetch_ohlcv(ticker: str = "SPY", start: str = "2018-01-01", end: str = "2024
                     coverage_check(df, ticker=ticker, start=start, end=end)
                     logger.info(json.dumps({"event": "cache_hit_parquet", "ticker": ticker, "rows": df.height}))
                     return df, "cache"
-        except Exception:
-            if is_crypto(ticker):
-                raise
+        except Exception as exc:
+            logger.warning(json.dumps({
+                "event": "cache_invalid_refresh",
+                "ticker": ticker,
+                "error": str(exc)[:200],
+            }))
 
     api_key = os.getenv("TIINGO_API_KEY", "").strip()
     if api_key:
