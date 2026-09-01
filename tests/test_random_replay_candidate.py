@@ -55,25 +55,16 @@ def test_candidate_replay_uses_candidate_model_features_and_indexes_evidence(tmp
         model_version="majority-v1",
         feature_version="baseline-subset",
         dataset_snapshot_sha256="snapshotsha",
+        research_start="2019-01-01",
+        research_end="2021-11-30",
     )
     monkeypatch.setattr(rr, "_load_candidate_spec", lambda experiment_id, root: spec)
-
-    # The candidate config lookup is only used to recover the research start for
-    # old bundles. Stub the verified bundle surface without mutating a real bundle.
-    class _Bundle:
-        config = {"start": "2019-01-01"}
-
-    import quant_loop_trader.bundle as bundle_mod
-    monkeypatch.setattr(bundle_mod.ExperimentBundle, "open_verified", classmethod(
-        lambda cls, experiment_id, exp_root: _Bundle()
-    ))
 
     report = rr.run_random_replay(
         experiment_id="candidate_001",
         runs=4,
         trade_days=60,
         min_training_days=120,
-        data_end="2021-12-31",
         seed=123,
         root=tmp_path,
     )
@@ -84,6 +75,7 @@ def test_candidate_replay_uses_candidate_model_features_and_indexes_evidence(tmp
     assert cfg["model_seed"] == 777
     assert cfg["sampling_seed"] == 123
     assert cfg["feature_set"] == ["ret_1", "ret_5"]
+    assert cfg["data_end"] == "2021-11-30"
     assert report["summary"]["runs"] == 4
 
     evidence = rr.latest_replay_for_experiment("candidate_001", root=tmp_path)
@@ -108,7 +100,40 @@ def test_candidate_replay_rejects_strategy_overrides(tmp_path, monkeypatch):
         model_version=None,
         feature_version=None,
         dataset_snapshot_sha256=None,
+        research_start="2019-01-01",
+        research_end="2021-12-31",
     )
     monkeypatch.setattr(rr, "_load_candidate_spec", lambda experiment_id, root: spec)
     with pytest.raises(ValueError, match="candidate_ticker_override_forbidden"):
         rr.run_random_replay(experiment_id="candidate_002", ticker="SPY", root=tmp_path)
+
+
+def test_candidate_replay_rejects_data_end_after_sealed_window(tmp_path, monkeypatch):
+    spec = rr.CandidateReplaySpec(
+        experiment_id="candidate_003",
+        ticker="BTCUSD",
+        horizon=5,
+        model_seed=42,
+        model_type="logistic",
+        model_params={},
+        feature_columns=tuple(rr.improved_feature_columns()),
+        dataset_snapshot=tmp_path / "unused.parquet",
+        dataset_id=None,
+        dataset_checksum=None,
+        spec_fingerprint=None,
+        model_version=None,
+        feature_version=None,
+        dataset_snapshot_sha256=None,
+        research_start="2019-01-01",
+        research_end="2021-06-30",
+    )
+    monkeypatch.setattr(rr, "_load_candidate_spec", lambda experiment_id, root: spec)
+    monkeypatch.setenv("QLT_CRYPTO_CAMPAIGN_ID", "candidate_replay_test_v1")
+    monkeypatch.setenv("QLT_CRYPTO_HOLDOUT_START", "2022-01-01")
+
+    with pytest.raises(ValueError, match="candidate_data_end_after_snapshot"):
+        rr.run_random_replay(
+            experiment_id="candidate_003",
+            data_end="2021-07-01",
+            root=tmp_path,
+        )
