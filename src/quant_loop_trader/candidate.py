@@ -12,6 +12,9 @@ from pathlib import Path
 from quant_loop_trader.features import improved_feature_columns
 from quant_loop_trader.market import campaign_holdout_start, campaign_id
 
+LEGACY_FEATURE_VERSION = "v1+vol_regime_ret5_x_vol10"
+LEGACY_MODEL_VERSION = "sklearn-LogReg-C1.0-scaled"
+
 
 @dataclass(frozen=True)
 class CandidateSpec:
@@ -61,19 +64,33 @@ class CandidateSpec:
                 f"candidate={candidate_campaign}:active={active_campaign}"
             )
 
+        feature_version = cfg.get("feature_version_improved")
         feature_cols = cfg.get("feature_columns")
         if not feature_cols:
             feature_cols = report.get("parameters", {}).get("feature_columns")
         if not feature_cols:
+            # Existing sealed experiments predate explicit feature_columns. Their
+            # exact feature identity is still recoverable from this frozen version.
+            if feature_version != LEGACY_FEATURE_VERSION:
+                raise ValueError(
+                    "candidate_feature_columns_missing_for_version:"
+                    f"{feature_version or 'missing'}"
+                )
             feature_cols = improved_feature_columns()
         feature_cols = tuple(str(c) for c in feature_cols)
         validate_feature_columns(feature_cols)
 
-        model_type = (
-            cfg.get("model_type")
-            or report.get("parameters", {}).get("model_type")
-            or "logistic"
-        )
+        model_version = cfg.get("model_version")
+        model_type = cfg.get("model_type") or report.get("parameters", {}).get("model_type")
+        if not model_type:
+            # Same compatibility rule for the pre-CandidateSpec experiment format:
+            # never infer logistic for an unknown model version.
+            if model_version != LEGACY_MODEL_VERSION:
+                raise ValueError(
+                    "candidate_model_type_missing_for_version:"
+                    f"{model_version or 'missing'}"
+                )
+            model_type = "logistic"
         model_params = (
             cfg.get("model_params")
             or report.get("parameters", {}).get("model_params")
@@ -96,8 +113,8 @@ class CandidateSpec:
             dataset_id=cfg.get("dataset_id"),
             dataset_checksum=cfg.get("dataset_checksum"),
             spec_fingerprint=cfg.get("spec_fingerprint"),
-            model_version=cfg.get("model_version"),
-            feature_version=cfg.get("feature_version_improved"),
+            model_version=model_version,
+            feature_version=feature_version,
             dataset_snapshot_sha256=bundle.lock.get("dataset_snapshot_sha256"),
             research_start=str(cfg.get("start", "2018-01-01")),
             research_end=str(cfg["end"]),
