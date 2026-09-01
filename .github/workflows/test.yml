@@ -22,18 +22,27 @@ jobs:
           pip install -e ".[dev]"
           pip install ruff
 
-      - name: Verify imports
+      - name: Verify core imports
         run: |
           python -c "
           import quant_loop_trader
-          from quant_loop_trader import data, replay, features, evaluation, experiment
-          from quant_loop_trader import agents, research_memory, autonomy, report, paper_trading
+          from quant_loop_trader import candidate, data, replay, features, evaluation, experiment
+          from quant_loop_trader import agents, research_memory, autonomy, report, random_replay
           from quant_loop_trader.connectors import alpaca, fred, sec
           from quant_loop_trader.features import macro, fundamental, technical
           from quant_loop_trader.validation import holdout, ablation, walkforward, multiple_testing, dashboard
-          from quant_loop_trader.research import hypothesis_engine, experiment_generator, hypothesis_ranker
           from quant_loop_trader.monitoring import heartbeat, health, alerts
-          print('all imports ok')
+          print('core imports ok')
+          "
+
+      - name: Verify deferred imports
+        run: |
+          python -c "
+          from quant_loop_trader.experimental import paper_trading
+          from quant_loop_trader.experimental.portfolio import construction
+          from quant_loop_trader.experimental.strategies import framework
+          from quant_loop_trader.experimental.hypothesis import hypothesis_engine, experiment_generator, hypothesis_ranker
+          print('experimental imports ok')
           "
 
       - name: Lint (ruff)
