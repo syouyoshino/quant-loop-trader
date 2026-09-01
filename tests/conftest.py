@@ -15,10 +15,9 @@ def isolated_research(tmp_path, monkeypatch):
     import quant_loop_trader.research_memory as rm_mod
     import quant_loop_trader.autonomy as auto_mod
     import quant_loop_trader.agents as agents_mod
-    import quant_loop_trader.automation.queue as queue_mod
 
     db = tmp_path / "data" / "research.duckdb"
-    for m in (data_mod, exp_mod, rm_mod, auto_mod, queue_mod):
+    for m in (data_mod, exp_mod, rm_mod, auto_mod):
         if hasattr(m, "DB_PATH"):
             monkeypatch.setattr(m, "DB_PATH", db)
 
@@ -98,7 +97,6 @@ def dashboard_fixture_holdout_seals(request, monkeypatch):
         )
         con.close()
 
-        # This legacy stage test intentionally models a missing dataset snapshot.
         if request.node.name == "test_pipeline_stages_reflect_recorded_evidence":
             dataset.unlink(missing_ok=True)
         return d

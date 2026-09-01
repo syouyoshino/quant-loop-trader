@@ -1,10 +1,15 @@
-"""Task 1 tests: hypothesis engine, novelty, ranking, config generation."""
+"""Deferred hypothesis-engine tests: novelty, ranking, and config generation."""
 
-from quant_loop_trader.research.hypothesis_engine import (
-    generate_candidates, novelty_check, token_similarity,
+from quant_loop_trader.experimental.hypothesis.hypothesis_engine import (
+    generate_candidates,
+    novelty_check,
+    token_similarity,
 )
-from quant_loop_trader.research.experiment_generator import to_experiment_config, validate_config
-from quant_loop_trader.research.hypothesis_ranker import rank
+from quant_loop_trader.experimental.hypothesis.experiment_generator import (
+    to_experiment_config,
+    validate_config,
+)
+from quant_loop_trader.experimental.hypothesis.hypothesis_ranker import rank
 
 
 def test_token_similarity_bounds():
@@ -25,12 +30,20 @@ def test_generate_candidates_structured_and_memory_aware():
     assert cands
     for h in cands:
         d = h.to_dict()
-        for field in ["hypothesis_id", "title", "research_question", "reasoning",
-                      "feature_groups", "target_variable", "prediction_horizon",
-                      "model_type", "expected_mechanism", "risk_factors"]:
+        for field in [
+            "hypothesis_id",
+            "title",
+            "research_question",
+            "reasoning",
+            "feature_groups",
+            "target_variable",
+            "prediction_horizon",
+            "model_type",
+            "expected_mechanism",
+            "risk_factors",
+        ]:
             assert field in d
         assert h.prediction_horizon == 5
-        # every hypothesis carries economic reasoning — no blind statistical fishing
         assert len(h.reasoning) > 20
 
 
@@ -39,7 +52,6 @@ def test_ranking_orders_and_penalizes_failures():
     ranked = rank(cands)
     scores = [r["score"] for r in ranked]
     assert scores == sorted(scores, reverse=True)
-    # components include memory signals
     top = ranked[0]
     assert {"info_gain", "novelty", "mechanism", "duplicate_risk"} <= set(top["components"])
 
@@ -55,13 +67,10 @@ def test_experiment_config_generation_and_validation():
 
 
 def test_macro_families_gated_behind_alfred(monkeypatch):
-    """FRED-revision ceiling: macro feature families are excluded from hypothesis
-    generation unless the operator explicitly accepts revised-data exposure."""
     monkeypatch.delenv("QLT_ALLOW_REVISED_MACRO", raising=False)
     cands = generate_candidates([], max_candidates=50)
     for h in cands:
         assert not (set(h.feature_groups) & {"macro_rates", "macro_inflation", "macro_labor"})
-    # operator override reopens them
     monkeypatch.setenv("QLT_ALLOW_REVISED_MACRO", "true")
     cands2 = generate_candidates([], max_candidates=50)
     assert any("macro_rates" in h.feature_groups for h in cands2)

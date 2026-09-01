@@ -13,6 +13,7 @@ from pathlib import Path
 import numpy as np
 import polars as pl
 
+from quant_loop_trader.candidate import CandidateSpec
 from quant_loop_trader.experiment import EXP_ROOT
 from quant_loop_trader.features import add_improved_features, improved_feature_columns
 from quant_loop_trader.market import periods_per_year
@@ -119,45 +120,43 @@ def statistical_review(exp_dir: Path, alpha: float = 0.05) -> dict:
 # --- Adversarial Reviewer ---------------------------------------------------
 def adversarial_review(exp_dir: Path, ticker: str, horizon: int,
                        start: str, end: str, seed: int, n_shuffles: int = 200,
-                       parquet_path: Path | None = None) -> dict:
-    """Hostile tests rebuilt from the experiment's immutable snapshot."""
+                       parquet_path: Path | None = None,
+                       feature_cols: list[str] | tuple[str, ...] | None = None,
+                       model_type: str = "logistic",
+                       model_params: dict | None = None) -> dict:
+    """Hostile tests rebuilt from the exact candidate and immutable snapshot."""
     from quant_loop_trader.experiment import build_train_test
+    from quant_loop_trader.models.registry import build_model
 
+    cols = list(feature_cols or improved_feature_columns())
     train, test = build_train_test(
         ticker, start, end, horizon, add_improved_features,
-        improved_feature_columns(), parquet_path=parquet_path,
+        cols, parquet_path=parquet_path,
     )
 
-    from sklearn.linear_model import LogisticRegression
-    from sklearn.pipeline import Pipeline
-    from sklearn.preprocessing import StandardScaler
-
-    Xtr = train.select(improved_feature_columns()).to_numpy()
+    Xtr = train.select(cols).to_numpy()
     ytr = train["label"].to_numpy()
-    Xte = test.select(improved_feature_columns()).to_numpy()
+    Xte = test.select(cols).to_numpy()
     yte = test["label"].to_numpy()
 
-    def _pipe():
-        return Pipeline([
-            ("scaler", StandardScaler()),
-            ("clf", LogisticRegression(max_iter=1000, random_state=seed)),
-        ])
+    def _model():
+        return build_model(model_type, seed=seed, **dict(model_params or {}))
 
     rng = np.random.default_rng(seed)
-    pipe = _pipe()
-    pipe.fit(Xtr, ytr)
-    real_acc = float((pipe.predict(Xte) == yte).mean())
+    model = _model()
+    model.fit(Xtr, ytr)
+    real_acc = float((model.predict(Xte) == yte).mean())
 
     Xte_shuf = rng.permuted(Xte, axis=0)
-    shuffled_acc = float((pipe.predict(Xte_shuf) == yte).mean())
+    shuffled_acc = float((model.predict(Xte_shuf) == yte).mean())
     feature_dependent = real_acc - shuffled_acc > 0.01
 
     null_accs = np.empty(n_shuffles)
     for i in range(n_shuffles):
         ytr_rand = rng.permutation(ytr)
-        pipe_r = _pipe()
-        pipe_r.fit(Xtr, ytr_rand)
-        null_accs[i] = (pipe_r.predict(Xte) == yte).mean()
+        model_r = _model()
+        model_r.fit(Xtr, ytr_rand)
+        null_accs[i] = (model_r.predict(Xte) == yte).mean()
     null_p95 = float(np.quantile(null_accs, 0.95))
 
     pred_df = _load_predictions(exp_dir)
@@ -190,6 +189,8 @@ def adversarial_review(exp_dir: Path, ticker: str, horizon: int,
         "shuffled_acc": shuffled_acc,
         "null_p95": null_p95,
         "regime_accs": reg_accs,
+        "model_type": model_type,
+        "feature_count": len(cols),
     }))
     return _msg(
         "adversarial_reviewer",
@@ -204,18 +205,32 @@ def adversarial_review(exp_dir: Path, ticker: str, horizon: int,
 
 # --- Independent Replicator -------------------------------------------------
 def independent_replication(experiment_id: str, tolerance: float = 1e-9) -> dict:
-    """Rebuild independently from the sealed snapshot and documented config."""
+    """Rebuild independently from the sealed snapshot and canonical candidate spec."""
     from quant_loop_trader.bundle import ExperimentBundle
     from quant_loop_trader.experiment import build_train_test
 
     bundle = ExperimentBundle.open_verified(experiment_id, EXP_ROOT)
-    cfg = bundle.config
+    candidate = CandidateSpec.from_bundle(bundle)
     report = bundle.report
+    cols = list(candidate.feature_columns)
     train, test = build_train_test(
-        cfg["ticker"], cfg["start"], cfg["end"], cfg["horizon"],
-        add_improved_features, improved_feature_columns(),
-        parquet_path=bundle.dataset_snapshot,
+        candidate.ticker,
+        candidate.research_start,
+        candidate.research_end,
+        candidate.horizon,
+        add_improved_features,
+        cols,
+        parquet_path=candidate.dataset_snapshot,
     )
+
+    # Deliberately independent implementation. Do not call registry.build_model
+    # here: a shared model bug would otherwise make creator and replicator agree.
+    if candidate.model_type != "logistic":
+        return _msg(
+            "independent_replicator",
+            ["dataset_reconstruction", "feature_rebuild"],
+            [f"replication_unsupported_model:{candidate.model_type}"],
+        )
 
     from sklearn.linear_model import LogisticRegression
     from sklearn.pipeline import Pipeline
@@ -223,12 +238,12 @@ def independent_replication(experiment_id: str, tolerance: float = 1e-9) -> dict
 
     pipe = Pipeline([
         ("scaler", StandardScaler()),
-        ("clf", LogisticRegression(max_iter=1000, random_state=cfg["seed"])),
+        ("clf", LogisticRegression(max_iter=1000, random_state=candidate.model_seed)),
     ])
-    Xte = test.select(improved_feature_columns()).to_numpy()
+    Xte = test.select(cols).to_numpy()
     yte = test["label"].to_numpy()
     pipe.fit(
-        train.select(improved_feature_columns()).to_numpy(),
+        train.select(cols).to_numpy(),
         train["label"].to_numpy(),
     )
     ypred = pipe.predict(Xte)
@@ -244,8 +259,8 @@ def independent_replication(experiment_id: str, tolerance: float = 1e-9) -> dict
         ypred,
         prob,
         test["close"].to_numpy(),
-        horizon=cfg["horizon"],
-        ticker=cfg["ticker"],
+        horizon=candidate.horizon,
+        ticker=candidate.ticker,
     )
 
     claimed = report["improved_metrics"]
@@ -291,28 +306,37 @@ def validate_experiment(experiment_id: str) -> dict:
     exp_dir = EXP_ROOT / experiment_id
     try:
         bundle = ExperimentBundle.open_verified(experiment_id, EXP_ROOT)
-    except BundleIntegrityError as exc:
-        issues = _verify_locks(exp_dir)
+        candidate = CandidateSpec.from_bundle(bundle)
+    except (BundleIntegrityError, ValueError, FileNotFoundError) as exc:
+        issues = _verify_locks(exp_dir) if exp_dir.exists() else []
         verdict = {
             "experiment_id": experiment_id,
             "reviews": [],
             "hardening": {},
             "approval_status": "REJECTED",
-            "issues_found": issues or [f"bundle_integrity:{exc}"],
+            "issues_found": issues or [f"candidate_integrity:{exc}"],
         }
         if exp_dir.exists():
             (exp_dir / "validation.json").write_text(json.dumps(verdict, indent=2))
         return verdict
 
-    cfg = bundle.config
-    ticker, horizon = cfg["ticker"], cfg["horizon"]
-    start, end, seed = cfg["start"], cfg["end"], cfg["seed"]
+    ticker, horizon = candidate.ticker, candidate.horizon
+    start, end, seed = candidate.research_start, candidate.research_end, candidate.model_seed
+    cols = list(candidate.feature_columns)
 
     reviews = [
         statistical_review(bundle.exp_dir),
         adversarial_review(
-            bundle.exp_dir, ticker, horizon, start, end, seed,
-            parquet_path=bundle.dataset_snapshot,
+            bundle.exp_dir,
+            ticker,
+            horizon,
+            start,
+            end,
+            seed,
+            parquet_path=candidate.dataset_snapshot,
+            feature_cols=cols,
+            model_type=candidate.model_type,
+            model_params=candidate.model_params,
         ),
         independent_replication(experiment_id),
     ]
@@ -331,18 +355,28 @@ def validate_experiment(experiment_id: str) -> dict:
     hardening_issues: list[str] = []
     try:
         from quant_loop_trader.experiment import build_train_test
-        from quant_loop_trader.models.registry import LogisticModel
+        from quant_loop_trader.models.registry import build_model
         from quant_loop_trader.validation.walkforward import WalkForwardValidator
 
         train, test = build_train_test(
-            ticker, start, end, horizon, add_improved_features,
-            improved_feature_columns(), parquet_path=bundle.dataset_snapshot,
+            ticker,
+            start,
+            end,
+            horizon,
+            add_improved_features,
+            cols,
+            parquet_path=candidate.dataset_snapshot,
         )
         full = pl.concat([train, test]).sort("event_time")
-        wf = WalkForwardValidator(lambda: LogisticModel(seed=seed), n_folds=3)
-        hardening["walk_forward"] = wf.run(
-            full, improved_feature_columns(), horizon=horizon
+        wf = WalkForwardValidator(
+            lambda: build_model(
+                candidate.model_type,
+                seed=seed,
+                **dict(candidate.model_params),
+            ),
+            n_folds=3,
         )
+        hardening["walk_forward"] = wf.run(full, cols, horizon=horizon)
         if not hardening["walk_forward"]["stable_across_time"]:
             hardening_issues.append("walk_forward:not_stable_across_folds")
 
@@ -384,26 +418,34 @@ def validate_experiment(experiment_id: str) -> dict:
                     f"multiple_testing:fdr_not_significant:p{current_p:.4f}"
                 )
 
-        from quant_loop_trader.validation.ablation import run_ablation
-        abl = run_ablation(
-            ticker,
-            start,
-            end,
-            horizon,
-            seed,
-            {
-                "momentum": ["ret_1", "ret_5", "ma10_gap"],
-                "volatility": ["vol10", "rsi14"],
-            },
-            parquet_path=bundle.dataset_snapshot,
-        )
-        hardening["ablation"] = abl.to_dicts()
-        removable = abl.filter(pl.col("removed") != "(none)")
-        if removable.height and removable["delta_vs_full"].max() > 0.02:
-            hardening_issues.append(
-                f"ablation:removal_improves_accuracy:"
-                f"{removable['delta_vs_full'].max():.3f}"
+        # Ablation is diagnostic for the current canonical improved feature family.
+        # Do not silently apply a different feature grouping to future candidates.
+        if tuple(cols) == tuple(improved_feature_columns()):
+            from quant_loop_trader.validation.ablation import run_ablation
+            abl = run_ablation(
+                ticker,
+                start,
+                end,
+                horizon,
+                seed,
+                {
+                    "momentum": ["ret_1", "ret_5", "ma10_gap"],
+                    "volatility": ["vol10", "rsi14"],
+                },
+                parquet_path=candidate.dataset_snapshot,
             )
+            hardening["ablation"] = abl.to_dicts()
+            removable = abl.filter(pl.col("removed") != "(none)")
+            if removable.height and removable["delta_vs_full"].max() > 0.02:
+                hardening_issues.append(
+                    f"ablation:removal_improves_accuracy:"
+                    f"{removable['delta_vs_full'].max():.3f}"
+                )
+        else:
+            hardening["ablation"] = {
+                "status": "not_applicable",
+                "reason": "candidate_feature_set_differs_from_canonical_ablation_groups",
+            }
     except Exception as exc:
         hardening["error"] = str(exc)[:200]
         hardening_issues.append(f"hardening_error:{str(exc)[:120]}")
@@ -418,6 +460,14 @@ def validate_experiment(experiment_id: str) -> dict:
 
     verdict = {
         "experiment_id": experiment_id,
+        "candidate": {
+            "ticker": candidate.ticker,
+            "horizon": candidate.horizon,
+            "model_type": candidate.model_type,
+            "model_params": candidate.model_params,
+            "feature_columns": cols,
+            "spec_fingerprint": candidate.spec_fingerprint,
+        },
         "reviews": reviews,
         "hardening": hardening,
         "approval_status": "APPROVED" if approved else "REJECTED",

@@ -1,141 +1,178 @@
 # Quant Loop Trader
 
-Historical-replay market prediction engine. BTCUSD and SPY are supported as daily research markets; broker order execution is deliberately absent. The intended flow is:
+A leakage-aware historical research engine for **BTCUSD** and SPY. The active runtime is deliberately small: acquire data → seal an immutable dataset → run an experiment → bind the exact strategy into `CandidateSpec` → validate/replay it → expose the final holdout once.
 
-1. Fetch and cache market and macro data in `data/raw/` and `data/cache/`.
-2. Produce replay-ready feature data in `data/processed/`.
-3. Run predictions strictly one historical timestamp at a time, using only data available at that timestamp.
-4. Record results for evaluation and validation before any broker integration.
+**This repository does not place real-money orders.** Broker execution is deliberately absent. Deferred portfolio, generalized strategy, hypothesis-generation, and paper-simulation code lives under `experimental/` and is not part of the BTC research runtime.
 
-## Layout
+## Active research path
 
 ```text
-src/quant_loop_trader/  Application code
-data/                   Local data root (market data is ignored by Git)
-tests/                  Automated checks
-.env                    Your local API credentials (ignored by Git)
-.env.example            Safe credential template
+Tiingo BTCUSD / SPY data
+        ↓
+exact PIT + calendar validation
+        ↓
+content-addressed immutable snapshot
+        ↓
+experiment.py
+        ↓
+CandidateSpec
+(model + params + features + seed + dataset + campaign)
+        ↓
+validation ───── random replay
+        ↓              ↓
+independent replication + robustness evidence
+        ↓
+one-shot final holdout
 ```
 
-## Local setup
+The active core is intentionally limited to:
 
-Create a virtual environment with Python 3.12 and install:
+```text
+candidate.py          canonical verified candidate identity
+data.py               acquisition, BTC coverage checks, snapshots, DuckDB
+market.py             market calendars + crypto campaign/holdout identity
+replay.py             point-in-time snapshots
+features/             causal feature construction
+models/               research model registry + prediction objects
+evaluation.py         predictive + economic metrics and cost stress
+experiment.py         canonical experiment runner
+random_replay.py      seeded historical random-start robustness replay
+validation/           statistical, walk-forward, holdout and hardening checks
+agents.py             adversarial + independent replication gate
+research_memory.py    durable evidence/memory
+ autonomy.py          the single autonomous research orchestrator
+dashboard/            read-only observability
+```
+
+## Setup
+
+Python 3.12 is the supported runtime:
 
 ```bash
 python3.12 -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev]"
-```
-
-Copy the safe template if needed, then paste your own values into `.env`:
-
-```bash
 cp .env.example .env
 ```
 
-Keep `ALPACA_PAPER=true`; this repository does not contain a live broker-order path.
+For BTCUSD, add a valid `TIINGO_API_KEY` to `.env`. BTC data fails closed unless the requested UTC daily window has exact 24/7 coverage.
 
-## Minimum Viable Research Scientist (Level 1)
-
-Single-command end-to-end loop — fetch → PIT snapshot → train baseline → predict → evaluate vs hidden future → autopsy → improved hypothesis → compare → store → reproduce:
+## Run Bitcoin research
 
 ```bash
-# SPY uses TIINGO_API_KEY if present, else the offline fixture.
-.venv/bin/python -m quant_loop_trader.experiment --ticker SPY --horizon 5 --start 2018-01-01 --end 2024-12-31
+# One BTC experiment. Bars on/after the configured campaign holdout are not used
+# for ordinary research training/testing.
+.venv/bin/python -m quant_loop_trader.experiment \
+  --ticker BTCUSD \
+  --horizon 5 \
+  --start 2018-01-01 \
+  --end 2024-12-31
 
-# BTCUSD requires TIINGO_API_KEY and exact 24/7 daily coverage.
-.venv/bin/python -m quant_loop_trader.experiment --ticker BTCUSD --horizon 5 --start 2018-01-01 --end 2024-12-31
-
-# outputs:
-#   data/processed/{TICKER}.parquet   — cached OHLCV with event_time/available_time
-#   data/research.duckdb              — datasets + experiments tables (migrated)
-#   data/experiments/{id}/report.json — full Experiment Framework record
-#   data/experiments/{id}/predictions_*.parquet
-
-# reproduce a prior experiment
-.venv/bin/python -m quant_loop_trader.experiment --reproduce <experiment_id>
-
-# run the independent validation gate (statistical + adversarial + replication)
+# Independent validation gate.
 .venv/bin/python -m quant_loop_trader.experiment --validate <experiment_id>
 
-# autonomous research session (observation mode, budgeted)
-.venv/bin/python -m quant_loop_trader.autonomy --ticker BTCUSD --horizon 5 --max-experiments 1
+# Candidate-bound random-start robustness replay.
+.venv/bin/python -m quant_loop_trader.random_replay \
+  --experiment <experiment_id> \
+  --runs 100 \
+  --trade-days 180
 
-# run tests (no API required, uses fixture/mocks)
-.venv/bin/python -m pytest -v
+# Reproduce from the experiment's sealed dataset snapshot.
+.venv/bin/python -m quant_loop_trader.experiment --reproduce <experiment_id>
+
+# Budgeted autonomous BTC research. This is the ONE orchestration path.
+QLT_AUTONOMOUS_ENABLED=true \
+.venv/bin/python -m quant_loop_trader.autonomy \
+  --ticker BTCUSD \
+  --horizon 5 \
+  --max-experiments 1
 ```
 
-For BTC campaign rules, strict Tiingo coverage checks, new-campaign configuration, and the credentialed live smoke test, see [docs/bitcoin.md](docs/bitcoin.md).
+The default BTC campaign is `btc_pre2024_v1` with a permanent holdout beginning `2024-01-01`. Moving that boundary requires an explicitly new crypto campaign ID. See [docs/bitcoin.md](docs/bitcoin.md).
 
-**Design:** daily market research with market-aware annualisation (SPY 252, crypto 365), LogisticRegression + StandardScaler, 5 lagged features (ret_1, ret_5, ma10_gap, vol10, rsi14) + 2 vol-regime interactions for the improvement. `ReplayEngine.get_snapshot(ticker, timestamp)` enforces `available_time <= prediction_timestamp` — only `evaluation.py` sees future outcomes. Baseline vs improved are compared on an identical hidden research test with accuracy/precision/recall/Brier + Sharpe/vol/DD/turnover/cost. For h-day economics, phase 0 remains the legacy chart series while canonical cost stress is the worst result across every valid entry phase.
+## What `CandidateSpec` prevents
 
-## Levels
+Every trusted downstream check derives one strategy identity from a **verified experiment bundle**. It binds:
 
-- **L1 — MVP Research Scientist:** single-command loop (`experiment.py`), PIT replay, baseline vs improvement, DuckDB provenance, reproducible via `--reproduce`.
-- **L2 — Research Infrastructure:** `research_memory.py` (institutional memory + belief updates + duplicate-risk detection), feature/model registries, migration `002_registries.sql`.
-- **L3 — Multi-Agent Research Team:** `agents.py` — role/permission model (researcher cannot approve own work), validation gate with three independent reviewers: statistical (binomial significance vs base rate), adversarial (label-randomisation null test, regime concentration), and an independent replicator that rebuilds dataset→features→model from documented artifacts only. Champion promotion requires APPROVED from all reviewers plus the final holdout gate.
-- **L4 — Autonomous Research Mode:** `autonomy.py` — budgeted observation-mode sessions: review memory → select unseen configs (duplicate prevention) → run experiments → validate → store knowledge. Scheduling = invoke from cron/launchd; sessions are crash-safe (each experiment commits independently). Crypto campaign identity and holdout boundary are bound into experiment fingerprints.
+- ticker and horizon,
+- model type, model parameters and seed,
+- exact feature columns,
+- immutable dataset snapshot and checksum,
+- experiment fingerprint,
+- crypto campaign and holdout boundary.
 
-## Platform phases (all built; autonomous mode OFF by default)
+Random replay, validation and final holdout therefore cannot silently evaluate different versions of the candidate. Unsupported feature families or replication models fail closed instead of falling back to a different strategy.
 
-| Phase | Module(s) | Notes |
-|---|---|---|
-| 3 — Features | `features/` (technical, macro, fundamental, pit) | as-of availability joins; truncation-invariance leakage tests |
-| 4 — Prediction | `models/prediction.py`, `experiment.run_horizons` | frozen Prediction objects (1/3/5/10/20d) |
-| 5 — Models | `models/registry.py` | random/majority baselines, logistic, XGBoost (`pip install '.[advanced]'`) |
-| 6 — Experiments | `experiment.py` registry API | list/get/compare, train+test period provenance |
-| 7 — Validation | `validation/` | hidden holdout, ablation, bias dashboard, bootstrap CI |
-| 8 — Portfolio | `portfolio/construction.py` | equal/vol/risk sizing, water-filled caps, drawdown stop |
-| 9 — Strategies | `strategies/framework.py` | Strategy ABC + PIT-only contract; reference impl only |
-| 10 — Automation | `automation/controller.py`, `queue.py` | task queue + controller, **inert** until `enabled=True` AND `QLT_AUTONOMOUS_ENABLED=true` |
-| 11 — Paper prep | `paper_trading.py` | Order/simulator/tracker offline; broker **disabled** until `allow=True` AND `QLT_PAPER_ENABLED=true` |
+Independent replication intentionally remains a separate implementation. That duplication is a scientific defense: a bug in the creator's model path should not automatically reproduce itself in the verifier.
 
-## Research terminal (read-only dashboard)
+## Bitcoin integrity rules
 
-Bloomberg-style observability over the running lab — cycle progress, live
-pipeline, equity/drawdown/rolling charts, validation evidence, rejection
-analytics and system health. It only reads: DuckDB is opened `read_only`, no
-artifact is ever written, and anything Quant Loop has not produced renders as
-`N/A`.
+BTCUSD research retains the safeguards that materially affect evidence quality:
+
+- exact 24/7 Tiingo daily coverage and gap checking,
+- `event_time` / `available_time` point-in-time contract,
+- causal lagged features plus truncation-invariance tests,
+- horizon purge between training and test data,
+- immutable content-addressed datasets,
+- permanent campaign-level holdout,
+- one-shot crash-safe holdout claims and sealed evidence,
+- majority/significance checks and multiple-testing controls,
+- adversarial feature/label tests,
+- independent replication,
+- random-start temporal robustness with overlap diagnostics,
+- transaction costs and worst-entry-phase cost stress.
+
+For multi-day models, replay reports overlapping windows explicitly and does **not** assume the repeated windows are statistically independent.
+
+## Deferred capabilities
+
+These capabilities are preserved but intentionally outside the active BTC core:
+
+```text
+experimental/
+  hypothesis/          hypothesis generation/ranking
+  portfolio/           multi-asset sizing and caps
+  strategies/          generalized Strategy interface
+  paper_trading.py     offline fill/portfolio simulator
+```
+
+They can be developed independently without increasing the complexity of the research-evidence path.
+
+## Tests and Bitcoin smoke check
+
+```bash
+.venv/bin/python -m pytest -q -m "not integration"
+```
+
+GitHub Actions runs import checks, Ruff, and the offline suite on pushes and pull requests. A manual `workflow_dispatch` job runs the credentialed Tiingo BTCUSD coverage integration test and fails if `TIINGO_API_KEY` is unavailable.
+
+## Research terminal
+
+The dashboard remains read-only:
 
 ```bash
 PYTHONPATH=src .venv/bin/python -m quant_loop_trader.dashboard.api --port 8787
-# → http://127.0.0.1:8787
+# http://127.0.0.1:8787
 ```
 
-Backend in `src/quant_loop_trader/dashboard/` (queries / service / schemas /
-api), frontend in `dashboard/` (native ES modules + vendored ECharts, no build
-step). Full documentation: [docs/dashboard.md](docs/dashboard.md).
-
-## Data connectors (`connectors/`)
-
-Every connector returns `(pl.DataFrame, source)` where the frame satisfies the PIT contract: `event_time` + `available_time` Date columns, `available_time >= event_time`. Any such frame filters through `replay.pit_filter(df, ts)` — the same availability rule as `ReplayEngine.get_snapshot`.
-
-| Connector | Source | event_time | available_time |
-|---|---|---|---|
-| `data.fetch_ohlcv` BTCUSD | Tiingo Crypto daily | UTC daily bar date | same day; exact 24/7 requested coverage required |
-| `alpaca.fetch_bars` | Alpaca Market Data (IEX feed, historical only — no trading) | bar date (daily close) | same day |
-| `fred.fetch_series` | FRED observations | observation period | period end **+ publication lag** (monthly ~15d, quarterly ~45d; ALFRED vintage_dates is the exact upgrade path) |
-| `sec.fetch_company_facts` | SEC EDGAR XBRL companyfacts | fiscal period end | **exact filing date** — a Q2 report filed Aug 2 is unavailable until Aug 2 |
-
-Unit tests mock HTTP. Integration tests hit live APIs and skip when credentials are absent. GitHub Actions also exposes a manual `workflow_dispatch` Tiingo BTCUSD smoke job that requires the repository `TIINGO_API_KEY` secret and fails if it is missing.
+It reads DuckDB and experiment artifacts but does not alter research state.
 
 ## Continuous operation
 
-The bundled launchd templates live under `deploy/`. The BTC research-session template is deliberately conservative:
+The bundled BTC launchd template invokes the direct autonomous research loop:
 
 | Job | Schedule | Action |
 |---|---|---|
 | `com.quantloop.research-session` | daily 06:00 | `autonomy --ticker BTCUSD --horizon 5 --max-experiments 1` |
-| `com.quantloop.weekly-report` | Sunday 18:00 | `report` + git-commit `data/reports/` |
+| `com.quantloop.weekly-report` | Sunday 18:00 | generate the weekly research report |
 
-Logs: `data/logs/session.log`. Reports: `data/reports/weekly_YYYY-Www.md`. Manage with:
+There is no second queue/controller orchestration layer. When the configured research frontier is exhausted, autonomy idles by design.
+
+Logs: `data/logs/session.log`. Reports: `data/reports/weekly_YYYY-Www.md`.
 
 ```bash
 launchctl kickstart gui/$(id -u)/com.quantloop.research-session
 launchctl unload ~/Library/LaunchAgents/com.quantloop.research-session.plist
 ```
 
-Editing the repository plist does not automatically reload an already-installed LaunchAgent. Deploy/reload it explicitly after reviewing the configuration. When the research grid is exhausted the loop idles by design (anti-mining governor, see report's "Research frontier").
-
-Note: install non-editable (`pip install .`) — macOS security tooling on some machines flags editable-install `.pth` files as hidden, breaking imports. Reinstall after code changes, or run tests (which use `pythonpath = src`).
+Editing a repository plist does not reload an already-installed LaunchAgent; redeploy/reload it explicitly.

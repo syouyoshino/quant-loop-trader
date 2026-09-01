@@ -1,10 +1,10 @@
 """Leakage-safe random-start replay robustness testing.
 
 Random replay can operate as a standalone BTC diagnostic or replay one verified
-experiment candidate. Candidate mode reconstructs the candidate's model type,
-feature columns, model parameters, horizon, seed, and sealed dataset snapshot.
-Unsupported feature sets fail closed rather than silently replaying a different
-strategy. Campaign holdout observations are never loaded or sampled.
+experiment candidate. Candidate mode consumes the same canonical CandidateSpec
+as validation and final holdout, so model, features, seed, campaign, and sealed
+dataset cannot drift between checks. Campaign holdout observations are never
+loaded or sampled.
 """
 from __future__ import annotations
 
@@ -14,13 +14,17 @@ import json
 import os
 import random
 from collections import Counter
-from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import numpy as np
 import polars as pl
 
+from quant_loop_trader.candidate import (
+    CandidateSpec,
+    safe_experiment_id,
+    validate_feature_columns,
+)
 from quant_loop_trader.core import significance
 from quant_loop_trader.data import coverage_check, dataset_metadata, fetch_ohlcv, gap_check
 from quant_loop_trader.evaluation import autopsy, evaluate
@@ -36,25 +40,9 @@ _REQUIRED_OHLCV = (
     "event_time", "available_time", "open", "high", "low", "close", "volume",
 )
 
-
-@dataclass(frozen=True)
-class CandidateReplaySpec:
-    experiment_id: str
-    ticker: str
-    horizon: int
-    model_seed: int
-    model_type: str
-    model_params: dict
-    feature_columns: tuple[str, ...]
-    dataset_snapshot: Path
-    dataset_id: str | None
-    dataset_checksum: str | None
-    spec_fingerprint: str | None
-    model_version: str | None
-    feature_version: str | None
-    dataset_snapshot_sha256: str | None
-    research_start: str
-    research_end: str
+# Backward-compatible public name for callers/tests created before CandidateSpec
+# became the one canonical candidate identity.
+CandidateReplaySpec = CandidateSpec
 
 
 def _as_date(value: str | date) -> date:
@@ -66,64 +54,13 @@ def _sha_file(path: Path) -> str:
 
 
 def _safe_experiment_id(experiment_id: str) -> str:
-    if not experiment_id or Path(experiment_id).name != experiment_id:
-        raise ValueError("invalid_candidate_experiment_id")
-    return experiment_id
+    return safe_experiment_id(experiment_id)
 
 
-def _load_candidate_spec(experiment_id: str, root: Path) -> CandidateReplaySpec:
-    """Open one verified candidate bundle and derive its replayable strategy spec."""
-    from quant_loop_trader.bundle import ExperimentBundle
-
-    experiment_id = _safe_experiment_id(experiment_id)
-    bundle = ExperimentBundle.open_verified(experiment_id, root / "data" / "experiments")
-    cfg = bundle.config
-    report = bundle.report
-    ticker = str(cfg["ticker"]).upper()
-
-    candidate_boundary = cfg.get("campaign_holdout_start")
-    active_boundary = campaign_holdout_start(ticker)
-    if candidate_boundary != active_boundary:
-        raise ValueError(
-            "candidate_campaign_holdout_mismatch:"
-            f"candidate={candidate_boundary}:active={active_boundary}"
-        )
-
-    feature_cols = cfg.get("feature_columns")
-    if not feature_cols:
-        feature_cols = report.get("parameters", {}).get("feature_columns")
-    if not feature_cols:
-        # Backward compatibility for current sealed bundles, whose improved
-        # feature identity is versioned but whose column list predates this field.
-        feature_cols = improved_feature_columns()
-
-    model_type = (
-        cfg.get("model_type")
-        or report.get("parameters", {}).get("model_type")
-        or "logistic"
-    )
-    model_params = cfg.get("model_params") or report.get("parameters", {}).get("model_params") or {}
-    snapshot = Path(cfg.get("dataset_snapshot") or bundle.dataset_snapshot)
-    if not snapshot.exists():
-        raise FileNotFoundError(f"candidate_dataset_snapshot_missing:{snapshot}")
-
-    return CandidateReplaySpec(
-        experiment_id=experiment_id,
-        ticker=ticker,
-        horizon=int(cfg["horizon"]),
-        model_seed=int(cfg["seed"]),
-        model_type=str(model_type),
-        model_params=dict(model_params),
-        feature_columns=tuple(str(c) for c in feature_cols),
-        dataset_snapshot=snapshot,
-        dataset_id=cfg.get("dataset_id"),
-        dataset_checksum=cfg.get("dataset_checksum"),
-        spec_fingerprint=cfg.get("spec_fingerprint"),
-        model_version=cfg.get("model_version"),
-        feature_version=cfg.get("feature_version_improved"),
-        dataset_snapshot_sha256=bundle.lock.get("dataset_snapshot_sha256"),
-        research_start=str(cfg.get("start", "2018-01-01")),
-        research_end=str(cfg["end"]),
+def _load_candidate_spec(experiment_id: str, root: Path) -> CandidateSpec:
+    return CandidateSpec.load(
+        experiment_id,
+        root / "data" / "experiments",
     )
 
 
@@ -219,11 +156,7 @@ def prepare_replay_frame(
 ) -> pl.DataFrame:
     """Create PIT features and labels once from the sealed research snapshot."""
     h = max(1, int(horizon))
-    cols = list(feature_cols or improved_feature_columns())
-    supported = set(improved_feature_columns())
-    unsupported = [c for c in cols if c not in supported]
-    if unsupported:
-        raise ValueError(f"unsupported_candidate_features:{','.join(unsupported)}")
+    cols = list(validate_feature_columns(feature_cols or improved_feature_columns()))
     frame = add_improved_features(make_labels(df.sort("event_time"), h))
     frame = frame.drop_nulls(subset=cols + ["label"]).sort("event_time")
     if frame.height == 0:
@@ -432,7 +365,7 @@ def summarize_replays(rows: list[dict]) -> dict:
 
 
 def _candidate_evidence_file(root: Path, experiment_id: str, replay_id: str) -> Path:
-    experiment_id = _safe_experiment_id(experiment_id)
+    experiment_id = safe_experiment_id(experiment_id)
     d = root / "data" / "random_replays" / "by_experiment" / experiment_id
     d.mkdir(parents=True, exist_ok=True)
     return d / f"{replay_id}.json"
@@ -441,7 +374,7 @@ def _candidate_evidence_file(root: Path, experiment_id: str, replay_id: str) -> 
 def latest_replay_for_experiment(experiment_id: str, root: str | Path | None = None) -> dict | None:
     """Return the latest externally-bound replay diagnostic for one experiment."""
     root_path = Path(root) if root is not None else Path(os.environ.get("QLT_ROOT", Path.cwd()))
-    experiment_id = _safe_experiment_id(experiment_id)
+    experiment_id = safe_experiment_id(experiment_id)
     d = root_path / "data" / "random_replays" / "by_experiment" / experiment_id
     if not d.exists():
         return None

@@ -1,9 +1,4 @@
-"""Portfolio construction (Phase 8): position sizing + risk controls.
-
-Separates prediction quality from portfolio mechanics: given a frame of
-per-period predictions/returns, produce weights under each sizing scheme and
-enforce hard limits (max position, drawdown stop).
-"""
+"""Deferred multi-asset position sizing and risk controls."""
 from __future__ import annotations
 
 import numpy as np
@@ -14,23 +9,18 @@ def equal_weight(n_positions: int) -> np.ndarray:
 
 
 def volatility_weight(returns: np.ndarray, lookback: int = 20) -> np.ndarray:
-    """Inverse-volatility weighting per asset column. Higher risk → smaller weight."""
     r = returns[-lookback:]
     vol = r.std(axis=0)
     inv = 1.0 / np.where(vol > 1e-12, vol, np.inf)
     total = inv.sum()
     if not np.isfinite(total) or total <= 0:
-        return equal_weight(returns.shape[1])  # all-zero vol: degenerate → equal weight (audit NaN)
-    w = inv / total
-    return np.nan_to_num(w)
+        return equal_weight(returns.shape[1])
+    return np.nan_to_num(inv / total)
 
 
 def apply_max_position(weights: np.ndarray, max_weight: float = 0.25) -> np.ndarray:
     if not 0 < max_weight <= 1:
         raise ValueError(f"max_weight must be in (0, 1], got {max_weight}")
-    """Cap positions at max_weight, redistributing excess to uncapped assets
-    (water-filling). When n_assets * cap < 1 the constraint set is infeasible:
-    the unallocatable remainder stays as CASH rather than breaching the cap."""
     w = np.clip(weights, 0.0, None).astype(float)
     cap = max_weight
     frozen = np.zeros(len(w), dtype=bool)
@@ -45,13 +35,11 @@ def apply_max_position(weights: np.ndarray, max_weight: float = 0.25) -> np.ndar
         s = w[under].sum()
         if s <= 0 or excess <= 0:
             break
-        addition = excess * (w[under] / s)
-        w[under] += addition
+        w[under] += excess * (w[under] / s)
     return w
 
 
 def drawdown_stop(cumulative_returns: np.ndarray, limit: float = -0.15) -> bool:
-    """True when the drawdown limit is breached — portfolio-level kill switch."""
     if len(cumulative_returns) == 0:
         return False
     peak = np.maximum.accumulate(cumulative_returns)
@@ -61,7 +49,6 @@ def drawdown_stop(cumulative_returns: np.ndarray, limit: float = -0.15) -> bool:
 
 def size_positions(returns_window: np.ndarray, scheme: str = "equal",
                    max_weight: float = 0.25) -> np.ndarray:
-    """Unified entry point. returns_window shape = (lookback, n_assets)."""
     if returns_window.ndim != 2 or returns_window.shape[1] == 0:
         raise ValueError("returns_window must be 2-D with at least one asset")
     if scheme == "equal":
@@ -69,7 +56,6 @@ def size_positions(returns_window: np.ndarray, scheme: str = "equal",
     elif scheme == "volatility":
         w = volatility_weight(returns_window)
     elif scheme == "risk":
-        # risk weighting: same inverse-vol family, squared to penalise variance harder
         w = volatility_weight(returns_window) ** 2
         w = w / w.sum()
     else:

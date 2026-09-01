@@ -1,11 +1,7 @@
-"""Strategy framework (Phase 9). INTERFACES ONLY — no strategies run, no discovery.
+"""Deferred generalized strategy interfaces.
 
-Contract every strategy must honour:
-- predictions come from ReplayEngine snapshots (PIT enforced upstream)
-- outputs are frozen Prediction objects
-- nothing here can promote itself: only validation/agents.validate_experiment moves status
-
-Future strategy families register via STRATEGY_REGISTRY; none are active by default.
+The active BTC research path is experiment -> CandidateSpec -> validation/replay/
+holdout. This framework is preserved for a future multi-strategy activation.
 """
 from __future__ import annotations
 
@@ -15,25 +11,19 @@ from quant_loop_trader.models.prediction import Prediction
 
 
 class Strategy(ABC):
-    """A research strategy converts a PIT snapshot into predictions. That is all."""
-
     name: str = "base"
     version: str = "v0"
     horizon: int = 5
 
     @abstractmethod
     def generate_predictions(self, snapshot, ticker: str) -> list[Prediction]:
-        """snapshot: ReplayEngine.get_snapshot output — information available at T.
-        Must NOT access evaluate_future() or any post-T data."""
+        """Convert a PIT snapshot into predictions without accessing future data."""
 
     def metadata(self) -> dict:
         return {"name": self.name, "version": self.version, "horizon": self.horizon}
 
 
 class MomentumStrategy(Strategy):
-    """Reference implementation of the interface (NOT auto-run anywhere).
-    Long when trailing momentum is positive — the baseline every strategy beats or dies."""
-
     name = "momentum_reference"
     version = "v1"
     horizon = 5
@@ -46,10 +36,15 @@ class MomentumStrategy(Strategy):
             ret = row["ret_5"] or 0
             score = 1 if ret > 0 else 0
             preds.append(Prediction(
-                timestamp=str(row["event_time"]), ticker=ticker.upper(), horizon=self.horizon,
+                timestamp=str(row["event_time"]),
+                ticker=ticker.upper(),
+                horizon=self.horizon,
                 prediction=score,
-                # confidence IS P(up): must agree with the prediction direction (audit H-conf)
-                confidence=0.5 + min(abs(ret), 0.05) if score == 1 else 0.5 - min(abs(ret), 0.05),
+                confidence=(
+                    0.5 + min(abs(ret), 0.05)
+                    if score == 1
+                    else 0.5 - min(abs(ret), 0.05)
+                ),
                 features_used=feature_columns(),
                 model_version=f"{self.name}-{self.version}",
                 strategy_version=self.version,

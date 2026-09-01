@@ -1,12 +1,7 @@
-"""Paper trading PREPARATION (Phase 11). Interfaces + offline simulator only.
+"""Deferred offline paper-trading simulator.
 
-SAFETY BOUNDARY (charter):
-- No real orders. No live endpoints. The broker below is an OFFLINE simulator
-  filling against historical bars.
-- PaperBroker refuses to construct unless explicitly allowed: allow=True AND
-  env QLT_PAPER_ENABLED=true. Default state is disabled everywhere.
-- Even when enabled, this simulates fills for research feedback; it never
-  touches Alpaca's order API. That integration point is deliberately absent.
+This module is intentionally outside the active BTC research core until the
+execution contract is finalized. It never touches a live broker endpoint.
 """
 from __future__ import annotations
 
@@ -16,12 +11,11 @@ from dataclasses import asdict, dataclass
 
 @dataclass(frozen=True)
 class Order:
-    """Order abstraction — strategy-neutral."""
     timestamp: str
     ticker: str
-    side: str                 # buy | sell
+    side: str
     quantity: float
-    order_type: str = "market"  # market | limit
+    order_type: str = "market"
     limit_price: float | None = None
 
     def validate(self) -> list[str]:
@@ -53,7 +47,7 @@ class Position:
 
 
 class ExecutionSimulator:
-    """Fills market orders at the given bar close + slippage bps. Offline by design."""
+    """Fills against supplied historical closes. Offline by design."""
 
     def __init__(self, slippage_bps: float = 2.0):
         self.slippage_bps = slippage_bps
@@ -66,8 +60,6 @@ class ExecutionSimulator:
             raise ValueError(f"unsupported order_type '{order.order_type}'")
         slip = bar_close * self.slippage_bps / 10_000
         if order.order_type == "limit":
-            # audit H10: limits must actually bind — a buy fills only when the
-            # slipped market price is at/below the limit, and never above it
             if order.side == "buy":
                 mkt = bar_close + slip
                 if mkt > order.limit_price:
@@ -88,8 +80,6 @@ class ExecutionSimulator:
 
 
 class PortfolioTracker:
-    """Positions + cash ledger for the simulation."""
-
     def __init__(self, starting_cash: float = 100_000.0):
         self.cash = starting_cash
         self.starting_cash = starting_cash
@@ -102,7 +92,9 @@ class PortfolioTracker:
             if cost > self.cash:
                 raise ValueError("insufficient cash")
             self.cash -= cost
-            self.positions.setdefault(order.ticker, Position(order.ticker)).apply_fill("buy", order.quantity, fill_price)
+            self.positions.setdefault(order.ticker, Position(order.ticker)).apply_fill(
+                "buy", order.quantity, fill_price
+            )
         else:
             pos = self.positions.setdefault(order.ticker, Position(order.ticker))
             if order.quantity > pos.quantity:
@@ -113,30 +105,29 @@ class PortfolioTracker:
                              "cash_after": round(self.cash, 2)})
 
     def equity(self, marks: dict[str, float]) -> float:
-        pos_val = sum(p.quantity * marks.get(p.ticker, p.avg_price) for p in self.positions.values())
+        pos_val = sum(
+            p.quantity * marks.get(p.ticker, p.avg_price)
+            for p in self.positions.values()
+        )
         return round(self.cash + pos_val, 2)
 
 
 class PaperBroker:
-    """Facade wiring simulator + tracker. DISABLED BY DEFAULT (see module docstring)."""
-
     enabled: bool = False
 
     def __init__(self, starting_cash: float = 100_000.0, allow: bool = False):
         env_ok = os.getenv("QLT_PAPER_ENABLED", "").lower() == "true"
         if not (allow and env_ok):
             raise RuntimeError(
-                "PaperBroker disabled: requires allow=True AND QLT_PAPER_ENABLED=true "
-                "(safety boundary — paper trading stays off until explicitly activated)"
+                "PaperBroker disabled: requires allow=True AND QLT_PAPER_ENABLED=true"
             )
         self.simulator = ExecutionSimulator()
         self.tracker = PortfolioTracker(starting_cash)
-        self.enabled = True  # truthful post-construction state (audit L2)
+        self.enabled = True
 
     def submit(self, order: Order, bar_close: float) -> dict:
         fill = self.simulator.fill(order, bar_close)
         if not fill.get("filled"):
-            # audit round-2: unfilled limits must NOT touch the tracker
             return {**fill, "cash_after": round(self.tracker.cash, 2)}
         self.tracker.execute(order, fill["price"])
         return {**fill, "cash_after": round(self.tracker.cash, 2)}

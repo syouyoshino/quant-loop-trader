@@ -1,9 +1,12 @@
-
 import numpy as np
 import pytest
 
-from quant_loop_trader.portfolio.construction import (
-    apply_max_position, drawdown_stop, equal_weight, size_positions, volatility_weight,
+from quant_loop_trader.experimental.portfolio.construction import (
+    apply_max_position,
+    drawdown_stop,
+    equal_weight,
+    size_positions,
+    volatility_weight,
 )
 
 
@@ -16,16 +19,14 @@ def test_volatility_weight_prefers_stable_assets():
     rng = np.random.default_rng(0)
     rets = np.column_stack([rng.normal(0, 0.01, 100), rng.normal(0, 0.05, 100)])
     w = volatility_weight(rets)
-    assert w[0] > w[1] * 3  # stable asset gets far more weight
+    assert w[0] > w[1] * 3
 
 
 def test_max_position_cap_enforced_and_renormalised():
     raw = np.array([0.8, 0.1, 0.1])
     w = apply_max_position(raw, max_weight=0.25)
     assert (w <= 0.25 + 1e-12).all()
-    # infeasible (3 assets x 0.25 < 1): remainder held as cash, never breach cap
     assert abs(w.sum() - 0.75) < 1e-9
-    # feasible case renormalises fully
     ok = apply_max_position(np.array([0.5, 0.3, 0.2]), max_weight=0.4)
     assert abs(ok.sum() - 1.0) < 1e-9 and (ok <= 0.4 + 1e-12).all()
 

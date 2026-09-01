@@ -1,15 +1,10 @@
-"""Hypothesis engine (Task 1): structured research questions from feature families
-+ research memory. Generates candidates, checks novelty, ranks by expected value.
-
-Every hypothesis still enters the full experiment + validation pipeline — nothing
-here claims an idea works.
-"""
+"""Deferred structured hypothesis generation from feature families and memory."""
 from __future__ import annotations
 
 import hashlib
-import os
 import json
 import logging
+import os
 from dataclasses import asdict, dataclass, field
 
 logger = logging.getLogger(__name__)
@@ -20,12 +15,12 @@ class ResearchHypothesis:
     hypothesis_id: str
     title: str
     research_question: str
-    reasoning: str                    # economic mechanism — why should this exist?
+    reasoning: str
     feature_groups: dict[str, list[str]]
-    target_variable: str              # e.g. "sign(fwd_ret)"
+    target_variable: str
     prediction_horizon: int
-    model_type: str                   # registry model name
-    expected_mechanism: str           # behavioural | market_structure | risk_compensation | information_delay
+    model_type: str
+    expected_mechanism: str
     risk_factors: list[str] = field(default_factory=list)
     similar_previous_experiments: list[str] = field(default_factory=list)
 
@@ -37,7 +32,6 @@ def _hyp_id(title: str) -> str:
     return "hyp_" + hashlib.sha256(title.encode()).hexdigest()[:10]
 
 
-# --- Feature families available for combination ------------------------------
 FEATURE_FAMILIES: dict[str, list[str]] = {
     "technical_momentum": ["ret_1", "ret_5", "ma10_gap"],
     "technical_volatility": ["vol10", "rsi14"],
@@ -48,9 +42,6 @@ FEATURE_FAMILIES: dict[str, list[str]] = {
     "fundamental_growth": ["revenue_growth", "earnings_growth"],
 }
 
-# Audit ceiling enforcement: macro series carry revised-history risk until ALFRED
-# vintages are wired. These families are excluded from generation unless the
-# operator explicitly accepts revised-data exposure.
 ALFRED_REQUIRED = {"macro_rates", "macro_inflation", "macro_labor"}
 
 MECHANISMS = {
@@ -71,7 +62,6 @@ class NoveltyReport:
 
 
 def token_similarity(a: str, b: str) -> float:
-    """Jaccard similarity over lowercase word tokens."""
     ta = set(a.lower().split())
     tb = set(b.lower().split())
     if not ta or not tb:
@@ -81,22 +71,23 @@ def token_similarity(a: str, b: str) -> float:
 
 def novelty_check(hypothesis_text: str, previous_texts: list[str],
                   threshold: float = 0.55) -> NoveltyReport:
-    """Duplicate guard: reject hypotheses too similar to already-tested ideas."""
-    scores = {prev[:60]: round(token_similarity(hypothesis_text, prev), 3)
-              for prev in previous_texts}
+    scores = {
+        prev[:60]: round(token_similarity(hypothesis_text, prev), 3)
+        for prev in previous_texts
+    }
     max_sim = max(scores.values()) if scores else 0.0
     reasons = []
     if max_sim >= threshold:
         reasons.append(f"too_similar_to_tested_hypothesis:{max_sim:.2f}")
-    return NoveltyReport(is_novel=max_sim < threshold,
-                         similarity_scores=dict(sorted(scores.items(), key=lambda kv: -kv[1])[:5]),
-                         reasons=reasons)
+    return NoveltyReport(
+        is_novel=max_sim < threshold,
+        similarity_scores=dict(sorted(scores.items(), key=lambda kv: -kv[1])[:5]),
+        reasons=reasons,
+    )
 
 
 def generate_candidates(previous_texts: list[str], horizons: list[int] = (5,),
                         max_candidates: int = 10) -> list[ResearchHypothesis]:
-    """Combine untested feature-family pairs × mechanisms into structured hypotheses.
-    Memory-driven: pairs whose mechanism already failed repeatedly get skipped."""
     from quant_loop_trader.research_memory import search_memory
 
     allow_revised_macro = os.getenv("QLT_ALLOW_REVISED_MACRO", "").lower() == "true"
@@ -110,12 +101,14 @@ def generate_candidates(previous_texts: list[str], horizons: list[int] = (5,),
             mech_a = MECHANISMS.get(fa, "under_research")
             mech_b = MECHANISMS.get(fb, "under_research")
             title = f"{fa} x {fb} interaction at {'/'.join(str(h) for h in horizons)}d horizon"
-            # memory-driven skip: identical title family already rejected hard
             mem = search_memory(f"{fa} {fb}")
             fails = [m for m in mem if m["memory_type"] == "failure"]
             if len(fails) >= 3:
-                logger.info(json.dumps({"event": "hypothesis_skipped_failed_family",
-                                        "family": f"{fa}+{fb}", "prior_failures": len(fails)}))
+                logger.info(json.dumps({
+                    "event": "hypothesis_skipped_failed_family",
+                    "family": f"{fa}+{fb}",
+                    "prior_failures": len(fails),
+                }))
                 continue
             hyp = ResearchHypothesis(
                 hypothesis_id=_hyp_id(title),
@@ -133,8 +126,7 @@ def generate_candidates(previous_texts: list[str], horizons: list[int] = (5,),
                 ],
                 similar_previous_experiments=[m["experiment_id"] or "" for m in mem[:3]],
             )
-            nov = novelty_check(title, previous_texts)
-            if not nov.is_novel:
+            if not novelty_check(title, previous_texts).is_novel:
                 continue
             out.append(hyp)
             if len(out) >= max_candidates:

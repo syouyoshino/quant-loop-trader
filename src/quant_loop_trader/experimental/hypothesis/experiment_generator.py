@@ -1,12 +1,7 @@
-"""Experiment generator (Task 1b): ResearchHypothesis → runnable experiment config.
-
-ponytail: run_experiment currently trains its fixed baseline-vs-vol-regime pair;
-full hypothesis-conditioned feature assembly is the activation-time wiring point.
-The generator produces the complete, validated config so activation is data, not code.
-"""
+"""Deferred ResearchHypothesis -> experiment-config adapter."""
 from __future__ import annotations
 
-from quant_loop_trader.research.hypothesis_engine import ResearchHypothesis
+from quant_loop_trader.experimental.hypothesis.hypothesis_engine import ResearchHypothesis
 
 
 def to_experiment_config(h: ResearchHypothesis, start: str, end: str, seed: int = 42) -> dict:
@@ -25,15 +20,16 @@ def to_experiment_config(h: ResearchHypothesis, start: str, end: str, seed: int 
         "economic_reasoning": h.reasoning,
         "expected_mechanism": h.expected_mechanism,
         "risk_factors": h.risk_factors,
-        "requires_walk_forward": True,   # every generated experiment gets WF validation
+        "requires_walk_forward": True,
     }
 
 
 def validate_config(cfg: dict) -> list[str]:
-    """Fail-fast config checks — a malformed hypothesis must never reach the runner."""
     errs = []
-    for key in ("hypothesis_id", "ticker", "horizon", "start", "end", "seed",
-                "model_type", "feature_columns"):
+    for key in (
+        "hypothesis_id", "ticker", "horizon", "start", "end", "seed",
+        "model_type", "feature_columns",
+    ):
         if key not in cfg:
             errs.append(f"missing_field:{key}")
     if "end" in cfg and "start" in cfg and cfg["end"] <= cfg["start"]:
