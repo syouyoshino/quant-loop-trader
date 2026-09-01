@@ -172,19 +172,21 @@ def _holdout_window_ready(cfg: dict) -> tuple[bool, str]:
 
 
 def adjudicate_holdout(experiment_id: str) -> dict:
-    """Evaluate an eligible model exactly once on its sealed dataset snapshot."""
+    """Evaluate the exact verified candidate once on its sealed final holdout."""
     import logging
 
     import duckdb
 
     from quant_loop_trader.bundle import BundleIntegrityError, ExperimentBundle
+    from quant_loop_trader.candidate import CandidateSpec
     from quant_loop_trader.data import DB_PATH
     from quant_loop_trader.experiment import EXP_ROOT
     from quant_loop_trader.models.registry import build_model
 
     try:
         bundle = ExperimentBundle.open_verified(experiment_id, EXP_ROOT)
-    except BundleIntegrityError as exc:
+        candidate = CandidateSpec.from_bundle(bundle)
+    except (BundleIntegrityError, ValueError, FileNotFoundError) as exc:
         return {"promoted": False, "reason": f"bundle_integrity:{str(exc)[:150]}"}
 
     cfg = bundle.config
@@ -203,7 +205,7 @@ def adjudicate_holdout(experiment_id: str) -> dict:
             "promoted": False,
             "reason": reason,
             "holdout_boundary": holdout_boundary(
-                cfg["start"], cfg["end"], ticker=cfg.get("ticker")
+                cfg["start"], cfg["end"], ticker=candidate.ticker
             ),
         }
 
@@ -211,19 +213,23 @@ def adjudicate_holdout(experiment_id: str) -> dict:
     if claim is not None:
         return claim
 
-    h = cfg["horizon"]
-    pq = bundle.dataset_snapshot
+    h = candidate.horizon
+    pq = candidate.dataset_snapshot
+    cols = list(candidate.feature_columns)
     fin = {}
     try:
-        df = _load_holdout_frame(pq, cfg)
-        cols = improved_feature_columns()
+        df = _load_holdout_frame(pq, cfg, cols)
         feats = df.select(cols + ["label", "close"])
         if feats.height < max(20, h * 10):
             raise ValueError(f"holdout_sample_too_small:{feats.height}")
         Xte = feats.select(cols).to_numpy()
         yte = feats["label"].to_numpy()
-        Xtr, ytr = _train_all_nonholdout(pq, cfg)
-        model = build_model(cfg.get("model_type", "logistic"), seed=cfg["seed"])
+        Xtr, ytr = _train_all_nonholdout(pq, cfg, cols)
+        model = build_model(
+            candidate.model_type,
+            seed=candidate.model_seed,
+            **dict(candidate.model_params),
+        )
         model.fit(Xtr, ytr)
         ypred = model.predict(Xte)
         base = float(max(yte.mean(), 1 - yte.mean()))
@@ -237,7 +243,7 @@ def adjudicate_holdout(experiment_id: str) -> dict:
         except Exception:
             prob = ypred.astype(float)
         fin = evaluate(
-            yte, ypred, prob, prices_h, horizon=h, ticker=cfg.get("ticker", "SPY")
+            yte, ypred, prob, prices_h, horizon=h, ticker=candidate.ticker
         )
         stress_25 = float(fin.get("cost_sensitivity_compounded", {}).get("25", -1.0))
         economic_gate = (
@@ -261,7 +267,7 @@ def adjudicate_holdout(experiment_id: str) -> dict:
             "promoted": False,
             "reason": f"adjudication_error:{str(exc)[:150]}",
             "holdout_boundary": holdout_boundary(
-                cfg["start"], cfg["end"], ticker=cfg.get("ticker")
+                cfg["start"], cfg["end"], ticker=candidate.ticker
             ),
             "economic_gate": fin or None,
             "traceback_tail": traceback.format_exc()[-300:],
@@ -281,8 +287,16 @@ def adjudicate_holdout(experiment_id: str) -> dict:
     result = _canonical_json({
         "promoted": promoted,
         "holdout_boundary": holdout_boundary(
-            cfg["start"], cfg["end"], ticker=cfg.get("ticker")
+            cfg["start"], cfg["end"], ticker=candidate.ticker
         ),
+        "candidate": {
+            "ticker": candidate.ticker,
+            "horizon": candidate.horizon,
+            "model_type": candidate.model_type,
+            "model_params": candidate.model_params,
+            "feature_columns": list(candidate.feature_columns),
+            "spec_fingerprint": candidate.spec_fingerprint,
+        },
         "holdout_accuracy": acc,
         "base_rate": base,
         "n_holdout": int(len(yte)),
@@ -439,14 +453,16 @@ def _confirm_success_memory(experiment_id: str) -> None:
     con.close()
 
 
-def _load_holdout_frame(pq, cfg):
+def _load_holdout_frame(pq, cfg, feature_cols=None):
     """Compute causal features on full history, then isolate the hidden tail."""
     import polars as pl
 
+    from quant_loop_trader.candidate import validate_feature_columns
     from quant_loop_trader.experiment import make_labels
     from quant_loop_trader.features import add_improved_features
     from quant_loop_trader.replay import ReplayEngine
 
+    cols = list(validate_feature_columns(feature_cols or improved_feature_columns()))
     df = ReplayEngine(pq, ticker=cfg["ticker"]).get_snapshot(cfg["ticker"], cfg["end"])
     df = df.filter(
         pl.col("event_time") >= pl.lit(cfg["start"]).str.strptime(pl.Date, "%Y-%m-%d")
@@ -455,16 +471,18 @@ def _load_holdout_frame(pq, cfg):
     hold = apply_holdout(
         featured, cfg["start"], cfg["end"], use_holdout=True, ticker=cfg["ticker"]
     )
-    return hold.drop_nulls(subset=improved_feature_columns() + ["label"])
+    return hold.drop_nulls(subset=cols + ["label"])
 
 
-def _train_all_nonholdout(pq, cfg):
+def _train_all_nonholdout(pq, cfg, feature_cols=None):
     import polars as pl
 
+    from quant_loop_trader.candidate import validate_feature_columns
     from quant_loop_trader.experiment import make_labels
-    from quant_loop_trader.features import add_improved_features, improved_feature_columns
+    from quant_loop_trader.features import add_improved_features
     from quant_loop_trader.replay import ReplayEngine
 
+    cols = list(validate_feature_columns(feature_cols or improved_feature_columns()))
     df = ReplayEngine(pq, ticker=cfg["ticker"]).get_snapshot(cfg["ticker"], cfg["end"])
     df = df.filter(
         pl.col("event_time") >= pl.lit(cfg["start"]).str.strptime(pl.Date, "%Y-%m-%d")
@@ -474,5 +492,5 @@ def _train_all_nonholdout(pq, cfg):
         featured, cfg["start"], cfg["end"], use_holdout=False, ticker=cfg["ticker"]
     )
     clean = clean.sort("event_time").slice(0, max(0, clean.height - cfg["horizon"]))
-    clean = clean.drop_nulls(subset=improved_feature_columns() + ["label"])
-    return clean.select(improved_feature_columns()).to_numpy(), clean["label"].to_numpy()
+    clean = clean.drop_nulls(subset=cols + ["label"])
+    return clean.select(cols).to_numpy(), clean["label"].to_numpy()
