@@ -15,10 +15,15 @@ def test_session_blocked_without_activation_key(monkeypatch):
     monkeypatch.delenv("QLT_AUTONOMOUS_ENABLED", raising=False)
     out = run_session(max_experiments=1)
     assert out["skipped"] == "autonomous_disabled" and out["executed"] == 0
-    import quant_loop_trader.data as _dm
-    _dm.migrate_db()
-    from quant_loop_trader.automation.queue import pending_count
-    assert pending_count() == 0  # blocked session must not touch the queue
+
+    # The legacy tasks table may still exist in old databases/migrations, but the
+    # simplified direct autonomy path must never enqueue work into it.
+    import duckdb
+    from quant_loop_trader.data import DB_PATH, migrate_db
+    migrate_db()
+    con = duckdb.connect(str(DB_PATH), read_only=True)
+    assert con.execute("SELECT count(*) FROM tasks").fetchone()[0] == 0
+    con.close()
 
 
 def test_review_memory_returns_structure():
@@ -67,14 +72,14 @@ def test_quarantined_history_does_not_block_a_rerun():
     key = s1["results"][0]["experiment_id"]
     cfg = json.loads((EXP_ROOT / key / "config.json").read_text())
     args = ("SPY", 5, cfg["start"], cfg["end"], cfg["seed"])
-    assert _already_run(*args) is True          # authoritative evidence exists
+    assert _already_run(*args) is True
 
     migrate_db()
     con = duckdb.connect(str(DB_PATH))
     con.execute("UPDATE experiments SET authoritative=FALSE WHERE experiment_id LIKE ?",
                 [f"{key}%"])
     con.close()
-    assert _already_run(*args) is False         # quarantined: unexplored again
+    assert _already_run(*args) is False
     assert any(c["start"] == cfg["start"] and c["end"] == cfg["end"]
                and c["seed"] == cfg["seed"] for c in select_candidates("SPY", 5, budget=50))
 
