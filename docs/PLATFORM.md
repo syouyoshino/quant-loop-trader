@@ -1,95 +1,125 @@
 # Quant Loop Trader — Research Platform
 
-An autonomous quantitative research laboratory. It predicts, tests against hidden
-futures, autopsies failures, improves, retests, and remembers. It is **not** a
-trading bot: nothing here places real orders, and autonomous research is disabled
-until explicitly activated.
+Quant Loop Trader is an autonomous historical research laboratory for BTCUSD and SPY. It is **not** a live trading bot: nothing in the active core places real orders.
 
-## Architecture
+The platform is intentionally organized around one evidence path instead of multiple orchestration/framework layers.
 
+## Active architecture
+
+```text
+connectors/          PIT data acquisition (Tiingo, Alpaca historical, FRED, SEC)
+data.py              fetch/cache, exact BTC coverage, checksums, DuckDB migrations
+market.py            market calendars + campaign/holdout identity
+replay.py            ReplayEngine.get_snapshot (available_time <= T)
+features/            causal technical/macro/fundamental feature construction
+models/              prediction objects + model registry
+experiment.py        acquire once → immutable snapshot → research experiment
+candidate.py         canonical verified CandidateSpec
+random_replay.py     candidate-bound random-start robustness testing
+evaluation.py        prediction/economic metrics, costs and risk
+validation/          walk-forward, multiple testing, holdout and diagnostics
+agents.py            statistical/adversarial/independent-replication gate
+research_memory.py   durable evidence and belief updates
+autonomy.py          ONE budgeted autonomous orchestration path
+monitoring/          heartbeat, health aggregation, alerts
+dashboard/           read-only observability
 ```
-connectors/          PIT data acquisition (Tiingo, Alpaca historical, FRED, SEC EDGAR)
-data.py              market data fetch/cache/checksums + DuckDB migrations
-replay.py            ReplayEngine.get_snapshot (available_time <= T) + evaluate_future + pit_filter
-features/
-  technical.py       returns/momentum/volatility/MA/RSI (shift(1) discipline)
-  macro.py           rates/inflation/unemployment/regime via as-of publication joins
-  fundamental.py     SEC XBRL growth/margin/quality via exact filing-date PIT
-  pit.py             as-of join primitive
-models/
-  prediction.py      frozen Prediction objects (content-hashed)
-  registry.py        versioned model interface: random/majority/logistic/xgboost
-experiment.py        run_experiment / run_horizons / registry API / build_train_test
-evaluation.py        time-split(purge), accuracy/Brier, Sharpe/Sortino/Calmar/VaR/ES, trade quality
-validation/
-  holdout.py         permanently hidden out-of-time segment
-  walkforward.py     expanding-window folds
-  ablation.py        feature-group ablation
-  multiple_testing.py  BH-FDR + deflated Sharpe Ratio
-  dashboard.py       bias/mining/tamper sentinels
-agents.py            statistical/adversarial/replication validation gate + champion promotion
-research/            hypothesis engine → novelty check → ranking → experiment configs
-portfolio/construction.py  sizing schemes, position caps, drawdown stop
-strategies/framework.py    Strategy ABC (PIT-only contract)
-automation/          DuckDB task queue + ResearchController (inert by default)
-monitoring/          heartbeat, health aggregation, provider-agnostic alerts
-paper_trading.py     Order/simulator/tracker (offline; broker double-keyed off)
+
+Deferred capabilities live under `experimental/`:
+
+```text
+experimental/hypothesis/   hypothesis generation/ranking
+experimental/portfolio/    multi-asset sizing
+experimental/strategies/   generalized strategy interfaces
+experimental/paper_trading.py  offline fill simulator
 ```
+
+They remain tested but are not dependencies of BTC research execution.
+
+## Canonical candidate identity
+
+After an experiment is sealed, trusted downstream checks derive a `CandidateSpec` from the verified bundle. It binds:
+
+- ticker and horizon,
+- model type, parameters and seed,
+- exact feature columns,
+- immutable dataset snapshot/checksum,
+- experiment fingerprint,
+- market campaign and holdout boundary.
+
+Validation, random replay and final holdout consume this same identity. They fail closed if the active campaign does not match the sealed candidate or if a candidate requires unsupported causal features.
+
+Independent replication deliberately does **not** reuse the creator's model implementation. That separation remains because it protects against shared implementation bugs.
 
 ## Data flow
 
-1. `fetch_ohlcv` → cached Parquet (`event_time`, `available_time` per row).
-2. `ReplayEngine.get_snapshot(ticker, T)` → only rows with `available_time <= T`.
-3. `build_train_test` → labels (`close[t+h]/close[t]`), features, purge boundary,
-   time-ordered split. Creator and all reviewers share this one pipeline.
-4. Train → predict → freeze artifacts → SHA-256 `predictions.lock`.
-5. `evaluate()` reveals outcomes (only evaluation touches the future).
-6. Autopsy by volatility regime → improvement hypothesis → retest on identical
-   hidden test.
-7. Validation gate: statistical (majority-class null) + adversarial
-   (feature-shuffle, label-randomisation, regime concentration) + independent
-   replication. Champions are promoted **only** on APPROVED.
-8. Outcomes written to research memory with confidence updates.
+1. `fetch_ohlcv` acquires the requested market window.
+2. BTCUSD must contain exactly one validated UTC daily observation for every requested calendar day.
+3. The acquired dataframe is sealed as a content-addressed immutable dataset snapshot.
+4. `ReplayEngine.get_snapshot(ticker, T)` exposes only observations with `available_time <= T`.
+5. `build_train_test` creates labels/features and a horizon-purged ordered split from the sealed snapshot.
+6. `experiment.py` trains/evaluates the research candidate and seals its artifacts.
+7. `CandidateSpec` becomes the one downstream strategy definition.
+8. Validation runs statistical/adversarial checks and an independent reconstruction.
+9. `random_replay.py` tests the same candidate from seeded historical start points without loading campaign holdout observations.
+10. Eligible candidates may consume the final holdout exactly once; evidence is sealed and committed atomically.
+11. Outcomes update research memory.
 
-## Validation process
+## Bitcoin campaign boundary
 
-A strategy is acceptable only if it:
-1. has no future leakage (PIT joins, purge, truncation-invariance tests),
-2. beats the majority-class base rate with significance,
-3. survives label-randomisation and feature-shuffle null tests,
-4. survives transaction costs,
-5. passes risk analysis (drawdown/VaR/ES),
-6. beats buy-and-hold,
-7. replicates independently from documented config alone,
-8. survives multiple-testing correction (BH-FDR, deflated Sharpe).
+BTCUSD defaults to the `btc_pre2024_v1` campaign with a permanent holdout beginning `2024-01-01`.
+
+Changing the crypto holdout boundary requires a new campaign identity. This prevents observations that were once treated as hidden evidence from silently returning to the research set.
+
+## Validation principles
+
+The platform retains the safeguards that directly improve scientific reliability:
+
+1. PIT availability and truncation-invariance leakage checks.
+2. Horizon purge between training and testing.
+3. Majority/base-rate significance checks.
+4. Multiple-testing controls.
+5. Adversarial label/feature destruction tests.
+6. Walk-forward temporal checks.
+7. Independent replication.
+8. Candidate-bound random historical replay.
+9. Transaction-cost and worst-entry-phase stress.
+10. Permanent one-shot final holdout.
+11. Immutable artifacts and checksums.
+
+Ablation, regime breakdowns and other diagnostics explain a candidate; they do not justify silently testing a different candidate configuration.
+
+## Autonomous operation
+
+There is one autonomous research runner: `quant_loop_trader.autonomy`.
+
+It remains disabled unless `QLT_AUTONOMOUS_ENABLED=true`.
+
+```bash
+QLT_AUTONOMOUS_ENABLED=true \
+python -m quant_loop_trader.autonomy \
+  --ticker BTCUSD \
+  --horizon 5 \
+  --max-experiments 1
+```
+
+The former task queue / `ResearchController` layer was removed because it duplicated orchestration already performed by `autonomy.py` and was not used by the scheduled BTC job.
 
 ## Safety boundaries
 
-- No real-money trading anywhere in the codebase. Paper broker is offline-only.
-- Autonomous controller requires `ResearchController(enabled=True)` AND env
-  `QLT_AUTONOMOUS_ENABLED=true`. Tests prove inertness.
-- Paper broker additionally requires `allow=True` AND `QLT_PAPER_ENABLED=true`.
-- Evaluation rules live in immutable modules; agents may propose but never weaken.
-- Failed experiments are permanent records — deletion is not a code path.
-
-## Research lifecycle
-
-hypothesis → novelty check → priority rank → experiment → lock → hidden test →
-autopsy → improve/reject → validation gate → memory/belief update → repeat.
-Hypotheses whose families fail repeatedly are skipped automatically.
-
-## Activation process
-
-1. Refresh hypothesis frontier (engine generates candidates automatically).
-2. Wire workers into `automation.controller.WORKERS`.
-3. Set `QLT_AUTONOMOUS_ENABLED=true` and start the controller with `enabled=True`.
-4. Monitor via `python -m quant_loop_trader.monitoring.health` and heartbeat age;
-   set `ALERT_WEBHOOK_URL` for push notifications.
+- No real-money broker execution exists in the active codebase.
+- Autonomous research is off unless explicitly enabled with `QLT_AUTONOMOUS_ENABLED=true`.
+- Experimental paper simulation remains separately double-keyed and does not connect to a live broker.
+- Final holdout consumption is one-shot and crash-safe.
+- Evaluation and campaign rules are not modifiable by research agents.
+- Failed/rejected evidence remains part of the audit trail.
 
 ## Operations
 
 ```bash
-.venv/bin/python -m pytest -q -m "not integration"   # full offline suite
-launchctl list | grep quantloop                      # scheduled sessions
-cat data/logs/heartbeat.json                         # liveness
+python -m pytest -q -m "not integration"
+python -m quant_loop_trader.monitoring.health
+python -m quant_loop_trader.dashboard.api --port 8787
 ```
+
+GitHub Actions also provides a manual credentialed Tiingo BTCUSD integration smoke test. It verifies that the real Tiingo crypto response satisfies the platform's exact daily-coverage contract.
