@@ -14,6 +14,7 @@ from quant_loop_trader.market import campaign_holdout_start, campaign_id
 
 LEGACY_FEATURE_VERSION = "v1+vol_regime_ret5_x_vol10"
 LEGACY_MODEL_VERSION = "sklearn-LogReg-C1.0-scaled"
+STRICT_IDENTITY_PIPELINE_VERSION = 4
 
 
 @dataclass(frozen=True)
@@ -47,6 +48,8 @@ class CandidateSpec:
         report = bundle.report
         experiment_id = safe_experiment_id(bundle.exp_dir.name)
         ticker = str(cfg["ticker"]).upper()
+        pipeline_version = int(cfg.get("pipeline_version", 0) or 0)
+        strict_identity = pipeline_version >= STRICT_IDENTITY_PIPELINE_VERSION
 
         active_boundary = campaign_holdout_start(ticker)
         candidate_boundary = cfg.get("campaign_holdout_start")
@@ -58,6 +61,8 @@ class CandidateSpec:
 
         active_campaign = campaign_id(ticker)
         candidate_campaign = cfg.get("campaign_id")
+        if strict_identity and not candidate_campaign:
+            raise ValueError("candidate_campaign_id_missing")
         if candidate_campaign is not None and candidate_campaign != active_campaign:
             raise ValueError(
                 "candidate_campaign_id_mismatch:"
@@ -66,6 +71,8 @@ class CandidateSpec:
 
         feature_version = cfg.get("feature_version_improved")
         feature_cols = cfg.get("feature_columns")
+        if strict_identity and not feature_cols:
+            raise ValueError("candidate_feature_columns_missing")
         if not feature_cols:
             feature_cols = report.get("parameters", {}).get("feature_columns")
         if not feature_cols:
@@ -81,7 +88,11 @@ class CandidateSpec:
         validate_feature_columns(feature_cols)
 
         model_version = cfg.get("model_version")
-        model_type = cfg.get("model_type") or report.get("parameters", {}).get("model_type")
+        model_type = cfg.get("model_type")
+        if strict_identity and not model_type:
+            raise ValueError("candidate_model_type_missing")
+        if not model_type:
+            model_type = report.get("parameters", {}).get("model_type")
         if not model_type:
             # Same compatibility rule for the pre-CandidateSpec experiment format:
             # never infer logistic for an unknown model version.
@@ -91,11 +102,14 @@ class CandidateSpec:
                     f"{model_version or 'missing'}"
                 )
             model_type = "logistic"
-        model_params = (
-            cfg.get("model_params")
-            or report.get("parameters", {}).get("model_params")
-            or {}
-        )
+
+        if strict_identity and "model_params" not in cfg:
+            raise ValueError("candidate_model_params_missing")
+        model_params = cfg.get("model_params")
+        if model_params is None:
+            model_params = report.get("parameters", {}).get("model_params") or {}
+        if not isinstance(model_params, dict):
+            raise ValueError("candidate_model_params_invalid")
 
         snapshot = Path(bundle.dataset_snapshot)
         if not snapshot.exists():
@@ -118,7 +132,7 @@ class CandidateSpec:
             dataset_snapshot_sha256=bundle.lock.get("dataset_snapshot_sha256"),
             research_start=str(cfg.get("start", "2018-01-01")),
             research_end=str(cfg["end"]),
-            campaign=active_campaign,
+            campaign=str(candidate_campaign or active_campaign),
             holdout_start=active_boundary,
         )
 

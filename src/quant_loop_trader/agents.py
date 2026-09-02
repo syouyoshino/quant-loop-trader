@@ -16,7 +16,12 @@ import polars as pl
 from quant_loop_trader.candidate import CandidateSpec
 from quant_loop_trader.experiment import EXP_ROOT
 from quant_loop_trader.features import add_improved_features, improved_feature_columns
-from quant_loop_trader.market import periods_per_year
+from quant_loop_trader.market import (
+    DEFAULT_CRYPTO_CAMPAIGN_ID,
+    DEFAULT_CRYPTO_HOLDOUT_START,
+    is_crypto,
+    periods_per_year,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -376,7 +381,9 @@ def validate_experiment(experiment_id: str) -> dict:
             ),
             n_folds=3,
         )
-        hardening["walk_forward"] = wf.run(full, cols, horizon=horizon)
+        hardening["walk_forward"] = wf.run(
+            full, cols, horizon=horizon, ticker=ticker
+        )
         if not hardening["walk_forward"]["stable_across_time"]:
             hardening_issues.append("walk_forward:not_stable_across_folds")
 
@@ -386,7 +393,11 @@ def validate_experiment(experiment_id: str) -> dict:
         n_buckets = int(m_improved.get("n_return_buckets", test.height))
         trial_sharpes_periodic = [
             s / np.sqrt(ppy)
-            for s in _authoritative_trial_sharpes(ticker=ticker, horizon=horizon)
+            for s in _authoritative_trial_sharpes(
+                ticker=ticker,
+                horizon=horizon,
+                campaign=candidate.campaign,
+            )
         ]
         current_sharpe = m_improved.get(
             "sharpe_strategy_liquidated", m_improved["sharpe_strategy"]
@@ -397,6 +408,7 @@ def validate_experiment(experiment_id: str) -> dict:
             n_trials=trial_sharpes_periodic,
         )
         hardening["multiple_testing"] = {
+            "campaign_id": candidate.campaign,
             "n_trials": len(trial_sharpes_periodic),
             "n_return_buckets": n_buckets,
             "periods_per_year": ppy,
@@ -410,7 +422,12 @@ def validate_experiment(experiment_id: str) -> dict:
             )
 
         from quant_loop_trader.validation.multiple_testing import benjamini_hochberg
-        family_pvals, current_p = _family_pvalues(bundle.exp_dir, ticker, horizon)
+        family_pvals, current_p = _family_pvalues(
+            bundle.exp_dir,
+            ticker,
+            horizon,
+            campaign=candidate.campaign,
+        )
         if current_p is not None and len(family_pvals) >= 5:
             rejects = benjamini_hochberg(family_pvals, fdr=0.10)
             if not rejects[family_pvals.index(current_p)]:
@@ -463,6 +480,7 @@ def validate_experiment(experiment_id: str) -> dict:
         "candidate": {
             "ticker": candidate.ticker,
             "horizon": candidate.horizon,
+            "campaign_id": candidate.campaign,
             "model_type": candidate.model_type,
             "model_params": candidate.model_params,
             "feature_columns": cols,
@@ -504,23 +522,42 @@ def validate_experiment(experiment_id: str) -> dict:
     return verdict
 
 
+def _campaign_from_config(raw_config, ticker: str) -> str | None:
+    """Resolve stored campaign identity, including pre-v4 BTC evidence."""
+    try:
+        cfg = json.loads(raw_config) if isinstance(raw_config, str) else dict(raw_config or {})
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
+    cid = cfg.get("campaign_id")
+    if cid:
+        return str(cid)
+    if is_crypto(ticker):
+        if cfg.get("campaign_holdout_start") == DEFAULT_CRYPTO_HOLDOUT_START:
+            return DEFAULT_CRYPTO_CAMPAIGN_ID
+        return None
+    return "default"
+
+
 def _authoritative_trial_sharpes(ticker: str | None = None,
-                                 horizon: int | None = None) -> list[float]:
+                                 horizon: int | None = None,
+                                 campaign: str | None = None) -> list[float]:
     import duckdb
     from quant_loop_trader.data import DB_PATH, migrate_db
 
     migrate_db()
     con = duckdb.connect(str(DB_PATH), read_only=True)
     rows = con.execute(
-        "SELECT metrics_json FROM experiments WHERE authoritative "
+        "SELECT metrics_json, config_json, ticker FROM experiments WHERE authoritative "
         "AND experiment_id NOT LIKE '%_baseline' "
         "AND (? IS NULL OR ticker = ?) AND (? IS NULL OR horizon_days = ?)",
         [ticker, ticker, horizon, horizon],
     ).fetchall()
     con.close()
     out = []
-    for (mj,) in rows:
+    for mj, cfg_json, row_ticker in rows:
         try:
+            if campaign is not None and _campaign_from_config(cfg_json, row_ticker) != campaign:
+                continue
             metrics = json.loads(mj)
             s_val = metrics.get("sharpe_strategy_liquidated", metrics.get("sharpe_strategy"))
             if isinstance(s_val, (int, float)) and math.isfinite(s_val):
@@ -597,8 +634,9 @@ def _correct_success_memory(memory_id: str) -> None:
     }))
 
 
-def _family_pvalues(current_exp_dir, ticker: str, horizon: int):
-    """Verified candidate p-values for the authoritative same-family experiments."""
+def _family_pvalues(current_exp_dir, ticker: str, horizon: int,
+                    campaign: str | None = None):
+    """Verified candidate p-values for the authoritative same-campaign family."""
     pvals, current_p = [], None
     import duckdb
     from quant_loop_trader.bundle import BundleIntegrityError, ExperimentBundle
@@ -606,12 +644,17 @@ def _family_pvalues(current_exp_dir, ticker: str, horizon: int):
 
     migrate_db()
     con = duckdb.connect(str(DB_PATH), read_only=True)
-    ids = [r[0].replace("_improved", "") for r in con.execute(
-        "SELECT experiment_id FROM experiments WHERE authoritative AND ticker=? "
+    rows = con.execute(
+        "SELECT experiment_id, config_json FROM experiments WHERE authoritative AND ticker=? "
         "AND horizon_days=? AND experiment_id NOT LIKE '%_baseline'",
         [ticker, horizon],
-    ).fetchall()]
+    ).fetchall()
     con.close()
+    ids = [
+        experiment_id.replace("_improved", "")
+        for experiment_id, config_json in rows
+        if campaign is None or _campaign_from_config(config_json, ticker) == campaign
+    ]
     for eid in ids:
         try:
             bundle = ExperimentBundle.open_verified(eid, EXP_ROOT)

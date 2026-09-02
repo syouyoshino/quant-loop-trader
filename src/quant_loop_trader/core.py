@@ -12,7 +12,7 @@ from dataclasses import asdict, dataclass, field
 
 import numpy as np
 
-PIPELINE_VERSION = 3
+PIPELINE_VERSION = 4
 
 
 @dataclass(frozen=True)

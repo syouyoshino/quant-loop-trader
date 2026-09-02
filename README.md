@@ -40,8 +40,8 @@ random_replay.py      seeded historical random-start robustness replay
 validation/           statistical, walk-forward, holdout and hardening checks
 agents.py             adversarial + independent replication gate
 research_memory.py    durable evidence/memory
- autonomy.py          the single autonomous research orchestrator
-dashboard/            read-only observability
+autonomy.py           bounded date/seed robustness sweep (legacy module name)
+dashboard/            observability + opt-in localhost research controls
 ```
 
 ## Setup
@@ -56,6 +56,8 @@ cp .env.example .env
 ```
 
 For BTCUSD, add a valid `TIINGO_API_KEY` to `.env`. BTC data fails closed unless the requested UTC daily window has exact 24/7 coverage.
+
+Each new experiment seals the interpreter and core package versions (NumPy, Polars, DuckDB, scikit-learn, SciPy and PyArrow) plus an environment fingerprint so later reproduction can identify runtime drift.
 
 ## Run Bitcoin research
 
@@ -80,7 +82,9 @@ For BTCUSD, add a valid `TIINGO_API_KEY` to `.env`. BTC data fails closed unless
 # Reproduce from the experiment's sealed dataset snapshot.
 .venv/bin/python -m quant_loop_trader.experiment --reproduce <experiment_id>
 
-# Budgeted autonomous BTC research. This is the ONE orchestration path.
+# Budgeted BTC robustness sweep over configured dates/seeds. The historical
+# `autonomy` module name is retained for scheduler/CLI compatibility; this does
+# not autonomously invent new strategies or hypotheses.
 QLT_AUTONOMOUS_ENABLED=true \
 .venv/bin/python -m quant_loop_trader.autonomy \
   --ticker BTCUSD \
@@ -92,7 +96,7 @@ The default BTC campaign is `btc_pre2024_v1` with a permanent holdout beginning 
 
 ## What `CandidateSpec` prevents
 
-Every trusted downstream check derives one strategy identity from a **verified experiment bundle**. It binds:
+Every trusted downstream check derives one strategy identity from a **verified experiment bundle**. Pipeline v4 experiments explicitly seal:
 
 - ticker and horizon,
 - model type, model parameters and seed,
@@ -101,7 +105,7 @@ Every trusted downstream check derives one strategy identity from a **verified e
 - experiment fingerprint,
 - crypto campaign and holdout boundary.
 
-Random replay, validation and final holdout therefore cannot silently evaluate different versions of the candidate. Unsupported feature families or replication models fail closed instead of falling back to a different strategy.
+Random replay, validation and final holdout therefore cannot silently evaluate different versions of the candidate. Unsupported feature families or replication models fail closed instead of falling back to a different strategy. Pre-v4 bundles remain readable through narrowly scoped legacy compatibility rules; new bundles do not rely on inferred candidate identity.
 
 Independent replication intentionally remains a separate implementation. That duplication is a scientific defense: a bug in the creator's model path should not automatically reproduce itself in the verifier.
 
@@ -109,14 +113,17 @@ Independent replication intentionally remains a separate implementation. That du
 
 BTCUSD research retains the safeguards that materially affect evidence quality:
 
+- exact Tiingo crypto-pair identity before parsing/caching,
 - exact 24/7 Tiingo daily coverage and gap checking,
 - `event_time` / `available_time` point-in-time contract,
 - causal lagged features plus truncation-invariance tests,
 - horizon purge between training and test data,
-- immutable content-addressed datasets,
+- 128-bit dataset IDs backed by full SHA-256 checksums,
+- immutable snapshots that fail on existing-path content mismatch,
 - permanent campaign-level holdout,
-- one-shot crash-safe holdout claims and sealed evidence,
-- majority/significance checks and multiple-testing controls,
+- one-shot holdout claims: an interrupted `CLAIMED` holdout is committed as a terminal `FAILED` result with `consumed=true` rather than being deleted or reopened,
+- campaign-scoped multiple-testing/deflated-Sharpe evidence,
+- majority/significance checks,
 - adversarial feature/label tests,
 - independent replication,
 - random-start temporal robustness with overlap diagnostics,
@@ -148,25 +155,25 @@ GitHub Actions runs import checks, Ruff, and the offline suite on pushes and pul
 
 ## Research terminal
 
-The dashboard remains read-only:
+The dashboard is read-only by default:
 
 ```bash
 PYTHONPATH=src .venv/bin/python -m quant_loop_trader.dashboard.api --port 8787
 # http://127.0.0.1:8787
 ```
 
-It reads DuckDB and experiment artifacts but does not alter research state.
+Optional research start/stop controls require an explicit `--enable-controls` launch and accept control POSTs only from a loopback client. Final holdout adjudication is not exposed through the dashboard.
 
 ## Continuous operation
 
-The bundled BTC launchd template invokes the direct autonomous research loop:
+The bundled BTC launchd template invokes the direct bounded robustness sweep:
 
 | Job | Schedule | Action |
 |---|---|---|
 | `com.quantloop.research-session` | daily 06:00 | `autonomy --ticker BTCUSD --horizon 5 --max-experiments 1` |
 | `com.quantloop.weekly-report` | Sunday 18:00 | generate the weekly research report |
 
-There is no second queue/controller orchestration layer. When the configured research frontier is exhausted, autonomy idles by design.
+There is no second queue/controller orchestration layer. When the configured date/seed frontier is exhausted, the sweep idles by design and requires a deliberate hypothesis refresh rather than silently expanding strategy complexity.
 
 Logs: `data/logs/session.log`. Reports: `data/reports/weekly_YYYY-Www.md`.
 
