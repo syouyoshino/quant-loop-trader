@@ -154,11 +154,24 @@ def _parse_tiingo(rows: list[dict]) -> pl.DataFrame:
 
 
 def _parse_tiingo_crypto(rows: list[dict], ticker: str) -> pl.DataFrame:
-    """Flatten Tiingo crypto pair metadata + nested priceData into PIT daily OHLCV."""
+    """Flatten the exact requested Tiingo crypto pair into PIT daily OHLCV.
+
+    Tiingo's crypto endpoint returns pair metadata with nested ``priceData``. A
+    response containing a different pair must never be accepted for the requested
+    ticker, even when that other pair has complete date coverage.
+    """
     if not rows:
         return _empty_ohlcv()
     wanted = ticker.lower().replace("-", "")
-    pair = next((r for r in rows if str(r.get("ticker", "")).lower() == wanted), rows[0])
+    matches = [
+        r for r in rows
+        if str(r.get("ticker", "")).strip().lower().replace("-", "") == wanted
+    ]
+    if not matches:
+        raise ValueError(f"requested_crypto_pair_missing:{ticker}")
+    if len(matches) != 1:
+        raise ValueError(f"requested_crypto_pair_ambiguous:{ticker}:matches={len(matches)}")
+    pair = matches[0]
     price_data = pair.get("priceData") or []
     if not isinstance(price_data, list) or not price_data:
         return _empty_ohlcv()
