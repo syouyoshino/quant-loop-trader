@@ -15,6 +15,7 @@ import { renderDetail } from '../components/detail.js';
 import { renderChampions } from '../components/champions.js';
 import { renderMarket } from '../components/market.js';
 import { renderActivity } from '../components/activity.js';
+import { initControl } from '../components/control.js';
 import { renderEquity } from '../charts/equity.js';
 import { initCollapse } from '../components/collapse.js';
 import { renderDrawdown } from '../charts/drawdown.js';
@@ -34,7 +35,7 @@ const state = {
 };
 
 const RATE = {
-  system: 2000, cycle: 2000, activity: 5000, experiments: 5000,
+  system: 2000, cycle: 2000, control: 2000, activity: 5000, experiments: 5000,
   overview: 5000, performance: 12000, risk: 12000, detail: 15000,
   champions: 15000, market: 30000,
 };
@@ -52,11 +53,13 @@ window.addEventListener('unhandledrejection', (e) => fatal(e.reason));
 
 async function boot() {
   initCollapse();
+  const control = initControl(el('control'), api);
   const overview = await api.overview().catch(() => null);
   if (overview) {
     state.selected = overview.default_experiment;
     paintOverview(overview);
   }
+  poll('control', () => api.control(), RATE.control, (status) => control.update(status));
   poll('system', () => api.system(), RATE.system, (sys) => {
     renderHeader(sys, sys.market || (overview && overview.market));
     renderSystem(el('system'), sys);

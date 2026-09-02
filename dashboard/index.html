@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>QUANT LOOP — RESEARCH TERMINAL</title>
 <link rel="stylesheet" href="/styles.css">
+<link rel="stylesheet" href="/controls.css">
 <script src="/vendor/echarts.min.js"></script>
 </head>
 <body>
@@ -16,6 +17,14 @@
 
 <main class="grid">
   <section id="cycle" class="panel span-12 cycle-panel"></section>
+
+  <section id="control-panel" class="panel span-12">
+    <div class="panel-head">
+      <h2>RESEARCH CONTROL</h2>
+      <span class="dim">BTC CAMPAIGN / LOCALHOST ONLY</span>
+    </div>
+    <div id="control"></div>
+  </section>
 
   <section id="pipeline" class="panel span-4"></section>
   <section id="system" class="panel span-4"></section>

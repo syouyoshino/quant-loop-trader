@@ -1,16 +1,23 @@
-"""Read-only HTTP API + static host for the Quant Loop terminal.
+"""HTTP API + static host for the Quant Loop research terminal.
 
-Stdlib only: the research environment already carries duckdb; a web framework
-would be one more thing to install and secure for a localhost observability
-tool. Every handler delegates to service/queries — no SQL lives here.
+GET endpoints remain read-only. Optional localhost-only control endpoints can be
+enabled explicitly with ``--enable-controls`` to launch/stop the existing
+autonomous research runner from the dashboard.
 
-    python -m quant_loop_trader.dashboard.api --port 8787
+    python -m quant_loop_trader.dashboard.api --port 8787 --enable-controls
 """
 from __future__ import annotations
 
 import argparse
+import json
+import os
 import re
+import signal
+import subprocess
+import sys
+import threading
 import traceback
+from datetime import date, datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
 
@@ -31,6 +38,10 @@ MIME = {
 }
 
 _ID = re.compile(r"^[A-Za-z0-9_.\-]+$")
+_TICKER = re.compile(r"^[A-Za-z0-9.\-]+$")
+_CONTROL_LOCK = threading.RLock()
+_CONTROL_PROCESS: subprocess.Popen | None = None
+_CONTROL_META: dict = {}
 
 
 def _int(params: dict, key: str, default: int) -> int:
@@ -38,6 +49,146 @@ def _int(params: dict, key: str, default: int) -> int:
         return int(params.get(key, [default])[0])
     except (TypeError, ValueError):
         return default
+
+
+def _iso_date(value: object, field: str) -> str:
+    text = str(value or "").strip()
+    try:
+        date.fromisoformat(text)
+    except ValueError as exc:
+        raise ValueError(f"invalid_{field}:{text}") from exc
+    return text
+
+
+def _control_status(enabled: bool) -> dict:
+    global _CONTROL_PROCESS
+    with _CONTROL_LOCK:
+        proc = _CONTROL_PROCESS
+        running = bool(proc and proc.poll() is None)
+        exit_code = None if not proc or running else proc.returncode
+        meta = dict(_CONTROL_META)
+    return {
+        "enabled": bool(enabled),
+        "localhost_only": True,
+        "running": running,
+        "pid": proc.pid if proc else None,
+        "exit_code": exit_code,
+        "run": meta or None,
+    }
+
+
+def _normalise_control_payload(payload: dict) -> dict:
+    ticker = str(payload.get("ticker", "BTCUSD")).strip().upper()
+    if not _TICKER.match(ticker):
+        raise ValueError("invalid_ticker")
+
+    try:
+        horizon = int(payload.get("horizon", 5))
+        max_experiments = int(payload.get("max_experiments", 3))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("invalid_numeric_control") from exc
+    if not 1 <= horizon <= 60:
+        raise ValueError("horizon_out_of_range")
+    if not 1 <= max_experiments <= 100:
+        raise ValueError("max_experiments_out_of_range")
+
+    validate = bool(payload.get("validate", True))
+    campaign_id = str(payload.get("campaign_id", "btc_2026_v1")).strip()
+    if not _ID.match(campaign_id):
+        raise ValueError("invalid_campaign_id")
+
+    holdout_start = _iso_date(payload.get("holdout_start", "2026-01-01"), "holdout_start")
+    data_end = _iso_date(
+        payload.get("data_end", datetime.now(timezone.utc).date().isoformat()),
+        "data_end",
+    )
+    if data_end <= holdout_start:
+        raise ValueError("data_end_must_be_after_holdout_start")
+
+    raw_starts = payload.get("research_starts", ["2018-01-01", "2020-01-01", "2022-01-01"])
+    if isinstance(raw_starts, str):
+        raw_starts = [v.strip() for v in raw_starts.split(",") if v.strip()]
+    if not isinstance(raw_starts, list) or not raw_starts:
+        raise ValueError("research_starts_required")
+    research_starts = [_iso_date(v, "research_start") for v in raw_starts]
+    if any(v >= holdout_start for v in research_starts):
+        raise ValueError("research_start_must_precede_holdout")
+
+    return {
+        "ticker": ticker,
+        "horizon": horizon,
+        "max_experiments": max_experiments,
+        "validate": validate,
+        "campaign_id": campaign_id,
+        "holdout_start": holdout_start,
+        "research_starts": research_starts,
+        "data_end": data_end,
+    }
+
+
+def _start_control_run(payload: dict) -> dict:
+    global _CONTROL_PROCESS, _CONTROL_META
+    cfg = _normalise_control_payload(payload)
+
+    with _CONTROL_LOCK:
+        if _CONTROL_PROCESS and _CONTROL_PROCESS.poll() is None:
+            raise RuntimeError("research_run_already_active")
+
+        env = os.environ.copy()
+        env["QLT_AUTONOMOUS_ENABLED"] = "true"
+        env["QLT_CRYPTO_CAMPAIGN_ID"] = cfg["campaign_id"]
+        env["QLT_CRYPTO_HOLDOUT_START"] = cfg["holdout_start"]
+        env["QLT_CRYPTO_CAMPAIGN_STARTS"] = ",".join(cfg["research_starts"])
+        env["QLT_CRYPTO_CAMPAIGN_ENDS"] = cfg["data_end"]
+
+        cmd = [
+            sys.executable,
+            "-m",
+            "quant_loop_trader.autonomy",
+            "--ticker",
+            cfg["ticker"],
+            "--horizon",
+            str(cfg["horizon"]),
+            "--max-experiments",
+            str(cfg["max_experiments"]),
+        ]
+        if not cfg["validate"]:
+            cmd.append("--no-validate")
+
+        log_dir = q.root() / "data" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = log_dir / "dashboard-control.log"
+        with log_path.open("ab") as log:
+            proc = subprocess.Popen(
+                cmd,
+                cwd=q.root(),
+                env=env,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+
+        _CONTROL_PROCESS = proc
+        _CONTROL_META = {
+            **cfg,
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "log": str(log_path.relative_to(q.root())),
+        }
+
+    return _control_status(True)
+
+
+def _stop_control_run() -> dict:
+    global _CONTROL_PROCESS
+    with _CONTROL_LOCK:
+        proc = _CONTROL_PROCESS
+        if not proc or proc.poll() is not None:
+            return _control_status(True)
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    return _control_status(True)
 
 
 def filter_experiments(rows: list[dict], params: dict) -> list[dict]:
@@ -76,7 +227,7 @@ def filter_experiments(rows: list[dict], params: dict) -> list[dict]:
 
 
 def route(path: str, params: dict):
-    """Map a GET path to a JSON-serialisable payload. Read-only by construction."""
+    """Map a GET path to a JSON-serialisable payload. GET is read-only."""
     parts = [unquote(p) for p in path.strip("/").split("/") if p]
     if not parts or parts[0] != "api":
         raise KeyError(path)
@@ -174,9 +325,15 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _local_control_allowed(self) -> bool:
+        return bool(self.server.enable_controls and self.client_address[0] in ("127.0.0.1", "::1"))
+
     def do_GET(self):
         parsed = urlparse(self.path)
         params = parse_qs(parsed.query)
+        if parsed.path == "/api/control":
+            self._send(200, dumps(_control_status(self._local_control_allowed())), "application/json")
+            return
         if parsed.path.startswith("/api/"):
             try:
                 self._send(200, dumps(route(parsed.path, params)), "application/json")
@@ -193,6 +350,37 @@ class Handler(BaseHTTPRequestHandler):
                            "application/json")
             return
         self._static(parsed.path)
+
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        if parsed.path not in ("/api/control/run", "/api/control/stop"):
+            self._send(404, dumps({"error": "not_found"}), "application/json")
+            return
+        if not self._local_control_allowed():
+            self._send(
+                403,
+                dumps({"error": "control_disabled", "detail": "launch with --enable-controls on localhost"}),
+                "application/json",
+            )
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if length > 16384:
+                raise ValueError("request_too_large")
+            raw = self.rfile.read(length) if length else b"{}"
+            payload = json.loads(raw.decode("utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError("json_object_required")
+            result = _start_control_run(payload) if parsed.path.endswith("/run") else _stop_control_run()
+            self._send(202, dumps(result), "application/json")
+        except (ValueError, json.JSONDecodeError) as exc:
+            self._send(400, dumps({"error": "invalid_request", "detail": str(exc)}), "application/json")
+        except RuntimeError as exc:
+            self._send(409, dumps({"error": "conflict", "detail": str(exc)}), "application/json")
+        except Exception as exc:
+            if self.server.verbose:
+                traceback.print_exc()
+            self._send(500, dumps({"error": "internal", "detail": str(exc)[:300]}), "application/json")
 
     def _static(self, path: str):
         rel = path.lstrip("/") or "index.html"
@@ -211,20 +399,32 @@ class Handler(BaseHTTPRequestHandler):
                    MIME.get(target.suffix, "application/octet-stream"))
 
 
-def serve(host: str = "127.0.0.1", port: int = 8787, verbose: bool = False):
+def serve(
+    host: str = "127.0.0.1",
+    port: int = 8787,
+    verbose: bool = False,
+    enable_controls: bool = False,
+):
     httpd = ThreadingHTTPServer((host, port), Handler)
     httpd.verbose = verbose
+    httpd.enable_controls = enable_controls
     return httpd
 
 
 def main():
-    p = argparse.ArgumentParser(description="Quant Loop research terminal (read-only)")
+    p = argparse.ArgumentParser(description="Quant Loop research terminal")
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8787)
     p.add_argument("-v", "--verbose", action="store_true")
+    p.add_argument(
+        "--enable-controls",
+        action="store_true",
+        help="allow localhost POST controls that launch/stop autonomous research",
+    )
     args = p.parse_args()
-    httpd = serve(args.host, args.port, args.verbose)
-    print(f"QUANT LOOP terminal → http://{args.host}:{args.port}  (root: {q.root()})")
+    httpd = serve(args.host, args.port, args.verbose, args.enable_controls)
+    mode = "CONTROL" if args.enable_controls else "READ-ONLY"
+    print(f"QUANT LOOP terminal → http://{args.host}:{args.port}  ({mode}; root: {q.root()})")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
