@@ -30,8 +30,38 @@ TIINGO_CRYPTO_URL = "https://api.tiingo.com/tiingo/crypto/prices"
 
 
 def _checksum_df(df: pl.DataFrame) -> str:
+    """Return the full SHA-256 of the canonical CSV representation."""
     b = df.write_csv().encode()
-    return hashlib.sha256(b).hexdigest()[:16]
+    return hashlib.sha256(b).hexdigest()
+
+
+def seal_dataset_snapshot(df: pl.DataFrame, path: Path, expected_checksum: str) -> None:
+    """Atomically create a content-addressed snapshot and fail on path collisions."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        existing = pl.read_parquet(str(path))
+        actual = _checksum_df(existing)
+        if actual != expected_checksum:
+            raise RuntimeError(
+                "dataset_snapshot_collision:"
+                f"path={path.name}:expected={expected_checksum}:actual={actual}"
+            )
+        return
+
+    tmp = path.with_name(f".{path.name}.tmp")
+    try:
+        df.write_parquet(str(tmp))
+        actual = _checksum_df(pl.read_parquet(str(tmp)))
+        if actual != expected_checksum:
+            raise RuntimeError(
+                "dataset_snapshot_write_mismatch:"
+                f"path={path.name}:expected={expected_checksum}:actual={actual}"
+            )
+        tmp.replace(path)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
 
 
 _MIGRATED: set[str] = set()
@@ -348,7 +378,7 @@ def dataset_metadata(df: pl.DataFrame, ticker: str, source: str,
     end = str(df["event_time"].max())
     prov = {"source": source, "ticker": ticker, "rows": df.height, **(extra_provenance or {})}
     return {
-        "dataset_id": f"{ticker}_{start}_{end}_{cs[:8]}",
+        "dataset_id": f"{ticker}_{start}_{end}_{cs[:32]}",
         "ticker": ticker,
         "start_date": start,
         "end_date": end,
