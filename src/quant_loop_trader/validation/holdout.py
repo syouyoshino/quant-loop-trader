@@ -402,18 +402,25 @@ def _commit_holdout_outcome(experiment_id: str, state: str, result: dict,
 
 
 def release_holdout_claim(experiment_id: str) -> str:
-    """Fail-closed crash recovery: seal an open claim as permanently consumed.
+    """Fail-closed crash recovery: permanently consume an open holdout claim.
 
     The historical function name is retained for callers, but a CLAIMED holdout is
-    never deleted or reopened. Once the holdout may have been exposed, recovery
-    marks it ABORTED_CONSUMED and rejects the candidate. A new campaign/holdout is
+    never deleted or reopened. Recovery commits a terminal FAILED result with an
+    explicit consumed marker and rejects the candidate. A new campaign/holdout is
     required for another final adjudication.
     """
+    import logging
+
     import duckdb
 
     from quant_loop_trader.data import DB_PATH, migrate_db
 
     migrate_db()
+    result = _canonical_json({
+        "promoted": False,
+        "reason": "holdout_aborted_after_claim",
+        "consumed": True,
+    })
     con = duckdb.connect(str(DB_PATH))
     try:
         con.execute("BEGIN TRANSACTION")
@@ -426,23 +433,16 @@ def release_holdout_claim(experiment_id: str) -> str:
         if row[0] != "CLAIMED":
             con.execute("ROLLBACK")
             return f"refused:{row[0]}"
-        result = {
-            "promoted": False,
-            "reason": "holdout_aborted_after_claim",
-            "consumed": True,
-        }
         con.execute(
             "UPDATE model_registry SET status='rejected' WHERE model_id=?",
             [f"{experiment_id}_improved"],
         )
         con.execute(
-            "UPDATE holdout_claims SET state='ABORTED_CONSUMED', "
-            "completed_at=current_timestamp, promoted=FALSE, result_json=? "
-            "WHERE experiment_id=?",
+            "UPDATE holdout_claims SET state='FAILED', completed_at=current_timestamp, "
+            "promoted=FALSE, result_json=? WHERE experiment_id=?",
             [json.dumps(result, sort_keys=True), experiment_id],
         )
         con.execute("COMMIT")
-        return "consumed:ABORTED_CONSUMED"
     except Exception:
         try:
             con.execute("ROLLBACK")
@@ -451,6 +451,23 @@ def release_holdout_claim(experiment_id: str) -> str:
         raise
     finally:
         con.close()
+
+    # Persist a normal sealed FAILED holdout artifact when the research bundle is
+    # still healthy. The database tombstone above remains authoritative even if
+    # filesystem evidence cannot be reconstructed after a severe crash/tamper.
+    try:
+        from quant_loop_trader.bundle import ExperimentBundle
+        from quant_loop_trader.experiment import EXP_ROOT
+
+        bundle = ExperimentBundle.open_verified(experiment_id, EXP_ROOT)
+        _seal_holdout_evidence(experiment_id, bundle, result)
+    except Exception as exc:
+        logging.getLogger(__name__).warning(
+            "consumed holdout claim but could not seal aborted evidence for %s: %s",
+            experiment_id,
+            exc,
+        )
+    return "consumed:FAILED"
 
 
 def _confirm_success_memory(experiment_id: str) -> None:
