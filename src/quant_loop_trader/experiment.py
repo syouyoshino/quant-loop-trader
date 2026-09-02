@@ -6,7 +6,9 @@ import hashlib
 import json
 import logging
 import os
+import platform
 import random
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -21,6 +23,7 @@ from quant_loop_trader.data import (
     dataset_metadata,
     fetch_ohlcv,
     migrate_db,
+    seal_dataset_snapshot,
     upsert_dataset,
 )
 from quant_loop_trader.evaluation import autopsy, evaluate, time_split
@@ -30,7 +33,7 @@ from quant_loop_trader.features import (
     feature_columns,
     improved_feature_columns,
 )
-from quant_loop_trader.market import calendar_days, campaign_holdout_start
+from quant_loop_trader.market import calendar_days, campaign_holdout_start, campaign_id
 from quant_loop_trader.replay import ReplayEngine
 from quant_loop_trader.research_memory import (
     duplicate_risk,
@@ -153,6 +156,35 @@ def _code_version() -> str:
         return "unknown"
 
 
+def _runtime_environment() -> dict:
+    """Record the interpreter and core package versions used by a sealed run."""
+    from importlib.metadata import PackageNotFoundError, version
+
+    packages = {}
+    for name in (
+        "numpy",
+        "polars",
+        "duckdb",
+        "scikit-learn",
+        "scipy",
+        "pyarrow",
+    ):
+        try:
+            packages[name] = version(name)
+        except PackageNotFoundError:
+            packages[name] = "not-installed"
+    payload = {
+        "python_version": platform.python_version(),
+        "python_implementation": platform.python_implementation(),
+        "platform": platform.platform(),
+        "packages": packages,
+    }
+    payload["fingerprint"] = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    return payload
+
+
 def run_experiment(ticker: str = "SPY", horizon: int = 5,
                    start: str = "2018-01-01", end: str = "2024-12-31",
                    seed: int = 42, source_snapshot: str | Path | None = None,
@@ -204,10 +236,8 @@ def run_experiment(ticker: str = "SPY", horizon: int = 5,
     upsert_dataset(meta)
 
     snap_dir = ROOT / "data" / "datasets"
-    snap_dir.mkdir(parents=True, exist_ok=True)
     snap_path = snap_dir / f"{meta['dataset_id']}.parquet"
-    if not snap_path.exists():
-        df_raw.write_parquet(str(snap_path))
+    seal_dataset_snapshot(df_raw, snap_path, meta["checksum"])
 
     # 2. all post-acquisition research uses the immutable snapshot
     train_b, test_b = build_train_test(
@@ -266,6 +296,10 @@ def run_experiment(ticker: str = "SPY", horizon: int = 5,
             "horizon": horizon,
         }))
 
+    runtime_environment = _runtime_environment()
+    model_type = "logistic"
+    model_params: dict = {}
+    candidate_features = improved_feature_columns()
     config = {
         "spec_fingerprint": spec.fingerprint(),
         "pipeline_version": _pipeline_version(),
@@ -275,14 +309,19 @@ def run_experiment(ticker: str = "SPY", horizon: int = 5,
         "end": end,
         "seed": seed,
         "calendar_days": calendar_days(ticker),
+        "campaign_id": campaign_id(ticker),
         "campaign_holdout_start": campaign_holdout_start(ticker),
         "dataset_id": meta["dataset_id"],
         "feature_version_baseline": "v1-ret1-ret5-ma10-vol10-rsi14",
         "feature_version_improved": "v1+vol_regime_ret5_x_vol10",
+        "feature_columns": candidate_features,
         "model_version": "sklearn-LogReg-C1.0-scaled",
+        "model_type": model_type,
+        "model_params": model_params,
         "snapshot_definition": meta["snapshot_definition"],
         "dataset_checksum": meta["checksum"],
         "dataset_snapshot": str(snap_path),
+        "runtime_environment": runtime_environment,
         **periods,
     }
     report = {
@@ -294,7 +333,7 @@ def run_experiment(ticker: str = "SPY", horizon: int = 5,
         "research_priority_score": 0.8,
         "experiment_design": (
             f"time-split 70/30, LogisticRegression, features baseline "
-            f"{feature_columns()} vs improved {improved_feature_columns()}"
+            f"{feature_columns()} vs improved {candidate_features}"
         ),
         "expected_outcome": "improved accuracy +0.02 and liquidated Sharpe non-degrading",
         "success_criteria": "improved accuracy > baseline and liquidated Sharpe >= baseline",
@@ -311,6 +350,9 @@ def run_experiment(ticker: str = "SPY", horizon: int = 5,
             "seed": seed,
             "model": "LogisticRegression",
             "scaler": "StandardScaler",
+            "model_type": model_type,
+            "model_params": model_params,
+            "feature_columns": candidate_features,
         },
         "prediction_timestamp": end,
         "baseline_metrics": baseline["metrics"],
@@ -348,6 +390,8 @@ def run_experiment(ticker: str = "SPY", horizon: int = 5,
             "seed": seed,
             "checksum": meta["checksum"],
             "code_version": _code_version(),
+            "environment_fingerprint": runtime_environment["fingerprint"],
+            "runtime_environment": runtime_environment,
         },
     }
 
