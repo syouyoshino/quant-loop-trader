@@ -1,0 +1,66 @@
+/* Research control panel — deliberately separate from the observability theme. */
+.control-form { margin-top: 8px; }
+.control-grid {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(120px, 1fr));
+  gap: 8px;
+}
+.control-grid label { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.control-grid label > span { color: var(--text-faint); font-size: 10px; letter-spacing: .08em; }
+.control-grid input {
+  width: 100%;
+  min-width: 0;
+  height: 28px;
+  padding: 4px 7px;
+  border: 1px solid var(--line-strong);
+  background: #05080c;
+  color: var(--text);
+  font: inherit;
+  outline: none;
+}
+.control-grid input:focus { border-color: var(--cyan); }
+.control-wide { grid-column: span 3; }
+.control-check {
+  grid-column: span 3;
+  flex-direction: row !important;
+  align-items: center;
+  justify-content: flex-start;
+  padding-top: 14px;
+}
+.control-check input { width: 14px; height: 14px; accent-color: var(--amber); }
+.control-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+.action {
+  height: 28px;
+  padding: 0 10px;
+  border: 1px solid var(--line-strong);
+  background: var(--panel-alt);
+  color: var(--text);
+  font: inherit;
+  letter-spacing: .06em;
+  cursor: pointer;
+}
+.action.primary { border-color: var(--amber); color: var(--amber); }
+.action.danger { border-color: var(--red); color: var(--red); }
+.action:disabled { opacity: .35; cursor: default; }
+.control-warning {
+  margin-top: 9px;
+  padding-top: 7px;
+  border-top: 1px solid var(--line);
+  color: var(--text-faint);
+  font-size: 10px;
+  line-height: 1.45;
+}
+@media (max-width: 1200px) {
+  .control-grid { grid-template-columns: repeat(3, minmax(120px, 1fr)); }
+  .control-wide, .control-check { grid-column: span 3; }
+}
+@media (max-width: 700px) {
+  .control-grid { grid-template-columns: 1fr; }
+  .control-wide, .control-check { grid-column: span 1; }
+}
