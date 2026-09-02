@@ -13,6 +13,7 @@ from quant_loop_trader.validation.holdout import (
     adjudicate_holdout,
     apply_holdout,
     release_holdout_claim,
+    verify_holdout_evidence,
 )
 
 
@@ -193,18 +194,19 @@ def test_crash_after_holdout_is_read_is_permanently_consumed(isolated_research):
     assert blocked["promoted"] is False
     assert blocked["reason"] == "holdout_already_consumed:CLAIMED"
 
-    assert release_holdout_claim(exp_id) == "consumed:ABORTED_CONSUMED"
-    assert release_holdout_claim(exp_id) == "refused:ABORTED_CONSUMED"
+    assert release_holdout_claim(exp_id) == "consumed:FAILED"
+    assert release_holdout_claim(exp_id) == "refused:FAILED"
 
     con = duckdb.connect(str(dm.DB_PATH))
-    state = con.execute(
-        "SELECT state FROM holdout_claims WHERE experiment_id=?", [exp_id]
-    ).fetchone()[0]
+    state, raw_result = con.execute(
+        "SELECT state, result_json FROM holdout_claims WHERE experiment_id=?", [exp_id]
+    ).fetchone()
     status = con.execute(
         "SELECT status FROM model_registry WHERE model_id=?", [f"{exp_id}_improved"]
     ).fetchone()[0]
-    assert state == "ABORTED_CONSUMED"
+    assert state == "FAILED"
     assert status == "rejected"
+    assert __import__("json").loads(raw_result)["consumed"] is True
     # Even a manual registry reset cannot reopen the consumed claim.
     con.execute("UPDATE model_registry SET status='eligible' WHERE model_id=?",
                 [f"{exp_id}_improved"])
@@ -212,7 +214,17 @@ def test_crash_after_holdout_is_read_is_permanently_consumed(isolated_research):
 
     recovered = adjudicate_holdout(exp_id)
     assert recovered["promoted"] is False
-    assert recovered["reason"] == "holdout_already_consumed:ABORTED_CONSUMED"
+    assert recovered["reason"] == "holdout_already_consumed:FAILED"
+
+    # Restore the fail-closed registry status to validate the sealed tombstone.
+    con = duckdb.connect(str(dm.DB_PATH))
+    con.execute("UPDATE model_registry SET status='rejected' WHERE model_id=?",
+                [f"{exp_id}_improved"])
+    con.close()
+    sealed = verify_holdout_evidence(exp_id)
+    assert sealed["promoted"] is False
+    assert sealed["consumed"] is True
+    assert sealed["reason"] == "holdout_aborted_after_claim"
 
 
 def test_full_holdout_metrics_are_persisted(isolated_research):
