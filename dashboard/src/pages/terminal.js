@@ -31,7 +31,9 @@ const state = {
   filters: {},
   perf: null,
   risk: null,
-  marketTicker: null,
+  marketTicker: 'BTCUSD',
+  followRun: null,
+  followSuppressedKey: null,
 };
 
 const RATE = {
@@ -59,7 +61,10 @@ async function boot() {
     state.selected = overview.default_experiment;
     paintOverview(overview);
   }
-  poll('control', () => api.control(), RATE.control, (status) => control.update(status));
+  poll('control', () => api.control(), RATE.control, (status) => {
+    control.update(status);
+    trackControlRun(status);
+  });
   poll('system', () => api.system(), RATE.system, (sys) => {
     renderHeader(sys, sys.market || (overview && overview.market));
     renderSystem(el('system'), sys);
@@ -77,7 +82,7 @@ async function boot() {
   poll('activity', () => api.activity(120), RATE.activity, (d) => renderActivity(el('activity'), d.events));
   poll('champions', () => api.champions(), RATE.champions,
     (d) => renderChampions(el('champions'), d, select));
-  poll('market', () => api.market(state.marketTicker || 'SPY'), RATE.market,
+  poll('market', () => api.market(state.marketTicker || 'BTCUSD'), RATE.market,
     (m) => renderMarket(el('market'), m));
   startSelectionStreams();
   wireControls();
@@ -93,9 +98,53 @@ function paintOverview(o) {
   if (!state.selected) state.selected = o.default_experiment;
 }
 
+function controlRunKey(status) {
+  const run = status && status.run;
+  if (!run || !run.started_at) return null;
+  return `${status.pid || 'unknown'}:${run.started_at}`;
+}
+
+function trackControlRun(status) {
+  if (!status || !status.running || !status.run) return;
+  const key = controlRunKey(status);
+  if (!key || state.followSuppressedKey === key) return;
+  if (!state.followRun || state.followRun.key !== key) {
+    const ticker = status.run.ticker || 'BTCUSD';
+    state.followRun = {
+      key,
+      ticker,
+      startedAt: status.run.started_at,
+    };
+    state.filters = { market: ticker };
+    state.marketTicker = ticker;
+    api.market(ticker).then((m) => renderMarket(el('market'), m)).catch(() => {});
+  }
+}
+
+function followResearchExperiment(rows) {
+  const follow = state.followRun;
+  if (!follow || !Array.isArray(rows)) return;
+
+  const threshold = Date.parse(follow.startedAt);
+  const toleranceMs = 5000;
+  const tickerMarker = `_${follow.ticker}_`;
+  const candidate = rows.find((row) => {
+    const sameMarket = row.market === follow.ticker || String(row.id || '').includes(tickerMarker);
+    if (!sameMarket) return false;
+    if (!Number.isFinite(threshold)) return true;
+    const started = Date.parse(row.started || '');
+    return Number.isFinite(started) && started >= threshold - toleranceMs;
+  });
+
+  if (candidate && candidate.id !== state.selected) {
+    setSelection(candidate.id);
+  }
+}
+
 function paintTable(payload) {
   const node = el('experiments');
   if (node.contains(document.activeElement) && document.activeElement !== document.body) return;
+  followResearchExperiment(payload.experiments || []);
   renderTable(node, payload, state, select);
 }
 
@@ -167,12 +216,20 @@ function updateRangeAvailability(points) {
   });
 }
 
-function select(id) {
+function setSelection(id) {
   if (id === state.selected) return;
   state.selected = id;
   document.querySelectorAll('#experiments tbody tr').forEach((tr) =>
     tr.classList.toggle('selected', tr.dataset.id === id));
   startSelectionStreams();
+}
+
+function select(id) {
+  if (state.followRun) {
+    state.followSuppressedKey = state.followRun.key;
+    state.followRun = null;
+  }
+  setSelection(id);
 }
 
 function wireControls() {
