@@ -1,5 +1,3 @@
-import { escape } from './util.js';
-
 export function initControl(node, api) {
   if (!node) return { update: () => {} };
 
@@ -88,12 +86,12 @@ export function initControl(node, api) {
     setMessage('STARTING…', 'warn');
     try {
       const status = await api.startResearch(config());
+      submitting = false;
       update(status);
     } catch (err) {
-      setMessage(`START FAILED — ${escape(err.message || err)}`, 'neg');
-    } finally {
       submitting = false;
       update(latest);
+      setMessage(`START FAILED — ${String(err.message || err)}`, 'neg');
     }
   });
 
@@ -104,12 +102,12 @@ export function initControl(node, api) {
     setMessage('STOPPING…', 'warn');
     try {
       const status = await api.stopResearch();
+      submitting = false;
       update(status);
     } catch (err) {
-      setMessage(`STOP FAILED — ${escape(err.message || err)}`, 'neg');
-    } finally {
       submitting = false;
       update(latest);
+      setMessage(`STOP FAILED — ${String(err.message || err)}`, 'neg');
     }
   });
 
