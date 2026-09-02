@@ -1,4 +1,9 @@
-"""Autonomous research loop — bounded observation-mode sessions."""
+"""Bounded research robustness sweep over dates/seeds, not strategy discovery.
+
+The historical module name is retained for CLI and scheduler compatibility. This
+runner explores the fixed active strategy family across configured windows and
+seeds, then validates each result; it does not autonomously invent hypotheses.
+"""
 from __future__ import annotations
 
 import argparse
@@ -169,6 +174,7 @@ def select_candidates(ticker: str, horizon: int, budget: int) -> list[dict]:
 
 def run_session(ticker: str = "SPY", horizon: int = 5,
                 max_experiments: int = 3, validate: bool = True) -> dict:
+    """Run a bounded robustness sweep of the fixed active strategy family."""
     if os.getenv("QLT_AUTONOMOUS_ENABLED", "").lower() != "true":
         logger.warning(json.dumps({
             "event": "session_blocked",
@@ -304,7 +310,9 @@ def _run_session_body(ticker: str, horizon: int, max_experiments: int,
 
 
 def main():
-    p = argparse.ArgumentParser(description="Autonomous research session (observation mode)")
+    p = argparse.ArgumentParser(
+        description="Bounded research robustness sweep (legacy autonomy module name)"
+    )
     p.add_argument("--ticker", default="SPY")
     p.add_argument("--horizon", type=int, default=5)
     p.add_argument("--max-experiments", type=int, default=3)
