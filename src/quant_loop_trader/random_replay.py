@@ -26,7 +26,13 @@ from quant_loop_trader.candidate import (
     validate_feature_columns,
 )
 from quant_loop_trader.core import significance
-from quant_loop_trader.data import coverage_check, dataset_metadata, fetch_ohlcv, gap_check
+from quant_loop_trader.data import (
+    coverage_check,
+    dataset_metadata,
+    fetch_ohlcv,
+    gap_check,
+    seal_dataset_snapshot,
+)
 from quant_loop_trader.evaluation import autopsy, evaluate
 from quant_loop_trader.experiment import make_labels
 from quant_loop_trader.features import add_improved_features, improved_feature_columns
@@ -142,10 +148,8 @@ def _load_research_snapshot(
         },
     )
     snap_dir = root / "data" / "datasets"
-    snap_dir.mkdir(parents=True, exist_ok=True)
     snap_path = snap_dir / f"{meta['dataset_id']}.parquet"
-    if not snap_path.exists():
-        df.write_parquet(str(snap_path))
+    seal_dataset_snapshot(df, snap_path, meta["checksum"])
     return df, meta, snap_path
 
 
