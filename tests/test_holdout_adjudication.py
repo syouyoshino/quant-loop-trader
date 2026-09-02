@@ -180,8 +180,8 @@ def test_holdout_cannot_be_adjudicated_twice(isolated_research):
     assert second["reason"].startswith("holdout_already_consumed")
 
 
-def test_crash_after_holdout_is_read_fails_closed(isolated_research):
-    """An open claim blocks re-adjudication until explicit human recovery."""
+def test_crash_after_holdout_is_read_is_permanently_consumed(isolated_research):
+    """Once CLAIMED, crash recovery must never make the hidden holdout reusable."""
     exp_id, _ = _make_eligible(isolated_research)
     import quant_loop_trader.data as dm
     con = duckdb.connect(str(dm.DB_PATH))
@@ -193,10 +193,26 @@ def test_crash_after_holdout_is_read_fails_closed(isolated_research):
     assert blocked["promoted"] is False
     assert blocked["reason"] == "holdout_already_consumed:CLAIMED"
 
-    assert release_holdout_claim(exp_id) == "released:CLAIMED"
-    assert release_holdout_claim(exp_id) == "no_claim"
+    assert release_holdout_claim(exp_id) == "consumed:ABORTED_CONSUMED"
+    assert release_holdout_claim(exp_id) == "refused:ABORTED_CONSUMED"
+
+    con = duckdb.connect(str(dm.DB_PATH))
+    state = con.execute(
+        "SELECT state FROM holdout_claims WHERE experiment_id=?", [exp_id]
+    ).fetchone()[0]
+    status = con.execute(
+        "SELECT status FROM model_registry WHERE model_id=?", [f"{exp_id}_improved"]
+    ).fetchone()[0]
+    assert state == "ABORTED_CONSUMED"
+    assert status == "rejected"
+    # Even a manual registry reset cannot reopen the consumed claim.
+    con.execute("UPDATE model_registry SET status='eligible' WHERE model_id=?",
+                [f"{exp_id}_improved"])
+    con.close()
+
     recovered = adjudicate_holdout(exp_id)
-    assert "holdout_already_consumed" not in str(recovered.get("reason", ""))
+    assert recovered["promoted"] is False
+    assert recovered["reason"] == "holdout_already_consumed:ABORTED_CONSUMED"
 
 
 def test_full_holdout_metrics_are_persisted(isolated_research):
