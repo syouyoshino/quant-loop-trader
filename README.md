@@ -121,7 +121,7 @@ BTCUSD research retains the safeguards that materially affect evidence quality:
 - 128-bit dataset IDs backed by full SHA-256 checksums,
 - immutable snapshots that fail on existing-path content mismatch,
 - permanent campaign-level holdout,
-- one-shot holdout claims: an interrupted `CLAIMED` holdout becomes permanently `ABORTED_CONSUMED` rather than being reopened,
+- one-shot holdout claims: an interrupted `CLAIMED` holdout is committed as a terminal `FAILED` result with `consumed=true` rather than being deleted or reopened,
 - campaign-scoped multiple-testing/deflated-Sharpe evidence,
 - majority/significance checks,
 - adversarial feature/label tests,
