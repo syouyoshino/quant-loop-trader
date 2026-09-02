@@ -8,7 +8,6 @@ import logging
 import os
 import platform
 import random
-import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
