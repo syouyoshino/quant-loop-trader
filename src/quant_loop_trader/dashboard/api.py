@@ -42,6 +42,7 @@ _TICKER = re.compile(r"^[A-Za-z0-9.\-]+$")
 _CONTROL_LOCK = threading.RLock()
 _CONTROL_PROCESS: subprocess.Popen | None = None
 _CONTROL_META: dict = {}
+_CONTROL_STATE_FILE = "dashboard-control-state.json"
 
 
 def _int(params: dict, key: str, default: int) -> int:
@@ -60,20 +61,77 @@ def _iso_date(value: object, field: str) -> str:
     return text
 
 
+def _control_state_path():
+    return q.root() / "data" / "logs" / _CONTROL_STATE_FILE
+
+
+def _read_control_state() -> dict:
+    path = _control_state_path()
+    try:
+        value = json.loads(path.read_text())
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _write_control_state(value: dict) -> None:
+    path = _control_state_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.tmp")
+    tmp.write_text(json.dumps(value, indent=2, sort_keys=True))
+    tmp.replace(path)
+
+
+def _pid_is_autonomy(pid: object) -> bool:
+    """Verify a persisted PID is alive and still belongs to the autonomy runner."""
+    try:
+        pid = int(pid)
+        if pid <= 0:
+            return False
+        os.kill(pid, 0)
+    except (TypeError, ValueError, ProcessLookupError):
+        return False
+    except PermissionError:
+        pass
+
+    try:
+        found = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "command="],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return found.returncode == 0 and "quant_loop_trader.autonomy" in found.stdout
+
+
 def _control_status(enabled: bool) -> dict:
     global _CONTROL_PROCESS
     with _CONTROL_LOCK:
         proc = _CONTROL_PROCESS
-        running = bool(proc and proc.poll() is None)
-        exit_code = None if not proc or running else proc.returncode
-        meta = dict(_CONTROL_META)
+        if proc is not None:
+            running = proc.poll() is None
+            pid = proc.pid
+            exit_code = None if running else proc.returncode
+            meta = dict(_CONTROL_META)
+            recovered = False
+        else:
+            saved = _read_control_state()
+            pid = saved.get("pid")
+            running = _pid_is_autonomy(pid)
+            exit_code = None if running else saved.get("exit_code")
+            meta = dict(saved.get("run") or {})
+            recovered = bool(running and saved)
+
     return {
         "enabled": bool(enabled),
         "localhost_only": True,
         "running": running,
-        "pid": proc.pid if proc else None,
+        "pid": pid,
         "exit_code": exit_code,
         "run": meta or None,
+        "recovered": recovered,
     }
 
 
@@ -131,7 +189,7 @@ def _start_control_run(payload: dict) -> dict:
     cfg = _normalise_control_payload(payload)
 
     with _CONTROL_LOCK:
-        if _CONTROL_PROCESS and _CONTROL_PROCESS.poll() is None:
+        if _control_status(True)["running"]:
             raise RuntimeError("research_run_already_active")
 
         env = os.environ.copy()
@@ -158,6 +216,7 @@ def _start_control_run(payload: dict) -> dict:
         log_dir = q.root() / "data" / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
         log_path = log_dir / "dashboard-control.log"
+        started_at = datetime.now(timezone.utc).isoformat()
         with log_path.open("ab") as log:
             proc = subprocess.Popen(
                 cmd,
@@ -171,23 +230,33 @@ def _start_control_run(payload: dict) -> dict:
         _CONTROL_PROCESS = proc
         _CONTROL_META = {
             **cfg,
-            "started_at": datetime.now(timezone.utc).isoformat(),
+            "started_at": started_at,
             "log": str(log_path.relative_to(q.root())),
         }
+        _write_control_state({
+            "pid": proc.pid,
+            "exit_code": None,
+            "run": _CONTROL_META,
+        })
 
     return _control_status(True)
 
 
 def _stop_control_run() -> dict:
-    global _CONTROL_PROCESS
     with _CONTROL_LOCK:
-        proc = _CONTROL_PROCESS
-        if not proc or proc.poll() is not None:
-            return _control_status(True)
+        status = _control_status(True)
+        if not status["running"] or not status.get("pid"):
+            return status
         try:
-            os.killpg(proc.pid, signal.SIGTERM)
+            os.killpg(int(status["pid"]), signal.SIGTERM)
         except ProcessLookupError:
             pass
+
+        saved = _read_control_state()
+        if saved:
+            saved["stop_requested_at"] = datetime.now(timezone.utc).isoformat()
+            _write_control_state(saved)
+
     return _control_status(True)
 
 
@@ -299,7 +368,7 @@ def route(path: str, params: dict):
             eid = ident(eid)
             return {"risk": svc.risk(eid), "rolling": svc.rolling_performance(eid)}
         case ["market"]:
-            ticker = params.get("ticker", ["SPY"])[0]
+            ticker = params.get("ticker", ["BTCUSD"])[0]
             return svc.market(ident(ticker))
         case ["system"]:
             return svc.system()
@@ -380,7 +449,8 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:
             if self.server.verbose:
                 traceback.print_exc()
-            self._send(500, dumps({"error": "internal", "detail": str(exc)[:300]}), "application/json")
+            self._send(500, dumps({"error": "internal", "detail": str(exc)[:300]}),
+                       "application/json")
 
     def _static(self, path: str):
         rel = path.lstrip("/") or "index.html"
