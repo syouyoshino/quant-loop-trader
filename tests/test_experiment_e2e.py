@@ -2,6 +2,7 @@ import polars as pl
 from quant_loop_trader.experiment import run_experiment
 import duckdb
 
+
 def test_experiment_e2e_fixture(isolated_research):
     # Use short date range for speed, but real fixture covers 2018-2024
     # run_experiment will use TIINGO if key exists; we force fixture by mocking env?
@@ -12,6 +13,19 @@ def test_experiment_e2e_fixture(isolated_research):
     assert "baseline_metrics" in report and "improved_metrics" in report
     assert "hypothesis" in report and "economic_reasoning" in report
     assert "reproducibility" in report
+
+    cfg = report["config"]
+    assert cfg["pipeline_version"] >= 4
+    assert cfg["campaign_id"] == "default"
+    assert cfg["model_type"] == "logistic"
+    assert cfg["model_params"] == {}
+    assert cfg["feature_columns"] == report["parameters"]["feature_columns"]
+    assert len(cfg["dataset_checksum"]) == 64
+    assert len(cfg["dataset_id"].rsplit("_", 1)[-1]) == 32
+    runtime = cfg["runtime_environment"]
+    assert runtime["fingerprint"] == report["reproducibility"]["environment_fingerprint"]
+    assert len(runtime["fingerprint"]) == 64
+
     # files exist
     exp_dir = isolated_research / report["experiment_id"]
     assert (exp_dir / "report.json").exists()
@@ -28,6 +42,7 @@ def test_experiment_e2e_fixture(isolated_research):
     report2 = run_experiment(ticker="SPY", horizon=5, start="2019-01-01", end="2024-12-31", seed=123)
     # same horizon/ticker but different experiment_id due to timestamp, but metrics should be close
     assert abs(report["baseline_metrics"]["accuracy"] - report2["baseline_metrics"]["accuracy"]) < 1e-9
+
 
 def test_no_future_leakage_in_experiment(isolated_research):
     # verify that predictions are only for test period after train
