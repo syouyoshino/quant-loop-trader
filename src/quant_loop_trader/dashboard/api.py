@@ -39,7 +39,7 @@ MIME = {
 
 _ID = re.compile(r"^[A-Za-z0-9_.\-]+$")
 _TICKER = re.compile(r"^[A-Za-z0-9.\-]+$")
-_CONTROL_LOCK = threading.Lock()
+_CONTROL_LOCK = threading.RLock()
 _CONTROL_PROCESS: subprocess.Popen | None = None
 _CONTROL_META: dict = {}
 
