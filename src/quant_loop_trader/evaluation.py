@@ -161,7 +161,7 @@ def _phase_robustness(phase_costs: dict[str, dict[str, float]], bps: int = 25) -
 
 
 def evaluate(y_true: np.ndarray, y_pred: np.ndarray, y_prob: np.ndarray, prices: np.ndarray,
-             horizon: int = 1, ticker: str = "SPY",
+             horizon: int = 1, ticker: str = "BTCUSD",
              transaction_cost: float = DEFAULT_COST_PER_SIDE) -> dict:
     """Return prediction and financial metrics using the market's real calendar.
 

@@ -35,3 +35,11 @@ Data end:        current date
 ```
 
 The model does not need calendar dates as predictive features. Timestamps remain in the research engine because chronological ordering, purging, replay windows and leakage checks depend on them.
+
+## Launch model
+
+The research-session launchd plist has no calendar trigger. Research starts only from the
+localhost dashboard controls or an explicit supervisor/manual launch. The default session
+budget is 100, which is deliberately larger than the normal candidate frontier; the
+anti-duplicate `_already_run` check and campaign identity remain authoritative, so a
+session naturally stops when there is no genuinely unexplored evidence left.

@@ -87,7 +87,7 @@ class ExperimentBundle:
             # Backward compatibility for pre-snapshot-lock experiments. New runs
             # never depend on this mutable-cache anchor.
             cache_expected = lock.get("dataset_parquet")
-            cache = _data.PROC_DIR / f"{cfg.get('ticker', 'SPY')}.parquet"
+            cache = _data.PROC_DIR / f"{cfg.get('ticker', 'BTCUSD')}.parquet"
             if cache_expected and cache.exists() and _sha(cache) != cache_expected:
                 issues.append("dataset_drift:legacy_input_data_changed_since_experiment")
 

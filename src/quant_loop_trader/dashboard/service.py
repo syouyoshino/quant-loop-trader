@@ -208,7 +208,7 @@ def curve(experiment_id: str, variant: str = "improved") -> dict:
     art = q.artifacts(experiment_id)
     cfg = _cfg(art)
     horizon = int(cfg.get("horizon") or 1)
-    ticker = cfg.get("ticker") or "SPY"
+    ticker = cfg.get("ticker") or "BTCUSD"
     try:
         rows = q.predictions(experiment_id, variant)
     except q.DataUnavailable as exc:
@@ -269,7 +269,7 @@ def performance(experiment_id: str, variant: str = "improved") -> dict:
     cfg = _cfg(art)
     sealed = _metrics(art, variant)
     c = curve(experiment_id, variant)
-    ticker = cfg.get("ticker") or "SPY"
+    ticker = cfg.get("ticker") or "BTCUSD"
     horizon = int(cfg.get("horizon") or 1)
     ppy = c.get("periods_per_year") or periods_per_year(ticker, horizon)
 
@@ -523,19 +523,17 @@ def _registry_status(experiment_id: str, registry: dict[str, dict] | None = None
 
 
 def _registry_map(authoritative_only: bool = False) -> dict[str, dict]:
-    """model_registry rows. `model_registry` carries no authoritative column of
-    its own, so lifecycle counts join it back onto the authoritative experiments."""
+    """Registry rows; programme lifecycle views join to active authoritative evidence."""
     try:
         rows = {r["model_id"]: r for r in q.model_registry_rows()}
     except q.DataUnavailable:
         return {}
     if not authoritative_only:
         return rows
-    flags = q.authoritative_ids()
-    if flags is None:
+    if not authority_available():
         return rows
-    good, quarantined = flags
-    return {k: v for k, v in rows.items() if q.stem(k) not in quarantined}
+    allowed = {r["id"] for r in authoritative()}
+    return {k: v for k, v in rows.items() if q.stem(k) in allowed}
 
 
 def _authoritative_flag(eid: str, flags) -> bool | None:
@@ -552,31 +550,26 @@ def authority_available() -> bool:
 
 
 def authoritative(rows: list[dict] | None = None) -> list[dict]:
-    """Rows that ARE current research evidence — `authoritative is True` only.
-
-    Every statistic (funnel, hypothesis tallies, pass rates, lifecycle counts,
-    research progress) is computed over this population. When the database is
-    unreadable this is empty by construction; callers must check
-    `authority_available()` and report N/A rather than a filesystem count.
-    """
+    """Current evidence, BTCUSD-scoped whenever BTC evidence exists."""
     rows = rows if rows is not None else experiment_index()
-    return [r for r in rows if r["authoritative"] is True]
+    good = [r for r in rows if r["authoritative"] is True]
+    btc = [r for r in good if str(r.get("market") or "").upper() == "BTCUSD"]
+    return btc or good
 
 
 def visible(rows: list[dict] | None = None) -> list[dict]:
-    """Rows the control room shows — authoritative plus not-yet-recorded runs.
-
-    An in-flight experiment has no `experiments` row until it seals, so it is
-    unknown, not quarantined. It belongs on the screen; it does not belong in
-    any evidence statistic until the database says `authoritative`.
-    """
+    """Visible rows, preferring BTCUSD while retaining historical fallback."""
     rows = rows if rows is not None else experiment_index()
-    return [r for r in rows if r["authoritative"] is not False]
+    shown = [r for r in rows if r["authoritative"] is not False]
+    btc = [r for r in shown if str(r.get("market") or "").upper() == "BTCUSD"]
+    return btc or shown
 
 
 def population() -> dict:
-    """How much of what is on disk is authoritative — never hide the rest silently."""
-    rows = experiment_index()
+    """Active-market population while preserving the dashboard API contract."""
+    all_rows = experiment_index()
+    btc = [r for r in all_rows if str(r.get("market") or "").upper() == "BTCUSD"]
+    rows = btc or all_rows
     if q.authoritative_ids() is None:
         return {"basis": "UNKNOWN", "on_disk": len(rows), "authoritative": None,
                 "quarantined": None, "unrecorded": None,
@@ -772,7 +765,7 @@ def validation_view(experiment_id: str, art: dict | None = None) -> dict:
                 "economic_gate": None if ho is None else ho.get("economic_gate"),
             },
             "cross_market": {"status": NOT_AVAILABLE,
-                             "detail": "single-market research programme (SPY only)"},
+                             "detail": "BTCUSD active market; historical SPY evidence is isolated"},
             "paper_trading": {"status": NOT_RUN,
                               "detail": "paper trading disabled until QLT_PAPER_ENABLED=true"},
         },
@@ -894,13 +887,7 @@ RUN_STALE_S = 24 * 3600   # older than a day with no seal is not coming back
 
 
 def _in_flight() -> list[dict]:
-    """Directories with no sealed report.
-
-    `run_experiment` creates the directory before it inserts any database row,
-    so an unsealed directory is evidence of a started process, never proof of a
-    live one. Age plus session freshness separates the three cases; none of them
-    is reported as a worker count.
-    """
+    """Unsealed runs, scoped to BTCUSD when the lab contains BTCUSD evidence."""
     hb = q.heartbeat() or {}
     session_live = bool(hb.get("timestamp")) and (
         _elapsed(hb["timestamp"], None) or 0) < RUN_FRESH_S
@@ -909,6 +896,7 @@ def _in_flight() -> list[dict]:
         art = q.artifacts(eid)
         if art.get("report"):
             continue
+        cfg = _cfg(art)
         started = art.get("started_at")
         age = None
         if started:
@@ -919,7 +907,15 @@ def _in_flight() -> list[dict]:
             state = "ORPHANED"
         else:
             state = "STALE"
-        out.append({"id": eid, "started_at": started, "age_s": age, "state": state})
+        out.append({
+            "id": eid, "started_at": started, "age_s": age, "state": state,
+            "market": cfg.get("ticker"),
+        })
+    lab_has_btc = any(
+        str(r.get("market") or "").upper() == "BTCUSD" for r in experiment_index()
+    )
+    if lab_has_btc:
+        return [r for r in out if str(r.get("market") or "").upper() == "BTCUSD"]
     return out
 
 
@@ -1168,6 +1164,11 @@ def hypotheses() -> list[dict]:
         memory = q.research_memory_rows()
     except q.DataUnavailable:
         pass
+    allowed_memory_ids = {r["id"] for r in rows}
+    memory = [
+        m for m in memory
+        if q.stem(str(m.get("experiment_id") or "")) in allowed_memory_ids
+    ]
     by_hyp: dict[str, dict] = {}
     for r in rows:
         h = r["hypothesis"]
@@ -1330,7 +1331,7 @@ def correlation_matrix(ids: list[str]) -> dict:
 # --- market -----------------------------------------------------------------
 
 
-def market(ticker: str = "SPY") -> dict:
+def market(ticker: str = "BTCUSD") -> dict:
     """Market state computed from the research price snapshot — no live feed."""
     try:
         rows = q.price_history(ticker)

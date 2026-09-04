@@ -11,7 +11,7 @@ def _payload():
     return {
         "ticker": "BTCUSD",
         "horizon": 5,
-        "max_experiments": 3,
+        "max_experiments": 100,
         "validate": True,
         "campaign_id": "btc_2026_v1",
         "holdout_start": "2026-01-01",

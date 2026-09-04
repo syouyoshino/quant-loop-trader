@@ -75,7 +75,7 @@ immediately.
 | Risk | equity curve reconstructed from the same predictions |
 | Funnel / rejections | experiment artifacts + `validation.json` issue strings |
 | Champions | `model_registry.status` lifecycle (`candidate → eligible → champion`) |
-| Market regime | `data/processed/SPY.parquet` (research snapshot, not a live feed) |
+| Market regime | `data/processed/BTCUSD.parquet` (research snapshot, not a live feed) |
 | System | heartbeat, DuckDB, `deploy/*.plist` + `launchctl`, `git rev-parse` |
 
 ### Which experiments count

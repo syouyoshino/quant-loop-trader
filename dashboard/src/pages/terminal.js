@@ -28,7 +28,7 @@ const state = {
   variant: 'improved',
   range: 'ALL',
   rolling: '90D',
-  filters: {},
+  filters: { market: 'BTCUSD' },
   perf: null,
   risk: null,
   marketTicker: 'BTCUSD',

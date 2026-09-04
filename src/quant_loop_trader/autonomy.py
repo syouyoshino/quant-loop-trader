@@ -140,7 +140,7 @@ def _already_run(ticker: str, horizon: int, start: str, end: str, seed: int) -> 
     return n > 0
 
 
-def _frontier_remaining(ticker: str = "SPY", horizon: int = 5) -> int:
+def _frontier_remaining(ticker: str = "BTCUSD", horizon: int = 5) -> int:
     return sum(
         1
         for c in _candidate_grid(ticker)
@@ -148,7 +148,7 @@ def _frontier_remaining(ticker: str = "SPY", horizon: int = 5) -> int:
     )
 
 
-def review_memory(ticker: str = "SPY", horizon: int = 5) -> dict:
+def review_memory(ticker: str = "BTCUSD", horizon: int = 5) -> dict:
     rows = search_memory("volatility regime", ticker=ticker, horizon=horizon)
     return {
         "ticker": ticker,
@@ -172,8 +172,8 @@ def select_candidates(ticker: str, horizon: int, budget: int) -> list[dict]:
     return out
 
 
-def run_session(ticker: str = "SPY", horizon: int = 5,
-                max_experiments: int = 3, validate: bool = True) -> dict:
+def run_session(ticker: str = "BTCUSD", horizon: int = 5,
+                max_experiments: int = 100, validate: bool = True) -> dict:
     """Run a bounded robustness sweep of the fixed active strategy family."""
     if os.getenv("QLT_AUTONOMOUS_ENABLED", "").lower() != "true":
         logger.warning(json.dumps({
@@ -313,9 +313,9 @@ def main():
     p = argparse.ArgumentParser(
         description="Bounded research robustness sweep (legacy autonomy module name)"
     )
-    p.add_argument("--ticker", default="SPY")
+    p.add_argument("--ticker", default="BTCUSD")
     p.add_argument("--horizon", type=int, default=5)
-    p.add_argument("--max-experiments", type=int, default=3)
+    p.add_argument("--max-experiments", type=int, default=100)
     p.add_argument("--no-validate", action="store_true")
     args = p.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(message)s")

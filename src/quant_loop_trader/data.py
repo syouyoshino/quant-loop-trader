@@ -285,7 +285,7 @@ def coverage_check(df: pl.DataFrame, ticker: str, start: str, end: str) -> None:
         )
 
 
-def fetch_ohlcv(ticker: str = "SPY", start: str = "2018-01-01", end: str = "2024-12-31",
+def fetch_ohlcv(ticker: str, start: str = "2018-01-01", end: str = "2024-12-31",
                 use_cache: bool = True) -> tuple[pl.DataFrame, str]:
     """Fetch OHLCV with PIT columns. Returns (df, actual_source).
 
@@ -350,7 +350,7 @@ def fetch_ohlcv(ticker: str = "SPY", start: str = "2018-01-01", end: str = "2024
     raise FileNotFoundError("No Tiingo key and no fixture at tests/fixtures/SPY.csv — cannot fetch data")
 
 
-def gap_check(df: pl.DataFrame, ticker: str = "SPY") -> None:
+def gap_check(df: pl.DataFrame, ticker: str = "BTCUSD") -> None:
     if df.height < 2:
         return
     diffs = df.select((pl.col("event_time").diff().dt.total_days()).alias("gap")).drop_nulls()
