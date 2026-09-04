@@ -21,6 +21,7 @@ from pathlib import Path
 import duckdb
 
 CACHE_TTL = float(os.environ.get("QLT_DASHBOARD_CACHE_TTL", "5"))
+DASHBOARD_MARKET = (os.environ.get("QLT_DASHBOARD_MARKET", "BTCUSD").strip().upper() or "BTCUSD")
 _CACHES: list[dict] = []
 
 
@@ -322,7 +323,8 @@ def predictions(experiment_id: str, variant: str = "improved") -> list[dict]:
 
 
 @ttl_cache
-def price_history(ticker: str = "SPY") -> list[dict]:
+def price_history(ticker: str = "BTCUSD") -> list[dict]:
+    ticker = (ticker or DASHBOARD_MARKET).upper()
     return parquet_rows(paths()["processed"] / f"{ticker}.parquet", order="event_time")
 
 
@@ -333,7 +335,7 @@ def heartbeat() -> dict | None:
 
 @ttl_cache
 def session_records() -> list[dict]:
-    """Autonomy session summaries appended to session.log as pretty JSON blobs."""
+    """Autonomy sessions, preferring BTCUSD when BTC sessions exist."""
     log = paths()["logs"] / "session.log"
     if not log.exists():
         return []
@@ -352,7 +354,11 @@ def session_records() -> list[dict]:
         if isinstance(obj, dict) and "session_started" in obj:
             out.append(obj)
     out.sort(key=lambda r: r["session_started"])
-    return out
+    btc = [
+        r for r in out
+        if str((r.get("memory_review") or {}).get("ticker") or "").upper() == DASHBOARD_MARKET
+    ]
+    return btc or out
 
 
 def log_tail(name: str, limit: int = 4000) -> str:

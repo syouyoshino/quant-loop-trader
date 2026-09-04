@@ -88,7 +88,7 @@ def build_train_test(ticker: str, start: str, end: str, horizon: int, feature_fn
 
 
 def train_evaluate_from(train: pl.DataFrame, test: pl.DataFrame, feat_cols: list[str],
-                        horizon: int, seed: int, ticker: str = "SPY") -> dict:
+                        horizon: int, seed: int, ticker: str) -> dict:
     """Train on prebuilt frames and evaluate the hidden research test split."""
     from quant_loop_trader.models.registry import build_model
 
@@ -184,7 +184,7 @@ def _runtime_environment() -> dict:
     return payload
 
 
-def run_experiment(ticker: str = "SPY", horizon: int = 5,
+def run_experiment(ticker: str, horizon: int = 5,
                    start: str = "2018-01-01", end: str = "2024-12-31",
                    seed: int = 42, source_snapshot: str | Path | None = None,
                    parent_experiment_id: str | None = None) -> dict:
@@ -540,7 +540,7 @@ def reproduce(experiment_id: str, tolerance: float = 1e-9) -> dict:
 
 def main():
     p = argparse.ArgumentParser(description="MVP Research loop — single command")
-    p.add_argument("--ticker", default="SPY")
+    p.add_argument("--ticker", default="BTCUSD")
     p.add_argument("--horizon", type=int, default=5)
     p.add_argument("--start", default="2018-01-01")
     p.add_argument("--end", default="2024-12-31")
@@ -568,7 +568,7 @@ if __name__ == "__main__":
     main()
 
 
-def run_horizons(ticker: str = "SPY", horizons: list[int] | None = None,
+def run_horizons(ticker: str = "BTCUSD", horizons: list[int] | None = None,
                  start: str = "2018-01-01", end: str = "2024-12-31",
                  seed: int = 42) -> list[dict]:
     from quant_loop_trader.models.prediction import SUPPORTED_HORIZONS

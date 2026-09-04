@@ -14,7 +14,7 @@
         <string>--horizon</string>
         <string>5</string>
         <string>--max-experiments</string>
-        <string>1</string>
+        <string>100</string>
     </array>
     <key>EnvironmentVariables</key>
     <dict>
@@ -23,13 +23,6 @@
     </dict>
     <key>WorkingDirectory</key>
     <string>/Users/syouyoshino/Desktop/projects_1/quant-loop-trader</string>
-    <key>StartCalendarInterval</key>
-    <dict>
-        <key>Hour</key>
-        <integer>6</integer>
-        <key>Minute</key>
-        <integer>0</integer>
-    </dict>
     <key>StandardOutPath</key>
     <string>/Users/syouyoshino/Desktop/projects_1/quant-loop-trader/data/logs/session.log</string>
     <key>StandardErrorPath</key>

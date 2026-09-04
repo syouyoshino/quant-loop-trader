@@ -7,7 +7,7 @@ export function initControl(node, api) {
       <div class="control-grid">
         <label><span>MARKET</span><input name="ticker" value="BTCUSD" autocomplete="off"></label>
         <label><span>HORIZON</span><input name="horizon" type="number" min="1" max="60" value="5"></label>
-        <label><span>EXPERIMENT BUDGET</span><input name="max_experiments" type="number" min="1" max="100" value="3"></label>
+        <label><span>EXPERIMENT BUDGET</span><input name="max_experiments" type="number" min="1" max="100" value="100"></label>
         <label><span>CAMPAIGN ID</span><input name="campaign_id" value="btc_2026_v1" autocomplete="off"></label>
         <label><span>HOLDOUT START</span><input name="holdout_start" type="date" value="2026-01-01"></label>
         <label><span>DATA END</span><input name="data_end" type="date" value="${today}"></label>

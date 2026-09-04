@@ -142,7 +142,7 @@ def _normalise_control_payload(payload: dict) -> dict:
 
     try:
         horizon = int(payload.get("horizon", 5))
-        max_experiments = int(payload.get("max_experiments", 3))
+        max_experiments = int(payload.get("max_experiments", 100))
     except (TypeError, ValueError) as exc:
         raise ValueError("invalid_numeric_control") from exc
     if not 1 <= horizon <= 60:
@@ -261,12 +261,14 @@ def _stop_control_run() -> dict:
 
 
 def filter_experiments(rows: list[dict], params: dict) -> list[dict]:
-    """Server-side filters for the experiment table."""
+    """Server-side filters; default to BTCUSD when BTC evidence exists."""
     def one(key):
         v = params.get(key, [None])[0]
         return v or None
 
     market, status, stage = one("market"), one("status"), one("stage")
+    if market is None and any(str(r.get("market") or "").upper() == "BTCUSD" for r in rows):
+        market = "BTCUSD"
     cycle, hypothesis = one("cycle"), one("hypothesis")
     start, end = one("from"), one("to")
     champion_only = (one("champion_only") or "").lower() in ("1", "true", "yes")

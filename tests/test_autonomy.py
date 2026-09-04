@@ -13,7 +13,7 @@ def autonomous_enabled(monkeypatch):
 
 def test_session_blocked_without_activation_key(monkeypatch):
     monkeypatch.delenv("QLT_AUTONOMOUS_ENABLED", raising=False)
-    out = run_session(max_experiments=1)
+    out = run_session(ticker="SPY", max_experiments=1)
     assert out["skipped"] == "autonomous_disabled" and out["executed"] == 0
 
     # The legacy tasks table may still exist in old databases/migrations, but the
@@ -27,13 +27,13 @@ def test_session_blocked_without_activation_key(monkeypatch):
 
 
 def test_review_memory_returns_structure():
-    m = review_memory()
+    m = review_memory(ticker="SPY")
     assert "total_memory_rows" in m and "recent_beliefs" in m
 
 
 def test_duplicate_prevention():
     # fresh DB copy: first session executes; the executed config must not be re-selected
-    s1 = run_session(max_experiments=1)
+    s1 = run_session(ticker="SPY", max_experiments=1)
     assert s1["executed"] == 1
     key = s1["results"][0]["experiment_id"]
     candidates = select_candidates("SPY", 5, budget=10)
@@ -46,7 +46,7 @@ def test_duplicate_prevention():
 
 
 def test_session_budget_respected_and_validates():
-    summary = run_session(max_experiments=2, validate=True)
+    summary = run_session(ticker="SPY", max_experiments=2, validate=True)
     assert summary["executed"] <= 2
     for r in summary["results"]:
         assert r["validation_status"] in ("APPROVED", "REJECTED")
@@ -67,7 +67,7 @@ def test_quarantined_history_does_not_block_a_rerun():
     from quant_loop_trader.data import DB_PATH, migrate_db
     from quant_loop_trader.experiment import EXP_ROOT
 
-    s1 = run_session(max_experiments=1)
+    s1 = run_session(ticker="SPY", max_experiments=1)
     assert s1["executed"] == 1
     key = s1["results"][0]["experiment_id"]
     cfg = json.loads((EXP_ROOT / key / "config.json").read_text())
@@ -90,7 +90,7 @@ def test_baseline_records_alone_do_not_mark_a_config_explored():
     from quant_loop_trader.data import DB_PATH, migrate_db
     from quant_loop_trader.experiment import EXP_ROOT
 
-    s1 = run_session(max_experiments=1)
+    s1 = run_session(ticker="SPY", max_experiments=1)
     key = s1["results"][0]["experiment_id"]
     cfg = json.loads((EXP_ROOT / key / "config.json").read_text())
     migrate_db()
