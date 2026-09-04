@@ -21,7 +21,9 @@ jobs:
           python-version: "3.12"
 
       - name: Apply Bitcoin hardening
-        run: python tools/apply_bitcoin_hardening.py
+        run: |
+          python tools/apply_bitcoin_hardening.py
+          python tools/fix_bitcoin_hardening.py
 
       - name: Install dependencies
         run: |
@@ -47,6 +49,7 @@ jobs:
       - name: Remove one-off migration machinery
         run: |
           rm tools/apply_bitcoin_hardening.py
+          rm tools/fix_bitcoin_hardening.py
           rm .github/workflows/apply-bitcoin-hardening-once.yml
 
       - name: Commit hardened runtime
